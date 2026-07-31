@@ -3,7 +3,10 @@ import net from 'net';
 
 function listenEcho(): Promise<{ server: net.Server; port: number }> {
   return new Promise((resolve) => {
-    const server = net.createServer((socket) => socket.pipe(socket));
+    const server = net.createServer((socket) => {
+      socket.on('error', () => {});
+      socket.pipe(socket);
+    });
     server.listen(0, '127.0.0.1', () => {
       const port = (server.address() as net.AddressInfo).port;
       resolve({ server, port });

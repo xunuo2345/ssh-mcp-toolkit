@@ -9,7 +9,10 @@ function listenServer(server: net.Server): Promise<number> {
 }
 
 function listenEcho(): Promise<{ server: net.Server; port: number }> {
-  const server = net.createServer((socket) => socket.pipe(socket));
+  const server = net.createServer((socket) => {
+    socket.on('error', () => {});
+    socket.pipe(socket);
+  });
   return listenServer(server).then((port) => ({ server, port }));
 }
 
@@ -146,6 +149,7 @@ describe('handleProxyConnection', () => {
     const { handleProxyConnection } = await import('../src/index.js');
     let received = '';
     const origin = net.createServer((socket) => {
+      socket.on('error', () => {});
       let buf = '';
       socket.on('data', (chunk: Buffer) => {
         buf += chunk.toString('latin1');
@@ -180,6 +184,7 @@ describe('handleProxyConnection', () => {
     const { handleProxyConnection } = await import('../src/index.js');
     let received = '';
     const origin = net.createServer((socket) => {
+      socket.on('error', () => {});
       let buf = '';
       socket.on('data', (chunk: Buffer) => {
         buf += chunk.toString('latin1');
