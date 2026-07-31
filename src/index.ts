@@ -429,8 +429,14 @@ export function validateEgressParams(params: {
   if (proxyPort !== undefined && (!Number.isInteger(proxyPort) || proxyPort < 1 || proxyPort > 65535)) {
     throw new McpError(ErrorCode.InvalidParams, 'proxy_port must be an integer between 1 and 65535');
   }
-  if (proxyBind !== undefined && (typeof proxyBind !== 'string' || net.isIP(proxyBind) === 0)) {
-    throw new McpError(ErrorCode.InvalidParams, 'proxy_bind must be a valid IPv4 or IPv6 address');
+  if (proxyBind !== undefined && (
+    typeof proxyBind !== 'string'
+    || net.isIP(proxyBind) === 0
+    || proxyBind === '0.0.0.0'
+    || proxyBind === '::'
+    || proxyBind === '0:0:0:0:0:0:0:0'
+  )) {
+    throw new McpError(ErrorCode.InvalidParams, 'proxy_bind must be a specific IPv4 or IPv6 interface address (not a wildcard)');
   }
 }
 
@@ -519,8 +525,9 @@ export function handleProxyConnection(stream: Duplex, connect: ConnectFn): void 
       const authority = target.trim();
       const colon = authority.lastIndexOf(':');
       const host = authority.slice(0, colon).replace(/^\[|\]$/g, '');
-      const port = Number.parseInt(authority.slice(colon + 1), 10);
-      if (!host || !Number.isInteger(port) || port < 1 || port > 65535) {
+      const portText = authority.slice(colon + 1);
+      const port = Number.parseInt(portText, 10);
+      if (!host || !/^\d+$/.test(portText) || port < 1 || port > 65535) {
         fail();
         return;
       }
@@ -991,7 +998,7 @@ server.tool(
   {
     host_id: z.string().describe("Identifier of the host (A) on which to open the proxy port"),
     proxy_port: z.number().int().describe("Port to listen on the host, 1-65535"),
-    proxy_bind: z.string().describe("IP address on the host to bind (must be reachable by the machines that will use the proxy)"),
+    proxy_bind: z.string().describe("Specific interface IP address on the host to bind (must be reachable by the machines that will use the proxy; a wildcard like 0.0.0.0 is not allowed)"),
     egress_id: z.string().optional().describe("Optional egress identifier; generated if omitted"),
   },
   async ({ host_id, proxy_port, proxy_bind, egress_id }) => {
@@ -1033,6 +1040,9 @@ server.tool(
     }
 
     activeEgress.set(id, egress);
+    if (proxy_bind !== '127.0.0.1' && proxy_bind !== 'localhost' && proxy_bind !== '::1') {
+      console.error(`Warning: egress '${id}' opens an unauthenticated HTTP proxy on ${proxy_bind}:${proxy_port} — any machine that can reach it can use the local machine as an internet egress`);
+    }
     const chain = resolved.jumpHostIds.length ? ` -> ${resolved.jumpHostIds.join(' -> ')}` : '';
     return {
       content: [{

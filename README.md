@@ -525,10 +525,12 @@ Only the outbound SSH connection from the local machine to A is required — no 
 The SSH server on A must allow TCP forwarding, and a non-loopback bind requires `GatewayPorts`:
 
 ```ini
-# /config/sshd/sshd_config (or the active sshd_config on A)
+# /etc/ssh/sshd_config (on the linuxserver docker image: /config/sshd/sshd_config)
 AllowTcpForwarding yes
-GatewayPorts yes
+GatewayPorts clientspecified
 ```
+
+`GatewayPorts clientspecified` lets the client supply the bind address (the behavior `open-egress` needs); plain `yes` also works but forces binding to all interfaces.
 
 ### Opening an egress
 
@@ -538,7 +540,7 @@ Tool: **`open-egress`**
 |---|---|---|---|---|
 | `host_id` | string | ✔ | — | Host (A) on which to open the proxy port |
 | `proxy_port` | number | ✔ | — | Port to listen on A, 1–65535 |
-| `proxy_bind` | string | ✔ | — | IP on A to bind (reachable by the machines that will use the proxy) |
+| `proxy_bind` | string | ✔ | — | Specific interface IP on A to bind (reachable by the machines that will use the proxy); wildcards like `0.0.0.0` are rejected |
 | `egress_id` | string | | auto UUID | Identifier used by `close-egress` / `list-egress` |
 
 ```json
@@ -659,6 +661,7 @@ Below is a typical workflow using Claude Code (commands start with `/mcp`), but 
    ```
    /mcp mcp-remote-ssh close-session {"sessionId":"<id>"}
    /mcp mcp-remote-ssh close-tunnel {"tunnel_id":"<id>"}
+   /mcp mcp-remote-ssh close-egress {"egress_id":"<id>"}
    ```
 
 ---

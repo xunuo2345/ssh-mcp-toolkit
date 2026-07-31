@@ -1,7 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import net from 'net';
 import { PassThrough } from 'stream';
-import type { ConnectFn } from '../src/index.js';
 
 function listenServer(server: net.Server): Promise<number> {
   return new Promise((resolve) => {
@@ -32,13 +31,6 @@ function readUntil(socket: NodeJS.ReadableStream, needle: string, timeoutMs = 20
   });
 }
 
-async function startProxy(connectFn: ConnectFn): Promise<{ server: net.Server; port: number }> {
-  const { handleProxyConnection } = await import('../src/index.js');
-  const server = net.createServer((socket) => handleProxyConnection(socket, connectFn));
-  const port = await listenServer(server);
-  return { server, port };
-}
-
 describe('validateEgressParams', () => {
   it('accepts a valid port and IP', async () => {
     const { validateEgressParams } = await import('../src/index.js');
@@ -63,6 +55,29 @@ describe('validateEgressParams', () => {
     const { validateEgressParams } = await import('../src/index.js');
     expect(() => validateEgressParams({ proxyPort: 80, proxyBind: '127.0.0.1' })).not.toThrow();
     expect(() => validateEgressParams({ proxyPort: 80, proxyBind: '::1' })).not.toThrow();
+  });
+
+  it('accepts port boundaries', async () => {
+    const { validateEgressParams } = await import('../src/index.js');
+    expect(() => validateEgressParams({ proxyPort: 1, proxyBind: '192.168.1.10' })).not.toThrow();
+    expect(() => validateEgressParams({ proxyPort: 65535, proxyBind: '192.168.1.10' })).not.toThrow();
+  });
+
+  it('accepts undefined optional params', async () => {
+    const { validateEgressParams } = await import('../src/index.js');
+    expect(() => validateEgressParams({})).not.toThrow();
+  });
+
+  it('rejects wildcard bind addresses', async () => {
+    const { validateEgressParams } = await import('../src/index.js');
+    expect(() => validateEgressParams({ proxyPort: 80, proxyBind: '0.0.0.0' })).toThrow(/proxy_bind/);
+    expect(() => validateEgressParams({ proxyPort: 80, proxyBind: '::' })).toThrow(/proxy_bind/);
+    expect(() => validateEgressParams({ proxyPort: 80, proxyBind: '0:0:0:0:0:0:0:0' })).toThrow(/proxy_bind/);
+  });
+
+  it('accepts a non-loopback IPv6 address', async () => {
+    const { validateEgressParams } = await import('../src/index.js');
+    expect(() => validateEgressParams({ proxyPort: 80, proxyBind: 'fd00::1' })).not.toThrow();
   });
 });
 
