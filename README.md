@@ -90,27 +90,25 @@ Each active session maintains:
 
 ## Installation
 
-Install the published package from npm so the `ssh-mcp-sessions` executable is available in your environment.
+> This fork is **not published to npm** — the `ssh-mcp-sessions` package name belongs to the upstream project. Install it directly from GitHub, which gives you the `ssh-mcp-sessions-redev` executable.
 
-### Global install (preferred)
-
-```bash
-npm install -g ssh-mcp-sessions
-```
-
-Launch the server anywhere by running `ssh-mcp-sessions`.
-
-### Project-local install
-
-Inside your project:
+### Global install from GitHub (preferred)
 
 ```bash
-npm install ssh-mcp-sessions
+npm install -g github:xunuo2345/ssh-mcp-sessions-redev
 ```
 
-Run the server with `npx ssh-mcp-sessions` (or reference `./node_modules/.bin/ssh-mcp-sessions`).
+The `prepare` script compiles TypeScript during install. Launch the server anywhere by running `ssh-mcp-sessions-redev`.
 
-> Building from source is only required for contributing. See the [Contributing](#contributing) section if you plan to work on the codebase itself.
+### From source
+
+```bash
+git clone https://github.com/xunuo2345/ssh-mcp-sessions-redev.git
+cd ssh-mcp-sessions-redev
+npm install          # `prepare` runs the build for you
+```
+
+The entry point is then `build/index.js`; run it with `node /absolute/path/to/build/index.js`.
 
 ---
 
@@ -122,10 +120,7 @@ Add an entry to `~/Library/Application Support/Claude/claude_desktop_config.json
 {
   "mcpServers": {
     "ssh-mcp": {
-      "command": "npx",
-      "args": [
-        "ssh-mcp-sessions"
-      ]
+      "command": "ssh-mcp-sessions-redev"
     }
   }
 }
@@ -141,10 +136,7 @@ Update the Claude Code workspace settings (`.vscode/settings.json` or global set
 {
   "claude.mcpServers": {
     "ssh-mcp": {
-      "command": "npx",
-      "args": [
-        "ssh-mcp-sessions"
-      ]
+      "command": "ssh-mcp-sessions-redev"
     }
   }
 }
@@ -158,8 +150,7 @@ Create or edit `~/.config/openai-codex/mcp.toml` (the path may differ per platfo
 
 ```toml
 [mcpServers."ssh-mcp"]
-command = "npx"
-args = ["ssh-mcp-sessions"]
+command = "ssh-mcp-sessions-redev"
 ```
 
 Restart Codex or re-open the MCP inspector. The `ssh-mcp` tools will appear under the configured servers list.
@@ -172,10 +163,7 @@ Open Cursor settings → “Model Context Protocol” (or edit `~/Library/Applic
 {
   "mcpServers": {
     "ssh-mcp": {
-      "command": "npx",
-      "args": [
-        "ssh-mcp-sessions"
-      ]
+      "command": "ssh-mcp-sessions-redev"
     }
   }
 }
@@ -183,14 +171,15 @@ Open Cursor settings → “Model Context Protocol” (or edit `~/Library/Applic
 
 After saving, reload Cursor. The MCP sidebar exposes the server; you can invoke tools via chat or the command palette (`Cmd/Ctrl+Shift+L`).
 
-> **Tip:** If you prefer an explicit path instead of relying on `npx`, replace the command/args with the absolute path to the executable (`node_modules/.bin/ssh-mcp-sessions` for local installs or `/usr/local/lib/node_modules/ssh-mcp-sessions/build/index.js` for global installs). 
+> **Tip:** If the executable is not on your `PATH` (e.g. you installed from source rather than globally), point the client at the built file instead:
+> `{ "command": "node", "args": ["/absolute/path/to/ssh-mcp-sessions-redev/build/index.js"] }`
 
 ---
 
 ## Running the Server
 
 ```bash
-ssh-mcp-sessions
+ssh-mcp-sessions-redev
 ```
 
 The server is purely stdio-based. Once running it prints:
@@ -199,22 +188,19 @@ The server is purely stdio-based. Once running it prints:
 SSH MCP Server running on stdio
 ```
 
-You can register it with Claude Code or any other MCP client by pointing to the executable installed from npm:
+You can register it with Claude Code or any other MCP client by pointing to the installed executable:
 
 ```json
 {
   "mcpServers": {
     "ssh-mcp": {
-      "command": "npx",
-      "args": [
-        "ssh-mcp-sessions"
-      ]
+      "command": "ssh-mcp-sessions-redev"
     }
   }
 }
 ```
 
-If you prefer to rely on PATH resolution (e.g., after a global install), you can simplify the entry to `{ "command": "ssh-mcp-sessions" }`.
+If it is not on your `PATH`, use `{ "command": "node", "args": ["/absolute/path/to/build/index.js"] }` instead.
 
 > **Note:** The server no longer accepts CLI arguments for host/user/password. Everything is configured dynamically via MCP tools.
 
