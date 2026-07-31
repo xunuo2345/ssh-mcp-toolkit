@@ -718,100 +718,48 @@ class PersistentSession {
       return;
     }
 
+    const { conn, jumpConns } = await openSshChain(this.resolved);
+    this.conn = conn;
+    this.jumpConns = jumpConns;
+
+    for (const jumpConn of jumpConns) {
+      jumpConn.once('error', (err) => this.cleanup(err));
+      jumpConn.once('end', () => this.cleanup());
+    }
+
     await new Promise<void>((resolve, reject) => {
-      const targetConfig: ConnectConfig = { ...this.resolved.config };
-
-      const openShell = (conn: InstanceType<typeof SSHClient>) => {
-        conn.shell({ term: 'xterm', rows: 40, cols: 120 }, (err, stream) => {
-          if (err) {
-            handleError(err);
-            return;
-          }
-
-          this.shell = stream;
-          stream.setEncoding('utf8');
-          stream.on('data', (data: string) => {
-            this.buffer += data;
-            this.processPending();
-          });
-          stream.on('close', () => {
-            this.cleanup();
-          });
-          stream.stderr?.on('data', (data: string) => {
-            this.buffer += data;
-            this.processPending();
-          });
-
-          stream.write('export PS1=""\n');
-          stream.write('stty -echo 2>/dev/null\n');
-          resolve();
-        });
-      };
-
       const handleError = (err: Error) => {
         this.cleanup(err);
         reject(err);
       };
 
-      const connectTarget = (sock?: any) => {
-        if (sock) {
-          targetConfig.sock = sock;
+      conn.once('error', handleError);
+      conn.once('end', () => this.cleanup());
+
+      conn.shell({ term: 'xterm', rows: 40, cols: 120 }, (err, stream) => {
+        if (err) {
+          handleError(err);
+          return;
         }
 
-        const conn = new SSHClient();
-        this.conn = conn;
-
-        conn.once('ready', () => {
-          openShell(conn);
+        this.shell = stream;
+        stream.setEncoding('utf8');
+        stream.on('data', (data: string) => {
+          this.buffer += data;
+          this.processPending();
+        });
+        stream.on('close', () => {
+          this.cleanup();
+        });
+        stream.stderr?.on('data', (data: string) => {
+          this.buffer += data;
+          this.processPending();
         });
 
-        conn.once('error', handleError);
-        conn.once('end', () => this.cleanup());
-        conn.connect(targetConfig);
-      };
-
-      if (this.resolved.jumpConfigs.length === 0) {
-        connectTarget();
-        return;
-      }
-
-      const connectJump = (index: number, sock?: any) => {
-        const jumpConfig: ConnectConfig = { ...this.resolved.jumpConfigs[index] };
-        if (sock) jumpConfig.sock = sock;
-
-        const jumpConn = new SSHClient();
-        this.jumpConns.push(jumpConn);
-        const jumpId = this.resolved.jumpHostIds[index];
-        const handleJumpError = (err: Error) => {
-          this.cleanup(err);
-          reject(new Error(`Jump host '${jumpId}' connection failed: ${err.message}`));
-        };
-
-        jumpConn.once('ready', () => {
-          const nextConfig = this.resolved.jumpConfigs[index + 1] ?? this.resolved.config;
-          const nextHost = nextConfig.host;
-          if (!nextHost) {
-            handleJumpError(new Error('Next hop host is missing'));
-            return;
-          }
-          jumpConn.forwardOut('127.0.0.1', 0, nextHost, nextConfig.port ?? 22, (err, stream) => {
-            if (err) {
-              handleJumpError(new Error(`forwardOut failed: ${err.message}`));
-              return;
-            }
-            if (index + 1 < this.resolved.jumpConfigs.length) {
-              connectJump(index + 1, stream);
-            } else {
-              connectTarget(stream);
-            }
-          });
-        });
-
-        jumpConn.once('error', handleJumpError);
-        jumpConn.once('end', () => this.cleanup());
-        jumpConn.connect(jumpConfig);
-      };
-      connectJump(0);
+        stream.write('export PS1=""\n');
+        stream.write('stty -echo 2>/dev/null\n');
+        resolve();
+      });
     });
 
     this.resetInactivityTimer();
