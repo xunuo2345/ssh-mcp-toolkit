@@ -2,6 +2,7 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+export { ErrorCode };
 import type { ClientChannel, ConnectConfig, SFTPWrapper, Stats } from 'ssh2';
 import SSH2Module from 'ssh2';
 const { Client: SSHClient, utils: sshUtils } = SSH2Module as typeof import('ssh2');
@@ -1417,6 +1418,176 @@ export class PortForward {
       socket.destroy();
     }
     this.activeSockets.clear();
+  }
+
+  private closeConnections(): void {
+    this.conn.end();
+    for (const jumpConn of this.jumpConns) {
+      jumpConn.end();
+    }
+  }
+}
+
+export class InternetEgress {
+  private idleTimer: NodeJS.Timeout | null = null;
+  private idleStartAt: number | null = null;
+  private readonly activeStreams = new Set<Duplex>();
+  private totalConnections = 0;
+  private state: EgressInfo['state'] = 'connecting';
+  private lastError: string | null = null;
+  private disposed = false;
+
+  constructor(
+    private readonly id: string,
+    private readonly hostId: string,
+    private readonly proxyBind: string,
+    private readonly proxyPort: number,
+    private readonly jumpHostIds: string[],
+    private readonly conn: InstanceType<typeof SSHClient>,
+    private readonly jumpConns: InstanceType<typeof SSHClient>[],
+    private readonly timeoutMs = DEFAULT_SESSION_TTL_MS,
+    private readonly onDispose?: (id: string) => void,
+  ) {
+    conn.once('error', (error: Error) => this.markDead(error));
+    conn.once('end', () => this.markDead(new Error('SSH connection ended')));
+    conn.once('close', () => this.markDead(new Error('SSH connection closed')));
+    for (const jumpConn of jumpConns) {
+      jumpConn.once('error', (error: Error) => this.markDead(error));
+      jumpConn.once('end', () => this.markDead(new Error('Jump connection ended')));
+    }
+    conn.on('tcp connection', (info: any, accept: any) => {
+      if (this.state !== 'active') {
+        try {
+          accept()?.destroy();
+        } catch {
+          /* ignore */
+        }
+        return;
+      }
+      let stream: Duplex;
+      try {
+        stream = accept();
+      } catch {
+        return;
+      }
+      this.handleStream(stream);
+    });
+  }
+
+  async start(): Promise<void> {
+    if (this.disposed) {
+      throw new McpError(ErrorCode.InternalError, `Egress ${this.id} has been disposed`);
+    }
+    return new Promise((resolve, reject) => {
+      this.conn.forwardIn(this.proxyBind, this.proxyPort, (error) => {
+        if (error) {
+          this.closeConnections();
+          this.state = 'closed';
+          reject(new McpError(ErrorCode.InternalError, `Failed to listen on ${this.proxyBind}:${this.proxyPort} on host '${this.hostId}': ${error.message}`));
+          return;
+        }
+        if (this.state === 'dead' || this.disposed) {
+          this.closeConnections();
+          reject(new Error('SSH chain closed before the egress could start'));
+          return;
+        }
+        this.state = 'active';
+        this.startIdleTimer();
+        resolve();
+      });
+    });
+  }
+
+  getInfo(): EgressInfo {
+    const idleMs = this.idleStartAt !== null
+      ? Math.max(0, Math.floor((Date.now() - this.idleStartAt) / 1000))
+      : null;
+    return {
+      id: this.id,
+      hostId: this.hostId,
+      proxyBind: this.proxyBind,
+      proxyPort: this.proxyPort,
+      jumpHosts: [...this.jumpHostIds],
+      state: this.state,
+      activeConnections: this.activeStreams.size,
+      totalConnections: this.totalConnections,
+      lastError: this.lastError,
+      idleMs,
+    };
+  }
+
+  dispose(): void {
+    if (this.disposed) {
+      return;
+    }
+    this.disposed = true;
+    this.clearIdleTimer();
+    try {
+      this.conn.unforwardIn(this.proxyBind, this.proxyPort);
+    } catch {
+      /* best effort */
+    }
+    this.destroyStreams();
+    this.closeConnections();
+    this.state = 'closed';
+    this.onDispose?.(this.id);
+  }
+
+  private handleStream(stream: Duplex): void {
+    this.activeStreams.add(stream);
+    this.totalConnections += 1;
+    this.clearIdleTimer();
+    stream.on('error', () => stream.destroy());
+    stream.on('close', () => {
+      this.activeStreams.delete(stream);
+      if (this.activeStreams.size === 0) {
+        this.startIdleTimer();
+      }
+    });
+    handleProxyConnection(stream, (host, port) =>
+      new Promise<Duplex>((resolve, reject) => {
+        const sock = net.connect({ host, port });
+        sock.once('connect', () => resolve(sock));
+        sock.once('error', reject);
+      })
+    );
+  }
+
+  private startIdleTimer(): void {
+    if (this.disposed || this.state !== 'active' || this.idleTimer) {
+      return;
+    }
+    this.idleStartAt = Date.now();
+    this.idleTimer = setTimeout(() => {
+      this.idleTimer = null;
+      this.dispose();
+    }, this.timeoutMs);
+  }
+
+  private clearIdleTimer(): void {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
+    this.idleStartAt = null;
+  }
+
+  private markDead(error: Error): void {
+    if (this.disposed || this.state === 'dead' || this.state === 'closed') {
+      return;
+    }
+    this.state = 'dead';
+    this.lastError = error.message;
+    this.clearIdleTimer();
+    this.destroyStreams();
+    this.closeConnections();
+  }
+
+  private destroyStreams(): void {
+    for (const stream of this.activeStreams) {
+      stream.destroy();
+    }
+    this.activeStreams.clear();
   }
 
   private closeConnections(): void {

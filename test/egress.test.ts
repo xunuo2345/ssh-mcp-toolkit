@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import net from 'net';
 import { PassThrough } from 'stream';
 import type { ConnectFn } from '../src/index.js';
@@ -245,5 +245,141 @@ describe('handleProxyConnection', () => {
     } finally {
       echo.close();
     }
+  });
+});
+
+function makeFakeConn() {
+  const listeners: Record<string, Array<(...args: any[]) => void>> = {};
+  const calls = { forwardIn: [] as Array<[string, number]>, unforwardIn: [] as number[] };
+  const conn = {
+    forwardIn(bind: string, port: number, cb: (e?: Error) => void) {
+      calls.forwardIn.push([bind, port]);
+      cb(null);
+    },
+    unforwardIn(bind: string, port: number) {
+      calls.unforwardIn.push(port);
+    },
+    on(evt: string, fn: (...args: any[]) => void) {
+      (listeners[evt] ||= []).push(fn);
+    },
+    once(evt: string, fn: (...args: any[]) => void) {
+      (listeners[evt] ||= []).push(fn);
+    },
+    end() {},
+  };
+  return { conn, listeners, calls };
+}
+
+function triggerTcpip(listeners: Record<string, Array<(...args: any[]) => void>>, stream: any) {
+  const fn = listeners['tcp connection']?.[0];
+  expect(fn).toBeDefined();
+  fn({ destIP: '0.0.0.0', destPort: 0, srcIP: '10.0.0.5', srcPort: 12345 }, () => stream);
+}
+
+describe('InternetEgress', () => {
+  it('opens a forwardIn listener on start', async () => {
+    const { InternetEgress } = await import('../src/index.js');
+    const { conn, calls } = makeFakeConn();
+    const egress = new InternetEgress('e1', 'A', '192.168.1.10', 8080, [], conn as any, []);
+    await egress.start();
+    expect(calls.forwardIn).toEqual([['192.168.1.10', 8080]]);
+    expect(egress.getInfo().state).toBe('active');
+    egress.dispose();
+  });
+
+  it('rejects when forwardIn fails', async () => {
+    const { InternetEgress, ErrorCode } = await import('../src/index.js');
+    const { conn } = makeFakeConn();
+    conn.forwardIn = (_bind: string, _port: number, cb: (e?: Error) => void) => cb(new Error('gateway denied'));
+    const egress = new InternetEgress('e1', 'A', '192.168.1.10', 8080, [], conn as any, []);
+    await expect(egress.start()).rejects.toMatchObject({ code: ErrorCode.InternalError });
+    expect(egress.getInfo().state).toBe('closed');
+  });
+
+  it('proxies incoming tcpip streams to the internet', async () => {
+    const { InternetEgress } = await import('../src/index.js');
+    const { conn, listeners } = makeFakeConn();
+    const { server: echo, port: echoPort } = await listenEcho();
+    const egress = new InternetEgress('e1', 'A', '192.168.1.10', 8080, [], conn as any, []);
+    try {
+      await egress.start();
+      const channel = new PassThrough();
+      triggerTcpip(listeners, channel);
+      channel.write(`CONNECT 127.0.0.1:${echoPort} HTTP/1.1\r\nHost: 127.0.0.1:${echoPort}\r\n\r\n`);
+      const resp = await readUntil(channel, '200 Connection Established');
+      expect(resp).toContain('200 Connection Established');
+      channel.write('ping');
+      const echoed = await readUntil(channel, 'ping');
+      expect(echoed).toContain('ping');
+      expect(egress.getInfo().totalConnections).toBe(1);
+      channel.destroy();
+      await new Promise((r) => setTimeout(r, 30));
+      expect(egress.getInfo().activeConnections).toBe(0);
+    } finally {
+      egress.dispose();
+      echo.close();
+    }
+  });
+
+  it('runs the idle timer only while there are no active connections', async () => {
+    const { InternetEgress } = await import('../src/index.js');
+    const { conn, listeners } = makeFakeConn();
+    const { server: echo, port: echoPort } = await listenEcho();
+    const egress = new InternetEgress('e1', 'A', '192.168.1.10', 8080, [], conn as any, []);
+    try {
+      await egress.start();
+      expect(egress.getInfo().idleMs).not.toBeNull();
+      const channel = new PassThrough();
+      triggerTcpip(listeners, channel);
+      await new Promise((r) => setTimeout(r, 30));
+      expect(egress.getInfo().activeConnections).toBe(1);
+      expect(egress.getInfo().idleMs).toBeNull();
+      channel.destroy();
+      await new Promise((r) => setTimeout(r, 30));
+      expect(egress.getInfo().activeConnections).toBe(0);
+      expect(egress.getInfo().idleMs).not.toBeNull();
+    } finally {
+      egress.dispose();
+      echo.close();
+    }
+  });
+
+  it('disposes on idle timeout', async () => {
+    vi.useFakeTimers();
+    const { InternetEgress } = await import('../src/index.js');
+    const { conn } = makeFakeConn();
+    const disposed: string[] = [];
+    const egress = new InternetEgress('e1', 'A', '192.168.1.10', 8080, [], conn as any, [], 60_000, (id) => disposed.push(id));
+    await egress.start();
+    expect(disposed).toEqual([]);
+    vi.advanceTimersByTime(60_001);
+    expect(disposed).toEqual(['e1']);
+    expect(egress.getInfo().state).toBe('closed');
+    vi.useRealTimers();
+  });
+
+  it('dispose removes the remote listener and fires onDispose', async () => {
+    const { InternetEgress } = await import('../src/index.js');
+    const { conn, calls } = makeFakeConn();
+    const disposed: string[] = [];
+    const egress = new InternetEgress('e1', 'A', '192.168.1.10', 8080, [], conn as any, [], 60_000, (id) => disposed.push(id));
+    await egress.start();
+    egress.dispose();
+    expect(calls.unforwardIn).toEqual([8080]);
+    expect(disposed).toEqual(['e1']);
+    expect(egress.getInfo().state).toBe('closed');
+  });
+
+  it('marks dead when the SSH connection errors', async () => {
+    const { InternetEgress } = await import('../src/index.js');
+    const { conn, listeners } = makeFakeConn();
+    const egress = new InternetEgress('e1', 'A', '192.168.1.10', 8080, [], conn as any, []);
+    await egress.start();
+    const errorHandler = listeners['error']?.find((fn) => fn.toString().includes('markDead'));
+    expect(errorHandler).toBeDefined();
+    errorHandler(new Error('boom'));
+    expect(egress.getInfo().state).toBe('dead');
+    expect(egress.getInfo().lastError).toBe('boom');
+    egress.dispose();
   });
 });
