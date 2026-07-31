@@ -95,6 +95,7 @@ async function buildConnectConfig(host: StoredHost, hostId: string): Promise<Con
     host: host.host,
     port: host.port ?? 22,
     username: host.username,
+    keepaliveInterval: 30 * 1000,
   };
 
   if (host.password) {
@@ -166,10 +167,15 @@ type SftpConnection = {
 };
 
 /**
- * Open an SFTP connection to a configured host. Every configured proxyJump is
- * an SSH direct-tcpip hop; intermediate hosts only forward encrypted traffic.
+ * Open an SSH connection to a configured host, hopping through every
+ * configured proxyJump with ssh2 `forwardOut`. Intermediate hosts only
+ * forward encrypted traffic. Resolves once the final target connection is
+ * ready; ownership of the returned connections transfers to the caller.
  */
-async function openSftpConnection(resolved: ResolvedHost): Promise<SftpConnection> {
+async function openSshChain(resolved: ResolvedHost): Promise<{
+  conn: InstanceType<typeof SSHClient>;
+  jumpConns: InstanceType<typeof SSHClient>[];
+}> {
   return new Promise((resolve, reject) => {
     const targetConfig: ConnectConfig = { ...resolved.config };
     let conn: InstanceType<typeof SSHClient> | null = null;
@@ -195,18 +201,12 @@ async function openSftpConnection(resolved: ResolvedHost): Promise<SftpConnectio
 
       conn = new SSHClient();
       conn.once('ready', () => {
-        conn!.sftp((error, sftp) => {
-          if (error) {
-            fail(new Error(`Failed to start SFTP subsystem: ${error.message}`));
-            return;
-          }
-          if (settled) return;
-          settled = true;
-          resolve({ conn: conn!, jumpConns, sftp });
-        });
+        if (settled) return;
+        settled = true;
+        resolve({ conn: conn!, jumpConns });
       });
       conn.once('error', fail);
-      conn.once('end', () => fail(new Error('SSH connection closed before SFTP was ready')));
+      conn.once('end', () => fail(new Error('SSH connection closed before target was ready')));
       conn.connect(targetConfig);
     };
 
@@ -242,10 +242,25 @@ async function openSftpConnection(resolved: ResolvedHost): Promise<SftpConnectio
         });
       });
       jumpConn.once('error', (error) => fail(new Error(`Jump host '${jumpId}' connection failed: ${error.message}`)));
-      jumpConn.once('end', () => fail(new Error(`Jump host '${jumpId}' closed before SFTP was ready`)));
+      jumpConn.once('end', () => fail(new Error(`Jump host '${jumpId}' closed before target was ready`)));
       jumpConn.connect(jumpConfig);
     };
     connectJump(0);
+  });
+}
+
+async function openSftpConnection(resolved: ResolvedHost): Promise<SftpConnection> {
+  const { conn, jumpConns } = await openSshChain(resolved);
+  return new Promise((resolve, reject) => {
+    conn.sftp((error, sftp) => {
+      if (error) {
+        conn.end();
+        for (const jumpConn of jumpConns) jumpConn.end();
+        reject(new Error(`Failed to start SFTP subsystem: ${error.message}`));
+        return;
+      }
+      resolve({ conn, jumpConns, sftp });
+    });
   });
 }
 
