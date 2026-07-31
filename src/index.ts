@@ -12,6 +12,7 @@ import { posix as posixPath, resolve as resolvePath } from 'path';
 import os from 'os';
 import { randomUUID } from 'crypto';
 import net from 'net';
+import type { Duplex } from 'stream';
 
 function expandPath(input: string | undefined): string | undefined {
   if (!input) return input;
@@ -442,6 +443,145 @@ export function formatEgressLine(info: EgressInfo): string {
     line += ` idle=${info.idleMs}s`;
   }
   return line;
+}
+
+export type ConnectFn = (host: string, port: number) => Promise<Duplex>;
+
+function parseTarget(target: string, headers: string[]): { host: string; port: number; path: string } | null {
+  const absolute = /^https?:\/\/(\[[^\]]+\]|[^/:]+)(?::(\d+))?(\/\S*)?$/i.exec(target);
+  if (absolute) {
+    const [, host, portText, path = '/'] = absolute;
+    const defaultPort = /^https:/i.test(target) ? 443 : 80;
+    const port = portText ? Number.parseInt(portText, 10) : defaultPort;
+    if (port < 1 || port > 65535) return null;
+    return { host, port, path };
+  }
+  if (target.startsWith('/')) {
+    const hostLine = headers.find((h) => h.toLowerCase().startsWith('host:'));
+    if (!hostLine) return null;
+    const hostHeader = hostLine.slice(5).trim();
+    let host = hostHeader;
+    let port = 80;
+    if (hostHeader.startsWith('[')) {
+      const end = hostHeader.indexOf(']');
+      if (end === -1) return null;
+      host = hostHeader.slice(1, end);
+      const rest = hostHeader.slice(end + 1);
+      if (rest.startsWith(':')) port = Number.parseInt(rest.slice(1), 10);
+    } else {
+      const colon = hostHeader.lastIndexOf(':');
+      if (colon !== -1 && /^\d+$/.test(hostHeader.slice(colon + 1))) {
+        host = hostHeader.slice(0, colon);
+        port = Number.parseInt(hostHeader.slice(colon + 1), 10);
+      }
+    }
+    if (port < 1 || port > 65535) return null;
+    return { host, port, path: target };
+  }
+  return null;
+}
+
+function rewriteRequest(headerBlock: string, parsed: { host: string; port: number; path: string }): string {
+  const lines = headerBlock.split('\r\n');
+  const parts = lines[0].split(' ');
+  const method = parts[0];
+  const version = parts[2] ?? 'HTTP/1.1';
+  const out: string[] = [];
+  let hasHost = false;
+  for (const line of lines.slice(1)) {
+    const name = line.split(':')[0].toLowerCase();
+    if (name === 'proxy-connection' || name === 'proxy-authorization') continue;
+    if (name === 'host') hasHost = true;
+    out.push(line);
+  }
+  if (!hasHost) {
+    const hostPort = parsed.port === 80 || parsed.port === 443 ? parsed.host : `${parsed.host}:${parsed.port}`;
+    out.unshift(`Host: ${hostPort}`);
+  }
+  return `${method} ${parsed.path} ${version}\r\n${out.join('\r\n')}\r\n\r\n`;
+}
+
+export function handleProxyConnection(stream: Duplex, connect: ConnectFn): void {
+  let buffer = '';
+  let routed = false;
+
+  const fail = () => stream.destroy();
+
+  const route = (headerBlock: string, rest: string, requestLine: string, headers: string[]) => {
+    const parts = requestLine.split(' ');
+    if (parts.length < 3) {
+      fail();
+      return;
+    }
+    const [method, target] = parts;
+    if (method.toUpperCase() === 'CONNECT') {
+      const authority = target.trim();
+      const colon = authority.lastIndexOf(':');
+      const host = authority.slice(0, colon);
+      const port = Number.parseInt(authority.slice(colon + 1), 10);
+      if (!host || !Number.isInteger(port) || port < 1 || port > 65535) {
+        fail();
+        return;
+      }
+      Promise.resolve(connect(host, port)).then(
+        (sock) => {
+          stream.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+          wireUpstream(stream, sock, rest);
+        },
+        () => {
+          stream.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+          stream.destroy();
+        }
+      );
+      return;
+    }
+
+    const parsed = parseTarget(target, headers);
+    if (!parsed) {
+      fail();
+      return;
+    }
+    const rewritten = rewriteRequest(headerBlock, parsed);
+    Promise.resolve(connect(parsed.host, parsed.port)).then(
+      (sock) => {
+        sock.write(rewritten);
+        wireUpstream(stream, sock, rest);
+      },
+      () => {
+        stream.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+        stream.destroy();
+      }
+    );
+  };
+
+  const wireUpstream = (client: Duplex, upstream: Duplex, rest: string) => {
+    if (rest) upstream.write(rest);
+    client.pipe(upstream);
+    upstream.pipe(client);
+    client.on('error', () => upstream.destroy());
+    upstream.on('error', () => client.destroy());
+    client.on('close', () => upstream.destroy());
+    upstream.on('close', () => client.destroy());
+  };
+
+  const onData = (chunk: Buffer) => {
+    buffer += chunk.toString('latin1');
+    if (routed) return;
+    const headerEnd = buffer.indexOf('\r\n\r\n');
+    if (headerEnd === -1) {
+      if (buffer.length > 64 * 1024) stream.destroy();
+      return;
+    }
+    routed = true;
+    stream.removeListener('data', onData);
+    const headerBlock = buffer.slice(0, headerEnd);
+    const rest = buffer.slice(headerEnd + 4);
+    const lines = headerBlock.split('\r\n');
+    route(headerBlock, rest, lines[0], lines.slice(1));
+  };
+
+  stream.on('data', onData);
+  stream.on('error', () => stream.destroy());
 }
 
 // Command sanitization and validation
