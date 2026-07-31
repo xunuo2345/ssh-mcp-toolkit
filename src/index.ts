@@ -719,6 +719,11 @@ class PersistentSession {
     }
 
     const { conn, jumpConns } = await openSshChain(this.resolved);
+    if (this.disposed) {
+      conn.end();
+      for (const jumpConn of jumpConns) jumpConn.end();
+      return;
+    }
     this.conn = conn;
     this.jumpConns = jumpConns;
 
