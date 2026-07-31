@@ -7,39 +7,40 @@
 ## Table of Contents
 
 1. [Overview](#overview)
-2. [Key Features](#key-features)
-3. [Architecture](#architecture)
-4. [Installation](#installation)
-5. [Running the Server](#running-the-server)
-6. [Client Integrations](#client-integrations)
+2. [New Features（新增功能一览）](#new-features新增功能一览)
+3. [Key Features](#key-features)
+4. [Architecture](#architecture)
+5. [Installation](#installation)
+6. [Running the Server](#running-the-server)
+7. [Client Integrations](#client-integrations)
    - [Claude Desktop](#claude-desktop)
    - [Claude Code](#claude-code)
    - [Codex](#codex)
    - [Cursor](#cursor)
-7. [Host Configuration](#host-configuration)
+8. [Host Configuration](#host-configuration)
    - [Host Storage](#host-storage)
    - [Adding Hosts](#adding-hosts)
    - [Listing Hosts](#listing-hosts)
    - [Editing Hosts](#editing-hosts)
    - [Removing Hosts](#removing-hosts)
-8. [Session Management](#session-management)
+9. [Session Management](#session-management)
    - [Starting a Session](#starting-a-session)
    - [Listing Sessions](#listing-sessions)
    - [Executing Commands](#executing-commands)
    - [Closing Sessions](#closing-sessions)
-9. [File Transfer](#file-transfer)
-10. [Internet Egress](#internet-egress)
-11. [Port Forwarding (Tunnels)](#port-forwarding-tunnels)
-12. [Authentication Modes](#authentication-modes)
-13. [Timeouts & Inactivity Handling](#timeouts--inactivity-handling)
-14. [Directory Structure](#directory-structure)
-15. [Using the MCP Tools](#using-the-mcp-tools)
-16. [Testing](#testing)
-17. [Troubleshooting](#troubleshooting)
-18. [Security Considerations](#security-considerations)
-19. [Contributing](#contributing)
-20. [Credits & Acknowledgements（致谢）](#credits--acknowledgements致谢)
-21. [License](#license)
+10. [File Transfer](#file-transfer)
+11. [Internet Egress](#internet-egress)
+12. [Port Forwarding (Tunnels)](#port-forwarding-tunnels)
+13. [Authentication Modes](#authentication-modes)
+14. [Timeouts & Inactivity Handling](#timeouts--inactivity-handling)
+15. [Directory Structure](#directory-structure)
+16. [Using the MCP Tools](#using-the-mcp-tools)
+17. [Testing](#testing)
+18. [Troubleshooting](#troubleshooting)
+19. [Security Considerations](#security-considerations)
+20. [Contributing](#contributing)
+21. [Credits & Acknowledgements（致谢）](#credits--acknowledgements致谢)
+22. [License](#license)
 
 ---
 
@@ -50,6 +51,21 @@
 The server is implemented in TypeScript on top of the official [@modelcontextprotocol/sdk](https://www.npmjs.com/package/@modelcontextprotocol/sdk).
 
 Hosts that are not directly reachable can be tunneled through any number of jump hosts. The same chain also powers local port forwarding: an internal service's port can be exposed to the local machine over a dedicated SSH tunnel, so ordinary tools (browsers, database clients, admin consoles) can reach it at `http://localhost:PORT`.
+
+---
+
+## New Features（新增功能一览）
+
+本项目是 [`ssh-mcp-sessions@1.0.17`](#credits--acknowledgements致谢) 的二次开发。以下能力均为本项目在既有 SSH 会话 / SFTP 基础之上新增：
+
+| 能力 | 相关工具 / 字段 | 说明 | 详见 |
+|---|---|---|---|
+| 多跳跳板 ProxyJump | `add-host` 的 `proxyJump` 字段 | 任意跳数的链式 SSH 穿透；纯 JS 实现（ssh2 `forwardOut`），**无需本地 `ssh` 命令** | [Host Configuration](#host-configuration)、[File Transfer](#file-transfer) |
+| SFTP 文件传输 | `upload-file` / `download-file` | 复用同一条跳板链上传/下载文件，自动创建远端缺失的父目录 | [File Transfer](#file-transfer) |
+| 本地端口转发（隧道） | `open-tunnel` / `close-tunnel` / `list-tunnels` | 把内网应用端口暴露到本机 `localhost`（`ssh -L` 风格），支持多跳，2 小时无活跃连接自动回收 | [Port Forwarding (Tunnels)](#port-forwarding-tunnels) |
+| 内网出网（Internet Egress） | `open-egress` / `close-egress` / `list-egress` | 让内网服务器 B/C 经本地机器访问外网（`ssh -R` + 本地 HTTP 正向代理），可用于 `apt`/`pip`/`npm` 下包 | [Internet Egress](#internet-egress) |
+
+所有新增均向后兼容：原有 `hosts.json` 格式与既有工具调用方式完全不变。
 
 ---
 
