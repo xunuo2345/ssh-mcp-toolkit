@@ -1,6 +1,6 @@
 # ssh-mcp-toolkit
 
-> A Model Context Protocol (MCP) server that gives LLM clients safe, persistent SSH access to remote machines — with multi-hop ProxyJump tunneling and SFTP file transfer.
+> A Model Context Protocol (MCP) server that gives LLM clients safe, persistent SSH access to remote machines — with multi-hop ProxyJump tunneling, SFTP file transfer, and local port forwarding.
 
 ---
 
@@ -28,16 +28,17 @@
    - [Executing Commands](#executing-commands)
    - [Closing Sessions](#closing-sessions)
 9. [File Transfer](#file-transfer)
-10. [Authentication Modes](#authentication-modes)
-11. [Timeouts & Inactivity Handling](#timeouts--inactivity-handling)
-12. [Directory Structure](#directory-structure)
-13. [Using the MCP Tools](#using-the-mcp-tools)
-14. [Testing](#testing)
-15. [Troubleshooting](#troubleshooting)
-16. [Security Considerations](#security-considerations)
-17. [Contributing](#contributing)
-18. [Credits & Acknowledgements（致谢）](#credits--acknowledgements致谢)
-19. [License](#license)
+10. [Port Forwarding (Tunnels)](#port-forwarding-tunnels)
+11. [Authentication Modes](#authentication-modes)
+12. [Timeouts & Inactivity Handling](#timeouts--inactivity-handling)
+13. [Directory Structure](#directory-structure)
+14. [Using the MCP Tools](#using-the-mcp-tools)
+15. [Testing](#testing)
+16. [Troubleshooting](#troubleshooting)
+17. [Security Considerations](#security-considerations)
+18. [Contributing](#contributing)
+19. [Credits & Acknowledgements（致谢）](#credits--acknowledgements致谢)
+20. [License](#license)
 
 ---
 
@@ -46,6 +47,8 @@
 `ssh-mcp-toolkit` lets MCP-compatible clients (such as Claude Code, Cursor, or custom MCP inspectors) control remote machines through SSH. Once hosts are registered, the server maintains persistent shell sessions that retain environment state between commands—ideal for multi-step workflows, long-running processes, or interactive diagnostics. Hosts that are not directly reachable can be tunneled through any number of jump hosts, and files can be moved in either direction over SFTP across the same tunnel.
 
 The server is implemented in TypeScript on top of the official [@modelcontextprotocol/sdk](https://www.npmjs.com/package/@modelcontextprotocol/sdk).
+
+Hosts that are not directly reachable can be tunneled through any number of jump hosts. The same chain also powers local port forwarding: an internal service's port can be exposed to the local machine over a dedicated SSH tunnel, so ordinary tools (browsers, database clients, admin consoles) can reach it at `http://localhost:PORT`.
 
 ---
 
@@ -56,7 +59,8 @@ The server is implemented in TypeScript on top of the official [@modelcontextpro
 - **Stored host profiles:** manage SSH targets through durable JSON configuration (`~/.ssh-mcp/hosts.json`).
 - **Flexible authentication:** supports passwords, private keys, and SSH agent forwarding (fallback).
 - **SFTP file transfer:** upload and download files directly, including targets reached through a configured jump host.
-- **Timeout & cleanup safeguards:** sessions auto-close after prolonged inactivity; commands are marked and monitored for completion.
+- **Local port forwarding:** expose an internal service's port to the local machine over the same SSH chain — including multi-hop setups — with no local `ssh` binary required.
+- **Timeout & cleanup safeguards:** sessions and tunnels auto-close after prolonged inactivity; commands are marked and monitored for completion.
 - **Structured listings:** query active sessions and saved hosts directly from the MCP client.
 
 ---
@@ -74,6 +78,10 @@ MCP Client ─┬─> add-host / edit-host / remove-host
             │
             ├─> upload-file / download-file ─> temporary SFTP connection
             │                                └─> optional ProxyJump tunnel
+            │
+            ├─> open-tunnel ──> PortForward (net.Server + conn.forwardOut)
+            │    close-tunnel / list-tunnels  └─> dedicated SSH connection
+            │                                   └─> optional ProxyJump tunnel
             │
             └─> list-sessions
 
@@ -426,6 +434,81 @@ The local destination directory must already exist. An existing local file at `l
 
 ---
 
+## Port Forwarding (Tunnels)
+
+The server can expose a port of an internal service to the local machine over a dedicated SSH tunnel — the same style as `ssh -L` local port forwarding, implemented entirely in JavaScript on top of ssh2. The tunnel reuses the host's `proxyJump` chain, so multi-hop topologies work with no extra configuration, no local `ssh` binary, and no inbound firewall changes on the target network.
+
+Typical scenario: the local machine can only reach an internal gateway over SSH, and an application (web service, database, admin console, …) runs on a machine further inside. After opening a tunnel, the service is reachable at `http://localhost:PORT` on the local machine.
+
+### Opening a tunnel
+
+Tool: **`open-tunnel`**
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `host_id` | string | ✔ | — | Registered host whose SSH chain (including its `proxyJump`) forwards to the service |
+| `remote_port` | number | ✔ | — | Service port, 1–65535 |
+| `remote_host` | string | | `127.0.0.1` | Service address as reachable from the chain's final hop |
+| `local_port` | number | | auto-assigned | Local port to listen on |
+| `local_bind` | string | | `127.0.0.1` | Local address to bind; non-loopback binds log a warning |
+| `tunnel_id` | string | | auto UUID | Identifier used by `close-tunnel` / `list-tunnels` |
+
+```json
+{
+  "host_id": "internal-gateway",
+  "remote_host": "127.0.0.1",
+  "remote_port": 8080,
+  "local_port": 8080,
+  "tunnel_id": "web"
+}
+```
+
+Response:
+
+```
+Tunnel 'web' listening on 127.0.0.1:8080 -> 127.0.0.1:8080
+```
+
+After this, `http://localhost:8080` on the MCP machine reaches the internal service. With a multi-hop chain the response shows the full path, e.g.:
+
+```
+Tunnel 'web' listening on 127.0.0.1:8080 -> gateway -> app-server -> 127.0.0.1:8080
+```
+
+### Listing tunnels
+
+Tool: **`list-tunnels`**
+
+```
+tunnel=web local=127.0.0.1:8080 -> host=app-server remote=127.0.0.1:8080 jump=gateway -> app-server state=active conns=0/1 idle=0s
+```
+
+- `jump=` shows the full jump path, or `direct` when the host has no `proxyJump`.
+- `conns=active/total` counts live vs. cumulative connections through the tunnel.
+- `idle=` is shown while no connection is active.
+- `state=dead` (with `lastError=`) marks a tunnel whose SSH chain dropped; the record is kept until you close it.
+
+### Closing a tunnel
+
+Tool: **`close-tunnel`**
+
+```json
+{
+  "tunnel_id": "web"
+}
+```
+
+Closes the local listener, destroys all active connections, and tears down the SSH chain (including every jump hop).
+
+### Lifecycle
+
+- Tunnels are independent of shell sessions — opening one does not require `start-session`.
+- A tunnel auto-closes after **2 hours of inactivity** (the same timeout as sessions); any active connection keeps it alive.
+- Closing the MCP server process closes all tunnels.
+- If the SSH chain drops (network interruption, host restart), the tunnel transitions to `dead`; a failed individual connection does not close the tunnel.
+
+---
+
 ## Authentication Modes
 
 1. **Password** — stored in `hosts.json`; transmitted to `ssh2` during connection.
@@ -439,6 +522,7 @@ The local destination directory must already exist. An existing local file at `l
 - Each session has a **global inactivity timeout** (default 2 hours). Timer resets whenever a command executes successfully.
 - If the timer elapses, the session cleans up the SSH connection, shell, and resolver buffer, and removes itself from `activeSessions`.
 - Command completion uses a UUID marker: `printf '__MCP_DONE__{uuid}%d\n' $?`. Output before the marker is returned; numeric code after the marker becomes the exit status.
+- Each tunnel shares the same **2-hour inactivity timeout**, but only counts while **no connection** is flowing through it. The timer is cleared as soon as a connection opens and restarts after the last one closes.
 
 ---
 
@@ -483,15 +567,23 @@ Below is a typical workflow using Claude Code (commands start with `/mcp`), but 
    /mcp mcp-remote-ssh download-file {"host_id":"host","remote_path":"/var/log/app.log","local_path":"C:/downloads/app.log"}
    ```
 
-5. **Inspect**
+5. **Expose an internal service (optional)**
+   ```
+   /mcp mcp-remote-ssh open-tunnel {"host_id":"host","remote_port":8080,"local_port":8080}
+   ```
+   → returns a tunnel id; the service is then reachable at `http://localhost:8080`. Close it with `close-tunnel`.
+
+6. **Inspect**
    ```
    /mcp mcp-remote-ssh list-sessions
    /mcp mcp-remote-ssh list-hosts
+   /mcp mcp-remote-ssh list-tunnels
    ```
 
-6. **Close session**
+7. **Close session / tunnel**
    ```
    /mcp mcp-remote-ssh close-session {"sessionId":"<id>"}
+   /mcp mcp-remote-ssh close-tunnel {"tunnel_id":"<id>"}
    ```
 
 ---
@@ -518,6 +610,8 @@ Integration smoke tests for SSH are not included by default because they require
 | Session disappears from `list-sessions` | Inactivity timeout reached | Start a new session or reduce idle periods. |
 | Permission denied (publickey) | Missing credentials | Ensure `keyPath` or agent has the right key. |
 | `Invalid key path` | `keyPath` resolved to undefined or missing file | Provide an absolute/tilde path that exists. |
+| `Local port X is already in use` | The requested `local_port` is taken | Pick another port, or omit `local_port` to auto-assign. |
+| Tunnel shows `state=dead` | SSH chain dropped (network, restart) | Read `lastError` in `list-tunnels`, then `close-tunnel` and reopen. |
 
 ---
 
@@ -559,6 +653,7 @@ Issues and feature requests are welcome via GitHub.
 - **ProxyJump 跳板机支持** —— 主机配置新增可选的 `proxyJump` 字段，支持任意跳数的链式穿透；完全用 JavaScript 通过 ssh2 的 `forwardOut` 实现，**无需本地 `ssh` 命令**，在 Windows 和 Linux 上行为一致。保存配置时会拒绝自引用、不存在的跳板机以及成环配置。
 - **SFTP 文件传输** —— 新增 `upload-file` 与 `download-file` 两个工具，复用同一条跳板链，自动创建远端缺失的父目录，且**不在中间跳板机上留下任何文件**。
 - **跳板信息可见** —— `list-hosts` 输出附带 `jump=<id>`，`list-sessions` 展示完整跳板路径（`jump=gateway -> a -> b`）或 `direct`。
+- **本地端口转发（隧道）** —— 新增 `open-tunnel` / `close-tunnel` / `list-tunnels` 三个工具，把内网服务的端口通过专用 SSH 隧道暴露到本机回环地址（`ssh -L` 风格，纯 JavaScript 实现）。完全复用同一套多跳跳板链，无需本地 `ssh` 命令；每条隧道 2 小时无活跃连接自动回收，SSH 链路断开时标记为 `dead` 供 `list-tunnels` 查看。
 - **单元测试** —— 覆盖主机 schema、跳板链解析与跳板配置校验。
 
 以上新增均向后兼容：原有的 `hosts.json` 与原有的工具调用方式行为完全不变。
