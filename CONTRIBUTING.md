@@ -1,6 +1,6 @@
-# Contributing to ssh-mcp
+# Contributing to ssh-mcp-toolkit
 
-Thank you for your interest in contributing to ssh-mcp! Your help is greatly appreciated. Please follow these guidelines to make the process smooth for everyone.
+Thank you for your interest in contributing to ssh-mcp-toolkit! Your help is greatly appreciated. Please follow these guidelines to make the process smooth for everyone.
 
 ## How to Contribute
 
@@ -33,4 +33,4 @@ Thank you for your interest in contributing to ssh-mcp! Your help is greatly app
 - Be respectful and inclusive in all interactions.
 - See the [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) if available.
 
-Thank you for helping make ssh-mcp better! 
+Thank you for helping make ssh-mcp-toolkit better! 

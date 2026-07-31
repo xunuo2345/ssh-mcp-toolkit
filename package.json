@@ -1,11 +1,11 @@
 {
-  "name": "ssh-mcp-sessions-redev",
+  "name": "ssh-mcp-toolkit",
   "license": "MIT",
   "version": "1.0.0",
   "description": "An MCP tool to manage persistent ssh connections to a collection of hosts enabling remote development, deployment, and information gathering. Adds multi-hop ProxyJump tunneling and SFTP file transfer.",
   "type": "module",
   "bin": {
-    "ssh-mcp-sessions-redev": "build/index.js"
+    "ssh-mcp-toolkit": "build/index.js"
   },
   "scripts": {
     "prepare": "npm run build",
@@ -34,13 +34,13 @@
     "typescript": "^5.9.2",
     "vitest": "^3.2.4"
   },
-  "homepage": "https://github.com/xunuo2345/ssh-mcp-sessions-redev#readme",
+  "homepage": "https://github.com/xunuo2345/ssh-mcp-toolkit#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/xunuo2345/ssh-mcp-sessions-redev.git"
+    "url": "git+https://github.com/xunuo2345/ssh-mcp-toolkit.git"
   },
   "bugs": {
-    "url": "https://github.com/xunuo2345/ssh-mcp-sessions-redev/issues"
+    "url": "https://github.com/xunuo2345/ssh-mcp-toolkit/issues"
   },
   "keywords": [
     "ssh",

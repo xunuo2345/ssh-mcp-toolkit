@@ -1,6 +1,6 @@
-# SSH MCP Server
+# ssh-mcp-toolkit
 
-> A Model Context Protocol (MCP) server that gives LLM clients safe, persistent SSH access to remote machines.
+> A Model Context Protocol (MCP) server that gives LLM clients safe, persistent SSH access to remote machines — with multi-hop ProxyJump tunneling and SFTP file transfer.
 
 ---
 
@@ -43,7 +43,7 @@
 
 ## Overview
 
-`ssh-mcp` lets MCP-compatible clients (such as Claude Code, Cursor, or custom MCP inspectors) control remote machines through SSH. Once hosts are registered, the server maintains persistent shell sessions that retain environment state between commands—ideal for multi-step workflows, long-running processes, or interactive diagnostics.
+`ssh-mcp-toolkit` lets MCP-compatible clients (such as Claude Code, Cursor, or custom MCP inspectors) control remote machines through SSH. Once hosts are registered, the server maintains persistent shell sessions that retain environment state between commands—ideal for multi-step workflows, long-running processes, or interactive diagnostics. Hosts that are not directly reachable can be tunneled through any number of jump hosts, and files can be moved in either direction over SFTP across the same tunnel.
 
 The server is implemented in TypeScript on top of the official [@modelcontextprotocol/sdk](https://www.npmjs.com/package/@modelcontextprotocol/sdk).
 
@@ -90,21 +90,21 @@ Each active session maintains:
 
 ## Installation
 
-> This fork is **not published to npm** — the `ssh-mcp-sessions` package name belongs to the upstream project. Install it directly from GitHub, which gives you the `ssh-mcp-sessions-redev` executable.
+> This fork is **not published to npm** — the `ssh-mcp-sessions` package name belongs to the upstream project. Install it directly from GitHub, which gives you the `ssh-mcp-toolkit` executable.
 
 ### Global install from GitHub (preferred)
 
 ```bash
-npm install -g github:xunuo2345/ssh-mcp-sessions-redev
+npm install -g github:xunuo2345/ssh-mcp-toolkit
 ```
 
-The `prepare` script compiles TypeScript during install. Launch the server anywhere by running `ssh-mcp-sessions-redev`.
+The `prepare` script compiles TypeScript during install. Launch the server anywhere by running `ssh-mcp-toolkit`.
 
 ### From source
 
 ```bash
-git clone https://github.com/xunuo2345/ssh-mcp-sessions-redev.git
-cd ssh-mcp-sessions-redev
+git clone https://github.com/xunuo2345/ssh-mcp-toolkit.git
+cd ssh-mcp-toolkit
 npm install          # `prepare` runs the build for you
 ```
 
@@ -120,7 +120,7 @@ Add an entry to `~/Library/Application Support/Claude/claude_desktop_config.json
 {
   "mcpServers": {
     "ssh-mcp": {
-      "command": "ssh-mcp-sessions-redev"
+      "command": "ssh-mcp-toolkit"
     }
   }
 }
@@ -136,7 +136,7 @@ Update the Claude Code workspace settings (`.vscode/settings.json` or global set
 {
   "claude.mcpServers": {
     "ssh-mcp": {
-      "command": "ssh-mcp-sessions-redev"
+      "command": "ssh-mcp-toolkit"
     }
   }
 }
@@ -150,7 +150,7 @@ Create or edit `~/.config/openai-codex/mcp.toml` (the path may differ per platfo
 
 ```toml
 [mcpServers."ssh-mcp"]
-command = "ssh-mcp-sessions-redev"
+command = "ssh-mcp-toolkit"
 ```
 
 Restart Codex or re-open the MCP inspector. The `ssh-mcp` tools will appear under the configured servers list.
@@ -163,7 +163,7 @@ Open Cursor settings → “Model Context Protocol” (or edit `~/Library/Applic
 {
   "mcpServers": {
     "ssh-mcp": {
-      "command": "ssh-mcp-sessions-redev"
+      "command": "ssh-mcp-toolkit"
     }
   }
 }
@@ -172,14 +172,14 @@ Open Cursor settings → “Model Context Protocol” (or edit `~/Library/Applic
 After saving, reload Cursor. The MCP sidebar exposes the server; you can invoke tools via chat or the command palette (`Cmd/Ctrl+Shift+L`).
 
 > **Tip:** If the executable is not on your `PATH` (e.g. you installed from source rather than globally), point the client at the built file instead:
-> `{ "command": "node", "args": ["/absolute/path/to/ssh-mcp-sessions-redev/build/index.js"] }`
+> `{ "command": "node", "args": ["/absolute/path/to/ssh-mcp-toolkit/build/index.js"] }`
 
 ---
 
 ## Running the Server
 
 ```bash
-ssh-mcp-sessions-redev
+ssh-mcp-toolkit
 ```
 
 The server is purely stdio-based. Once running it prints:
@@ -194,7 +194,7 @@ You can register it with Claude Code or any other MCP client by pointing to the 
 {
   "mcpServers": {
     "ssh-mcp": {
-      "command": "ssh-mcp-sessions-redev"
+      "command": "ssh-mcp-toolkit"
     }
   }
 }
@@ -445,7 +445,7 @@ The local destination directory must already exist. An existing local file at `l
 ## Directory Structure
 
 ```
-ssh-mcp/
+ssh-mcp-toolkit/
 ├── build/                # Compiled JS output (npm run build)
 ├── src/index.ts          # Primary MCP server implementation
 ├── test/                 # Vitest tests (CLI-only; integration tests skipped)
