@@ -1,0 +1,61 @@
+{
+  "name": "ssh-mcp-sessions",
+  "license": "MIT",
+  "version": "1.0.17",
+  "description": "An MCP tool to manage persistent ssh connections to a collection of hosts enabling remote development, deployment, and information gathering.",
+  "type": "module",
+  "bin": {
+    "ssh-mcp-sessions": "build/index.js"
+  },
+  "scripts": {
+    "prepare": "npm run build",
+    "build": "tsc && shx chmod +x build/*.js",
+    "inspect": "npx @modelcontextprotocol/inspector node build/index.js",
+    "test": "cross-env SSH_MCP_DISABLE_MAIN=1 vitest --run",
+    "test:watch": "cross-env SSH_MCP_DISABLE_MAIN=1 vitest",
+    "coverage": "cross-env SSH_MCP_DISABLE_MAIN=1 vitest --run --coverage"
+  },
+  "files": [
+    "build"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.5",
+    "ssh2": "^1.17.0",
+    "zod": "3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^24.5.2",
+    "@types/ssh2": "^1.15.5",
+    "cross-env": "^7.0.3",
+    "shx": "^0.4.0",
+    "testcontainers": "^11.7.0",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  },
+  "homepage": "https://github.com/xunuo2345/ssh-mcp-sessions#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xunuo2345/ssh-mcp-sessions.git"
+  },
+  "bugs": {
+    "url": "https://github.com/xunuo2345/ssh-mcp-sessions/issues"
+  },
+  "keywords": [
+    "ssh",
+    "mcp",
+    "model-context-protocol",
+    "server",
+    "windows",
+    "linux",
+    "automation",
+    "remote",
+    "cli",
+    "typescript"
+  ],
+  "author": "kryonas",
+  "engines": {
+    "node": ">=18"
+  }
+}
