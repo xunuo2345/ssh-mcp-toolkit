@@ -994,7 +994,7 @@ server.tool(
 
 server.tool(
   "open-egress",
-  "Let internal servers on the host's network reach the internet through the local machine. Opens an HTTP forward proxy port on the host via remote port forwarding; point other machines at http://<proxy_bind>:<proxy_port>. The host's sshd must allow TCP forwarding (AllowTcpForwarding yes) and, for a non-loopback bind, GatewayPorts yes.",
+  "Let internal servers on the host's network reach the internet through the local machine. Opens an HTTP forward proxy port on the host via remote port forwarding; point other machines at http://<proxy_bind>:<proxy_port>. The host's sshd must allow TCP forwarding (AllowTcpForwarding yes) and, for a non-loopback bind, GatewayPorts clientspecified (or yes).",
   {
     host_id: z.string().describe("Identifier of the host (A) on which to open the proxy port"),
     proxy_port: z.number().int().describe("Port to listen on the host, 1-65535"),
