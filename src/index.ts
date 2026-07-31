@@ -445,12 +445,13 @@ export function formatEgressLine(info: EgressInfo): string {
   return line;
 }
 
-export type ConnectFn = (host: string, port: number) => Promise<Duplex>;
+export type ConnectFn = (host: string, port: number) => Duplex | Promise<Duplex>;
 
 function parseTarget(target: string, headers: string[]): { host: string; port: number; path: string } | null {
   const absolute = /^https?:\/\/(\[[^\]]+\]|[^/:]+)(?::(\d+))?(\/\S*)?$/i.exec(target);
   if (absolute) {
-    const [, host, portText, path = '/'] = absolute;
+    const [, rawHost, portText, path = '/'] = absolute;
+    const host = rawHost.replace(/^\[|\]$/g, '');
     const defaultPort = /^https:/i.test(target) ? 443 : 80;
     const port = portText ? Number.parseInt(portText, 10) : defaultPort;
     if (port < 1 || port > 65535) return null;
@@ -517,13 +518,21 @@ export function handleProxyConnection(stream: Duplex, connect: ConnectFn): void 
     if (method.toUpperCase() === 'CONNECT') {
       const authority = target.trim();
       const colon = authority.lastIndexOf(':');
-      const host = authority.slice(0, colon);
+      const host = authority.slice(0, colon).replace(/^\[|\]$/g, '');
       const port = Number.parseInt(authority.slice(colon + 1), 10);
       if (!host || !Number.isInteger(port) || port < 1 || port > 65535) {
         fail();
         return;
       }
-      Promise.resolve(connect(host, port)).then(
+      let dialing: Duplex | Promise<Duplex>;
+      try {
+        dialing = connect(host, port);
+      } catch {
+        stream.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+        stream.destroy();
+        return;
+      }
+      Promise.resolve(dialing).then(
         (sock) => {
           stream.write('HTTP/1.1 200 Connection Established\r\n\r\n');
           wireUpstream(stream, sock, rest);
@@ -542,7 +551,15 @@ export function handleProxyConnection(stream: Duplex, connect: ConnectFn): void 
       return;
     }
     const rewritten = rewriteRequest(headerBlock, parsed);
-    Promise.resolve(connect(parsed.host, parsed.port)).then(
+    let dialing: Duplex | Promise<Duplex>;
+    try {
+      dialing = connect(parsed.host, parsed.port);
+    } catch {
+      stream.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+      stream.destroy();
+      return;
+    }
+    Promise.resolve(dialing).then(
       (sock) => {
         sock.write(rewritten);
         wireUpstream(stream, sock, rest);
