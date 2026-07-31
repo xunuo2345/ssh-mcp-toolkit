@@ -407,6 +407,43 @@ export function formatTunnelLine(info: PortForwardInfo): string {
   return line;
 }
 
+export type EgressInfo = {
+  id: string;
+  hostId: string;
+  proxyBind: string;
+  proxyPort: number;
+  jumpHosts: string[];
+  state: 'connecting' | 'active' | 'dead' | 'closed';
+  activeConnections: number;
+  totalConnections: number;
+  lastError: string | null;
+  idleMs: number | null;
+};
+
+export function validateEgressParams(params: {
+  proxyPort?: number;
+  proxyBind?: string;
+}): void {
+  const { proxyPort, proxyBind } = params;
+  if (proxyPort !== undefined && (!Number.isInteger(proxyPort) || proxyPort < 1 || proxyPort > 65535)) {
+    throw new McpError(ErrorCode.InvalidParams, 'proxy_port must be an integer between 1 and 65535');
+  }
+  if (proxyBind !== undefined && (typeof proxyBind !== 'string' || net.isIP(proxyBind) === 0)) {
+    throw new McpError(ErrorCode.InvalidParams, 'proxy_bind must be a valid IPv4 or IPv6 address');
+  }
+}
+
+export function formatEgressLine(info: EgressInfo): string {
+  const jump = info.jumpHosts.length ? info.jumpHosts.join(' -> ') : 'direct';
+  let line = `egress=${info.id} host=${info.hostId} bind=${info.proxyBind}:${info.proxyPort} jump=${jump} state=${info.state} conns=${info.activeConnections}/${info.totalConnections}`;
+  if (info.state === 'dead' && info.lastError) {
+    line += ` lastError=${info.lastError}`;
+  } else if (info.activeConnections === 0) {
+    line += ` idle=${info.idleMs}s`;
+  }
+  return line;
+}
+
 // Command sanitization and validation
 export function sanitizeCommand(command: string): string {
   if (typeof command !== 'string') {
