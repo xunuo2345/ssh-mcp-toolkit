@@ -374,7 +374,8 @@ const DEFAULT_SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
 
 const server = new McpServer({
   name: 'SSH MCP Server',
-  version: '1.0.9',
+  // Keep in sync with the "version" field in package.json.
+  version: '1.0.0',
   capabilities: {
     resources: {},
     tools: {},
