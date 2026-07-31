@@ -379,8 +379,9 @@ export function validateTunnelParams(params: {
   localPort?: number;
   remotePort?: number;
   localBind?: string;
+  remoteHost?: string;
 }): void {
-  const { localPort, remotePort, localBind } = params;
+  const { localPort, remotePort, localBind, remoteHost } = params;
   if (remotePort !== undefined && (!Number.isInteger(remotePort) || remotePort < 1 || remotePort > 65535)) {
     throw new McpError(ErrorCode.InvalidParams, 'remote_port must be an integer between 1 and 65535');
   }
@@ -389,6 +390,9 @@ export function validateTunnelParams(params: {
   }
   if (localBind !== undefined && (typeof localBind !== 'string' || localBind.length === 0)) {
     throw new McpError(ErrorCode.InvalidParams, 'local_bind must be a non-empty string');
+  }
+  if (remoteHost !== undefined && (typeof remoteHost !== 'string' || remoteHost.length === 0)) {
+    throw new McpError(ErrorCode.InvalidParams, 'remote_host must be a non-empty string');
   }
 }
 
@@ -699,7 +703,7 @@ server.tool(
     tunnel_id: z.string().optional().describe("Optional tunnel identifier; generated if omitted"),
   },
   async ({ host_id, remote_port, remote_host, local_port, local_bind, tunnel_id }) => {
-    validateTunnelParams({ localPort: local_port, remotePort: remote_port, localBind: local_bind });
+    validateTunnelParams({ localPort: local_port, remotePort: remote_port, localBind: local_bind, remoteHost: remote_host });
     const id = tunnel_id && tunnel_id.trim() ? tunnel_id.trim() : randomUUID();
     if (activeTunnels.has(id)) {
       throw new McpError(ErrorCode.InvalidParams, `Tunnel '${id}' already exists`);
@@ -730,11 +734,16 @@ server.tool(
     } catch (error: any) {
       throw error instanceof McpError
         ? error
-        : new McpError(ErrorCode.InternalError, `Failed to open tunnel to '${host_id}': ${error.message}`);
+        : new McpError(ErrorCode.InternalError, `Failed to open tunnel to '${host_id}': ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    if (activeTunnels.has(id)) {
+      tunnel.dispose();
+      throw new McpError(ErrorCode.InvalidParams, `Tunnel '${id}' already exists`);
     }
 
     activeTunnels.set(id, tunnel);
-    if (local_bind !== '127.0.0.1' && local_bind !== 'localhost' && local_bind !== '0.0.0.0' && !local_bind.startsWith('::')) {
+    if (local_bind !== '127.0.0.1' && local_bind !== 'localhost' && local_bind !== '::1') {
       console.error(`Warning: tunnel '${id}' binds ${local_bind} — it is reachable beyond localhost`);
     }
     const chain = resolved.jumpHostIds.length ? ` -> ${resolved.jumpHostIds.join(' -> ')}` : '';
@@ -1080,6 +1089,8 @@ export class PortForward {
       this.server = net.createServer((socket) => this.handleConnection(socket));
       this.server.on('error', (error: NodeJS.ErrnoException) => {
         this.closeConnections();
+        this.server = null;
+        this.state = 'closed';
         if (error.code === 'EADDRINUSE') {
           reject(new McpError(ErrorCode.InvalidParams, `Local port ${this.boundPort} is already in use`));
         } else {
@@ -1087,6 +1098,12 @@ export class PortForward {
         }
       });
       this.server.listen(this.boundPort, this.localBind, () => {
+        if (this.state === 'dead' || this.disposed) {
+          this.closeServer();
+          this.closeConnections();
+          reject(new Error('SSH chain closed before the tunnel could start'));
+          return;
+        }
         const address = this.server!.address() as net.AddressInfo;
         this.boundPort = address.port;
         this.state = 'active';
@@ -1149,6 +1166,10 @@ export class PortForward {
       if (error) {
         this.lastError = `forwardOut to ${this.remoteHost}:${this.remotePort} failed: ${error.message}`;
         socket.destroy();
+        return;
+      }
+      if (socket.destroyed) {
+        stream.destroy();
         return;
       }
       socket.pipe(stream);

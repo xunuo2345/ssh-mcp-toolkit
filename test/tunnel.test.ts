@@ -129,32 +129,34 @@ describe('PortForward', () => {
       't1', 'h1', '127.0.0.1', 0, '127.0.0.1', echoPort, [],
       fakeConn as any, [], 60_000
     );
-    await tunnel.start();
-    const boundPort = tunnel.getInfo().localPort;
-    expect(boundPort).toBeGreaterThan(0);
-    expect(tunnel.getInfo().state).toBe('active');
+    try {
+      await tunnel.start();
+      const boundPort = tunnel.getInfo().localPort;
+      expect(boundPort).toBeGreaterThan(0);
+      expect(tunnel.getInfo().state).toBe('active');
 
-    await new Promise<void>((resolve, reject) => {
-      const client = net.connect({ host: '127.0.0.1', port: boundPort }, () => client.write('hello'));
-      client.on('data', (data) => {
-        try {
-          expect(data.toString()).toBe('hello');
-          client.end();
-          resolve();
-        } catch (err) {
-          reject(err);
-        }
+      await new Promise<void>((resolve, reject) => {
+        const client = net.connect({ host: '127.0.0.1', port: boundPort }, () => client.write('hello'));
+        client.on('data', (data) => {
+          try {
+            expect(data.toString()).toBe('hello');
+            client.end();
+            resolve();
+          } catch (err) {
+            reject(err);
+          }
+        });
+        client.on('error', reject);
       });
-      client.on('error', reject);
-    });
 
-    await new Promise((r) => setTimeout(r, 30));
-    expect(calls).toEqual([['127.0.0.1', 0, '127.0.0.1', echoPort]]);
-    expect(tunnel.getInfo().totalConnections).toBe(1);
-    expect(tunnel.getInfo().activeConnections).toBe(0);
-
-    tunnel.dispose();
-    echo.close();
+      await new Promise((r) => setTimeout(r, 30));
+      expect(calls).toEqual([['127.0.0.1', 0, '127.0.0.1', echoPort]]);
+      expect(tunnel.getInfo().totalConnections).toBe(1);
+      expect(tunnel.getInfo().activeConnections).toBe(0);
+    } finally {
+      tunnel.dispose();
+      echo.close();
+    }
   });
 
   it('runs the idle timer only while there are no active connections', async () => {
@@ -164,22 +166,24 @@ describe('PortForward', () => {
       't1', 'h1', '127.0.0.1', 0, '127.0.0.1', echoPort, [],
       makeFakeConn() as any, [], 60_000
     );
-    await tunnel.start();
-    expect(tunnel.getInfo().idleMs).not.toBeNull();
+    try {
+      await tunnel.start();
+      expect(tunnel.getInfo().idleMs).not.toBeNull();
 
-    const client = net.connect({ host: '127.0.0.1', port: tunnel.getInfo().localPort });
-    await new Promise((r) => client.on('connect', r));
-    await new Promise((r) => setTimeout(r, 30));
-    expect(tunnel.getInfo().activeConnections).toBe(1);
-    expect(tunnel.getInfo().idleMs).toBeNull();
+      const client = net.connect({ host: '127.0.0.1', port: tunnel.getInfo().localPort });
+      await new Promise((r) => client.on('connect', r));
+      await new Promise((r) => setTimeout(r, 30));
+      expect(tunnel.getInfo().activeConnections).toBe(1);
+      expect(tunnel.getInfo().idleMs).toBeNull();
 
-    client.destroy();
-    await new Promise((r) => setTimeout(r, 30));
-    expect(tunnel.getInfo().activeConnections).toBe(0);
-    expect(tunnel.getInfo().idleMs).not.toBeNull();
-
-    tunnel.dispose();
-    echo.close();
+      client.destroy();
+      await new Promise((r) => setTimeout(r, 30));
+      expect(tunnel.getInfo().activeConnections).toBe(0);
+      expect(tunnel.getInfo().idleMs).not.toBeNull();
+    } finally {
+      tunnel.dispose();
+      echo.close();
+    }
   });
 
   it('disposes the tunnel when the idle timeout elapses', async () => {
@@ -191,11 +195,66 @@ describe('PortForward', () => {
       { once() {}, end() {} } as any, [], 60_000,
       (id) => disposed.push(id)
     );
-    await tunnel.start();
-    expect(disposed).toEqual([]);
-    vi.advanceTimersByTime(60_001);
-    expect(disposed).toEqual(['t1']);
-    expect(tunnel.getInfo().state).toBe('closed');
-    vi.useRealTimers();
+    try {
+      await tunnel.start();
+      expect(disposed).toEqual([]);
+      vi.advanceTimersByTime(60_001);
+      expect(disposed).toEqual(['t1']);
+      expect(tunnel.getInfo().state).toBe('closed');
+    } finally {
+      tunnel.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it('destroys the stream when the local client aborts before forwardOut resolves', async () => {
+    const { PortForward } = await import('../src/index.js');
+    const { server: echo, port: echoPort } = await listenEcho();
+    let streamRef: any = null;
+    const fakeConn = {
+      forwardOut(_s: string, _p: number, dstIp: string, dstPort: number, cb: (e: Error | null, st?: any) => void) {
+        const stream = net.connect({ host: dstIp, port: dstPort });
+        stream.once('connect', () => { streamRef = stream; setTimeout(() => cb(null, stream), 50); });
+        stream.on('error', () => {});
+        return stream;
+      },
+      once() {},
+      end() {},
+    };
+    const tunnel = new PortForward('t1', 'h1', '127.0.0.1', 0, '127.0.0.1', echoPort, [], fakeConn as any, [], 60_000);
+    try {
+      await tunnel.start();
+      const client = net.connect({ host: '127.0.0.1', port: tunnel.getInfo().localPort });
+      await new Promise((r) => client.on('connect', r));
+      client.destroy();
+      await new Promise((r) => setTimeout(r, 80));
+      expect(streamRef).not.toBeNull();
+      expect(streamRef.destroyed).toBe(true);
+      expect(tunnel.getInfo().activeConnections).toBe(0);
+    } finally {
+      tunnel.dispose();
+      echo.close();
+    }
+  });
+
+  it('does not dispose while a connection is active', async () => {
+    vi.useFakeTimers();
+    const { PortForward } = await import('../src/index.js');
+    const { server: echo, port: echoPort } = await listenEcho();
+    const disposed: string[] = [];
+    const tunnel = new PortForward('t1', 'h1', '127.0.0.1', 0, '127.0.0.1', echoPort, [], makeFakeConn() as any, [], 60_000, (id) => disposed.push(id));
+    try {
+      await tunnel.start();
+      const client = net.connect({ host: '127.0.0.1', port: tunnel.getInfo().localPort });
+      await new Promise((r) => client.on('connect', r));
+      vi.advanceTimersByTime(60_001);
+      expect(disposed).toEqual([]);
+      expect(tunnel.getInfo().state).toBe('active');
+      client.destroy();
+    } finally {
+      tunnel.dispose();
+      echo.close();
+      vi.useRealTimers();
+    }
   });
 });
