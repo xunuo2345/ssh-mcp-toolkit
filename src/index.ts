@@ -429,6 +429,7 @@ export function escapeCommandForShell(command: string): string {
 }
 
 const activeSessions = new Map<string, PersistentSession>();
+const activeTunnels = new Map<string, PortForward>();
 const DEFAULT_SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
 
 const server = new McpServer({
@@ -683,6 +684,96 @@ server.tool(
     return {
       content: [{ type: 'text', text: lines.join('\n') }],
     };
+  }
+);
+
+server.tool(
+  "open-tunnel",
+  "Expose an internal service port reachable from a stored host to the local machine over an SSH tunnel. Traverses the host's proxyJump chain (multi-hop supported); the chain's final hop opens the connection to the service.",
+  {
+    host_id: z.string().describe("Identifier of the host whose SSH chain forwards to the service"),
+    remote_port: z.number().int().describe("Port of the internal service, 1-65535"),
+    remote_host: z.string().default('127.0.0.1').describe("Address of the internal service as reachable from the chain's final hop (default 127.0.0.1)"),
+    local_port: z.number().int().optional().describe("Local port to listen on; a free port is chosen automatically when omitted"),
+    local_bind: z.string().default('127.0.0.1').describe("Local address to bind (default 127.0.0.1)"),
+    tunnel_id: z.string().optional().describe("Optional tunnel identifier; generated if omitted"),
+  },
+  async ({ host_id, remote_port, remote_host, local_port, local_bind, tunnel_id }) => {
+    validateTunnelParams({ localPort: local_port, remotePort: remote_port, localBind: local_bind });
+    const id = tunnel_id && tunnel_id.trim() ? tunnel_id.trim() : randomUUID();
+    if (activeTunnels.has(id)) {
+      throw new McpError(ErrorCode.InvalidParams, `Tunnel '${id}' already exists`);
+    }
+
+    const resolved = await resolveHost(host_id);
+    let tunnel: PortForward;
+    try {
+      const { conn, jumpConns } = await openSshChain(resolved);
+      tunnel = new PortForward(
+        id,
+        host_id,
+        local_bind,
+        local_port ?? 0,
+        remote_host,
+        remote_port,
+        resolved.jumpHostIds,
+        conn,
+        jumpConns,
+        undefined,
+        (disposedId) => {
+          if (activeTunnels.get(disposedId) === tunnel) {
+            activeTunnels.delete(disposedId);
+          }
+        }
+      );
+      await tunnel.start();
+    } catch (error: any) {
+      throw error instanceof McpError
+        ? error
+        : new McpError(ErrorCode.InternalError, `Failed to open tunnel to '${host_id}': ${error.message}`);
+    }
+
+    activeTunnels.set(id, tunnel);
+    if (local_bind !== '127.0.0.1' && local_bind !== 'localhost' && local_bind !== '0.0.0.0' && !local_bind.startsWith('::')) {
+      console.error(`Warning: tunnel '${id}' binds ${local_bind} — it is reachable beyond localhost`);
+    }
+    const chain = resolved.jumpHostIds.length ? ` -> ${resolved.jumpHostIds.join(' -> ')}` : '';
+    return {
+      content: [{
+        type: 'text',
+        text: `Tunnel '${id}' listening on ${local_bind}:${tunnel.getInfo().localPort}${chain} -> ${remote_host}:${remote_port}`,
+      }],
+    };
+  }
+);
+
+server.tool(
+  "close-tunnel",
+  "Close an existing SSH tunnel, destroying its local listener and SSH connections.",
+  {
+    tunnel_id: z.string().describe("Identifier of the tunnel to close"),
+  },
+  async ({ tunnel_id }) => {
+    const tunnel = activeTunnels.get(tunnel_id);
+    if (!tunnel) {
+      throw new McpError(ErrorCode.InvalidParams, `Tunnel '${tunnel_id}' does not exist`);
+    }
+    tunnel.dispose();
+    activeTunnels.delete(tunnel_id);
+    return { content: [{ type: 'text', text: `Tunnel '${tunnel_id}' closed` }] };
+  }
+);
+
+server.tool(
+  "list-tunnels",
+  "List all SSH tunnels (active or dead) with metadata.",
+  {},
+  async () => {
+    if (activeTunnels.size === 0) {
+      return { content: [{ type: 'text', text: 'No active tunnels' }] };
+    }
+    const lines = [...activeTunnels.values()].map((tunnel) => formatTunnelLine(tunnel.getInfo()));
+    return { content: [{ type: 'text', text: lines.join('\n') }] };
   }
 );
 
