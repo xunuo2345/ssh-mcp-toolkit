@@ -288,11 +288,11 @@ describe('InternetEgress', () => {
   });
 
   it('rejects when forwardIn fails', async () => {
-    const { InternetEgress, ErrorCode } = await import('../src/index.js');
+    const { InternetEgress } = await import('../src/index.js');
     const { conn } = makeFakeConn();
     conn.forwardIn = (_bind: string, _port: number, cb: (e?: Error) => void) => cb(new Error('gateway denied'));
     const egress = new InternetEgress('e1', 'A', '192.168.1.10', 8080, [], conn as any, []);
-    await expect(egress.start()).rejects.toMatchObject({ code: ErrorCode.InternalError });
+    await expect(egress.start()).rejects.toThrow(/Failed to listen/);
     expect(egress.getInfo().state).toBe('closed');
   });
 
@@ -350,12 +350,16 @@ describe('InternetEgress', () => {
     const { conn } = makeFakeConn();
     const disposed: string[] = [];
     const egress = new InternetEgress('e1', 'A', '192.168.1.10', 8080, [], conn as any, [], 60_000, (id) => disposed.push(id));
-    await egress.start();
-    expect(disposed).toEqual([]);
-    vi.advanceTimersByTime(60_001);
-    expect(disposed).toEqual(['e1']);
-    expect(egress.getInfo().state).toBe('closed');
-    vi.useRealTimers();
+    try {
+      await egress.start();
+      expect(disposed).toEqual([]);
+      vi.advanceTimersByTime(60_001);
+      expect(disposed).toEqual(['e1']);
+      expect(egress.getInfo().state).toBe('closed');
+    } finally {
+      egress.dispose();
+      vi.useRealTimers();
+    }
   });
 
   it('dispose removes the remote listener and fires onDispose', async () => {

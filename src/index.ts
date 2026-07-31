@@ -2,7 +2,6 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
-export { ErrorCode };
 import type { ClientChannel, ConnectConfig, SFTPWrapper, Stats } from 'ssh2';
 import SSH2Module from 'ssh2';
 const { Client: SSHClient, utils: sshUtils } = SSH2Module as typeof import('ssh2');
@@ -573,6 +572,10 @@ export function handleProxyConnection(stream: Duplex, connect: ConnectFn): void 
   };
 
   const wireUpstream = (client: Duplex, upstream: Duplex, rest: string) => {
+    if (client.destroyed) {
+      upstream.destroy();
+      return;
+    }
     if (rest) upstream.write(rest);
     client.pipe(upstream);
     upstream.pipe(client);
