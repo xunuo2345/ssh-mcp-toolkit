@@ -1,6 +1,6 @@
 # ssh-mcp-toolkit
 
-> A Model Context Protocol (MCP) server that gives LLM clients safe, persistent SSH access to remote machines — with multi-hop ProxyJump tunneling, SFTP file transfer, and local port forwarding.
+> A Model Context Protocol (MCP) server that gives LLM clients safe, persistent SSH access to remote machines — with multi-hop ProxyJump tunneling, SFTP file transfer, local port forwarding, and internet egress for internal servers.
 
 ---
 
@@ -28,17 +28,18 @@
    - [Executing Commands](#executing-commands)
    - [Closing Sessions](#closing-sessions)
 9. [File Transfer](#file-transfer)
-10. [Port Forwarding (Tunnels)](#port-forwarding-tunnels)
-11. [Authentication Modes](#authentication-modes)
-12. [Timeouts & Inactivity Handling](#timeouts--inactivity-handling)
-13. [Directory Structure](#directory-structure)
-14. [Using the MCP Tools](#using-the-mcp-tools)
-15. [Testing](#testing)
-16. [Troubleshooting](#troubleshooting)
-17. [Security Considerations](#security-considerations)
-18. [Contributing](#contributing)
-19. [Credits & Acknowledgements（致谢）](#credits--acknowledgements致谢)
-20. [License](#license)
+10. [Internet Egress](#internet-egress)
+11. [Port Forwarding (Tunnels)](#port-forwarding-tunnels)
+12. [Authentication Modes](#authentication-modes)
+13. [Timeouts & Inactivity Handling](#timeouts--inactivity-handling)
+14. [Directory Structure](#directory-structure)
+15. [Using the MCP Tools](#using-the-mcp-tools)
+16. [Testing](#testing)
+17. [Troubleshooting](#troubleshooting)
+18. [Security Considerations](#security-considerations)
+19. [Contributing](#contributing)
+20. [Credits & Acknowledgements（致谢）](#credits--acknowledgements致谢)
+21. [License](#license)
 
 ---
 
@@ -60,6 +61,7 @@ Hosts that are not directly reachable can be tunneled through any number of jump
 - **Flexible authentication:** supports passwords, private keys, and SSH agent forwarding (fallback).
 - **SFTP file transfer:** upload and download files directly, including targets reached through a configured jump host.
 - **Local port forwarding:** expose an internal service's port to the local machine over the same SSH chain — including multi-hop setups — with no local `ssh` binary required.
+- **Internet egress:** let internal servers without direct internet access download packages through the local machine via an HTTP proxy on the jump host (`open-egress`).
 - **Timeout & cleanup safeguards:** sessions and tunnels auto-close after prolonged inactivity; commands are marked and monitored for completion.
 - **Structured listings:** query active sessions and saved hosts directly from the MCP client.
 
@@ -82,6 +84,9 @@ MCP Client ─┬─> add-host / edit-host / remove-host
             ├─> open-tunnel ──> PortForward (net.Server + conn.forwardOut)
             │    close-tunnel / list-tunnels  └─> dedicated SSH connection
             │                                   └─> optional ProxyJump tunnel
+            │
+            ├─> open-egress ──> InternetEgress (forwardIn on A + inline HTTP proxy)
+            │    close-egress / list-egress  └─> local machine is the egress
             │
             └─> list-sessions
 
@@ -509,6 +514,70 @@ Closes the local listener, destroys all active connections, and tears down the S
 
 ---
 
+## Internet Egress
+
+Let internal servers that cannot reach the internet (B, C, …) download packages through the local machine. The server asks host A to listen on a port (remote port forwarding, `ssh -R` style); every connection to that port is forwarded back over the SSH tunnel to the local machine, which acts as an HTTP forward proxy (`CONNECT` for HTTPS, plain forwarding for HTTP).
+
+Only the outbound SSH connection from the local machine to A is required — no inbound firewall changes on the internal network.
+
+### A-side prerequisites
+
+The SSH server on A must allow TCP forwarding, and a non-loopback bind requires `GatewayPorts`:
+
+```ini
+# /config/sshd/sshd_config (or the active sshd_config on A)
+AllowTcpForwarding yes
+GatewayPorts yes
+```
+
+### Opening an egress
+
+Tool: **`open-egress`**
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `host_id` | string | ✔ | — | Host (A) on which to open the proxy port |
+| `proxy_port` | number | ✔ | — | Port to listen on A, 1–65535 |
+| `proxy_bind` | string | ✔ | — | IP on A to bind (reachable by the machines that will use the proxy) |
+| `egress_id` | string | | auto UUID | Identifier used by `close-egress` / `list-egress` |
+
+```json
+{
+  "host_id": "A",
+  "proxy_bind": "192.168.1.10",
+  "proxy_port": 8080,
+  "egress_id": "apt-mirror"
+}
+```
+
+Response:
+
+```
+Egress 'apt-mirror' on A:192.168.1.10:8080 -> local internet egress
+```
+
+### Using it from B/C
+
+On any machine that can reach `A`, point your package manager at the proxy:
+
+```bash
+export http_proxy=http://192.168.1.10:8080
+export https_proxy=http://192.168.1.10:8080
+apt update        # or: yum/dnf/apk/pip/npm/go …
+```
+
+### Listing / closing
+
+Tool: **`list-egress`** shows one line per egress (bind address, state, connection counts, idle time, or `lastError` when dead). Tool: **`close-egress`** with `egress_id` removes the listener on A and tears down the connection.
+
+### Lifecycle
+
+- An egress auto-closes after **2 hours of inactivity** (same timeout as sessions/tunnels), counted only while no connection is active.
+- If the SSH chain drops, the egress becomes `dead` and stays visible in `list-egress` until closed.
+- There is **no proxy authentication** — the port is open to the host's network; bind `proxy_bind` to a specific IP to limit exposure.
+
+---
+
 ## Authentication Modes
 
 1. **Password** — stored in `hosts.json`; transmitted to `ssh2` during connection.
@@ -522,7 +591,7 @@ Closes the local listener, destroys all active connections, and tears down the S
 - Each session has a **global inactivity timeout** (default 2 hours). Timer resets whenever a command executes successfully.
 - If the timer elapses, the session cleans up the SSH connection, shell, and resolver buffer, and removes itself from `activeSessions`.
 - Command completion uses a UUID marker: `printf '__MCP_DONE__{uuid}%d\n' $?`. Output before the marker is returned; numeric code after the marker becomes the exit status.
-- Each tunnel shares the same **2-hour inactivity timeout**, but only counts while **no connection** is flowing through it. The timer is cleared as soon as a connection opens and restarts after the last one closes.
+- Each tunnel shares the same **2-hour inactivity timeout**, but only counts while **no connection** is flowing through it. The timer is cleared as soon as a connection opens and restarts after the last one closes. Internet egress tunnels behave the same way.
 
 ---
 
@@ -573,14 +642,20 @@ Below is a typical workflow using Claude Code (commands start with `/mcp`), but 
    ```
    → returns a tunnel id; the service is then reachable at `http://localhost:8080`. Close it with `close-tunnel`.
 
-6. **Inspect**
+6. **Provide internet access to internal machines (optional)**
+   ```
+   /mcp mcp-remote-ssh open-egress {"host_id":"A","proxy_bind":"192.168.1.10","proxy_port":8080}
+   ```
+   → returns an egress id; machines that can reach A can then use `http://192.168.1.10:8080` as their HTTP proxy. Close it with `close-egress`.
+
+7. **Inspect**
    ```
    /mcp mcp-remote-ssh list-sessions
    /mcp mcp-remote-ssh list-hosts
    /mcp mcp-remote-ssh list-tunnels
    ```
 
-7. **Close session / tunnel**
+8. **Close session / tunnel**
    ```
    /mcp mcp-remote-ssh close-session {"sessionId":"<id>"}
    /mcp mcp-remote-ssh close-tunnel {"tunnel_id":"<id>"}
@@ -612,6 +687,7 @@ Integration smoke tests for SSH are not included by default because they require
 | `Invalid key path` | `keyPath` resolved to undefined or missing file | Provide an absolute/tilde path that exists. |
 | `Local port X is already in use` | The requested `local_port` is taken | Pick another port, or omit `local_port` to auto-assign. |
 | Tunnel shows `state=dead` | SSH chain dropped (network, restart) | Read `lastError` in `list-tunnels`, then `close-tunnel` and reopen. |
+| `Failed to listen on ... on host` | sshd on A denies remote forwarding | Set `AllowTcpForwarding yes` (and `GatewayPorts yes` for non-loopback binds) on A, then retry. |
 
 ---
 
@@ -654,6 +730,7 @@ Issues and feature requests are welcome via GitHub.
 - **SFTP 文件传输** —— 新增 `upload-file` 与 `download-file` 两个工具，复用同一条跳板链，自动创建远端缺失的父目录，且**不在中间跳板机上留下任何文件**。
 - **跳板信息可见** —— `list-hosts` 输出附带 `jump=<id>`，`list-sessions` 展示完整跳板路径（`jump=gateway -> a -> b`）或 `direct`。
 - **本地端口转发（隧道）** —— 新增 `open-tunnel` / `close-tunnel` / `list-tunnels` 三个工具，把内网服务的端口通过专用 SSH 隧道暴露到本机回环地址（`ssh -L` 风格，纯 JavaScript 实现）。完全复用同一套多跳跳板链，无需本地 `ssh` 命令；每条隧道 2 小时无活跃连接自动回收，SSH 链路断开时标记为 `dead` 供 `list-tunnels` 查看。
+- **内网出网（Internet Egress）** —— 新增 `open-egress` / `close-egress` / `list-egress` 三个工具：在跳板机 A 上反向监听端口（`ssh -R` 风格），把内网 B/C 的 HTTP 代理流量经 SSH 隧道送回本地，由本地作为出口代理访问外网。无需内网开放任何入站端口，纯 JavaScript 实现。
 - **单元测试** —— 覆盖主机 schema、跳板链解析与跳板配置校验。
 
 以上新增均向后兼容：原有的 `hosts.json` 与原有的工具调用方式行为完全不变。
