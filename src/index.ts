@@ -632,6 +632,7 @@ export function escapeCommandForShell(command: string): string {
 
 const activeSessions = new Map<string, PersistentSession>();
 const activeTunnels = new Map<string, PortForward>();
+const activeEgress = new Map<string, InternetEgress>();
 const DEFAULT_SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
 
 const server = new McpServer({
@@ -980,6 +981,94 @@ server.tool(
       return { content: [{ type: 'text', text: 'No active tunnels' }] };
     }
     const lines = [...activeTunnels.values()].map((tunnel) => formatTunnelLine(tunnel.getInfo()));
+    return { content: [{ type: 'text', text: lines.join('\n') }] };
+  }
+);
+
+server.tool(
+  "open-egress",
+  "Let internal servers on the host's network reach the internet through the local machine. Opens an HTTP forward proxy port on the host via remote port forwarding; point other machines at http://<proxy_bind>:<proxy_port>. The host's sshd must allow TCP forwarding (AllowTcpForwarding yes) and, for a non-loopback bind, GatewayPorts yes.",
+  {
+    host_id: z.string().describe("Identifier of the host (A) on which to open the proxy port"),
+    proxy_port: z.number().int().describe("Port to listen on the host, 1-65535"),
+    proxy_bind: z.string().describe("IP address on the host to bind (must be reachable by the machines that will use the proxy)"),
+    egress_id: z.string().optional().describe("Optional egress identifier; generated if omitted"),
+  },
+  async ({ host_id, proxy_port, proxy_bind, egress_id }) => {
+    validateEgressParams({ proxyPort: proxy_port, proxyBind: proxy_bind });
+    const id = egress_id && egress_id.trim() ? egress_id.trim() : randomUUID();
+    if (activeEgress.has(id)) {
+      throw new McpError(ErrorCode.InvalidParams, `Egress '${id}' already exists`);
+    }
+
+    const resolved = await resolveHost(host_id);
+    let egress: InternetEgress;
+    try {
+      const { conn, jumpConns } = await openSshChain(resolved);
+      egress = new InternetEgress(
+        id,
+        host_id,
+        proxy_bind,
+        proxy_port,
+        resolved.jumpHostIds,
+        conn,
+        jumpConns,
+        undefined,
+        (disposedId) => {
+          if (activeEgress.get(disposedId) === egress) {
+            activeEgress.delete(disposedId);
+          }
+        }
+      );
+      await egress.start();
+    } catch (error: any) {
+      throw error instanceof McpError
+        ? error
+        : new McpError(ErrorCode.InternalError, `Failed to open egress on '${host_id}': ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    if (activeEgress.has(id)) {
+      egress.dispose();
+      throw new McpError(ErrorCode.InvalidParams, `Egress '${id}' already exists`);
+    }
+
+    activeEgress.set(id, egress);
+    const chain = resolved.jumpHostIds.length ? ` -> ${resolved.jumpHostIds.join(' -> ')}` : '';
+    return {
+      content: [{
+        type: 'text',
+        text: `Egress '${id}' on ${host_id}:${proxy_bind}:${proxy_port}${chain} -> local internet egress`,
+      }],
+    };
+  }
+);
+
+server.tool(
+  "close-egress",
+  "Close an existing internet egress, removing the proxy listener from the host and tearing down its SSH connections.",
+  {
+    egress_id: z.string().describe("Identifier of the egress to close"),
+  },
+  async ({ egress_id }) => {
+    const egress = activeEgress.get(egress_id);
+    if (!egress) {
+      throw new McpError(ErrorCode.InvalidParams, `Egress '${egress_id}' does not exist`);
+    }
+    egress.dispose();
+    activeEgress.delete(egress_id);
+    return { content: [{ type: 'text', text: `Egress '${egress_id}' closed` }] };
+  }
+);
+
+server.tool(
+  "list-egress",
+  "List all internet egress tunnels (active or dead) with metadata.",
+  {},
+  async () => {
+    if (activeEgress.size === 0) {
+      return { content: [{ type: 'text', text: 'No active egress' }] };
+    }
+    const lines = [...activeEgress.values()].map((egress) => formatEgressLine(egress.getInfo()));
     return { content: [{ type: 'text', text: lines.join('\n') }] };
   }
 );
