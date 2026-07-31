@@ -11,6 +11,7 @@ import { readFile, writeFile, mkdir, stat } from 'fs/promises';
 import { posix as posixPath, resolve as resolvePath } from 'path';
 import os from 'os';
 import { randomUUID } from 'crypto';
+import net from 'net';
 
 function expandPath(input: string | undefined): string | undefined {
   if (!input) return input;
@@ -357,6 +358,49 @@ export function formatHostLine(host: StoredHost): string {
   const auth = host.password ? 'password' : host.keyPath ? 'key' : 'agent';
   const jump = host.proxyJump ? ` jump=${host.proxyJump}` : '';
   return `id=${host.id} host=${host.host}:${host.port} user=${host.username} auth=${auth}${jump}`;
+}
+
+export type PortForwardInfo = {
+  id: string;
+  hostId: string;
+  localBind: string;
+  localPort: number;
+  remoteHost: string;
+  remotePort: number;
+  jumpHosts: string[];
+  state: 'connecting' | 'active' | 'dead' | 'closed';
+  activeConnections: number;
+  totalConnections: number;
+  lastError: string | null;
+  idleMs: number | null;
+};
+
+export function validateTunnelParams(params: {
+  localPort?: number;
+  remotePort?: number;
+  localBind?: string;
+}): void {
+  const { localPort, remotePort, localBind } = params;
+  if (remotePort !== undefined && (!Number.isInteger(remotePort) || remotePort < 1 || remotePort > 65535)) {
+    throw new McpError(ErrorCode.InvalidParams, 'remote_port must be an integer between 1 and 65535');
+  }
+  if (localPort !== undefined && (!Number.isInteger(localPort) || localPort < 1 || localPort > 65535)) {
+    throw new McpError(ErrorCode.InvalidParams, 'local_port must be an integer between 1 and 65535');
+  }
+  if (localBind !== undefined && (typeof localBind !== 'string' || localBind.length === 0)) {
+    throw new McpError(ErrorCode.InvalidParams, 'local_bind must be a non-empty string');
+  }
+}
+
+export function formatTunnelLine(info: PortForwardInfo): string {
+  const jump = info.jumpHosts.length ? info.jumpHosts.join(' -> ') : 'direct';
+  let line = `tunnel=${info.id} local=${info.localBind}:${info.localPort} -> host=${info.hostId} remote=${info.remoteHost}:${info.remotePort} jump=${jump} state=${info.state} conns=${info.activeConnections}/${info.totalConnections}`;
+  if (info.state === 'dead' && info.lastError) {
+    line += ` lastError=${info.lastError}`;
+  } else if (info.activeConnections === 0) {
+    line += ` idle=${info.idleMs}s`;
+  }
+  return line;
 }
 
 // Command sanitization and validation
@@ -899,6 +943,180 @@ class PersistentSession {
 
     if (this.disposed) {
       this.onDispose?.(this.id);
+    }
+  }
+}
+
+export class PortForward {
+  private server: net.Server | null = null;
+  private readonly activeSockets = new Set<net.Socket>();
+  private totalConnections = 0;
+  private idleTimer: NodeJS.Timeout | null = null;
+  private idleStartAt: number | null = null;
+  private state: PortForwardInfo['state'] = 'connecting';
+  private lastError: string | null = null;
+  private boundPort: number;
+  private disposed = false;
+
+  constructor(
+    private readonly id: string,
+    private readonly hostId: string,
+    private readonly localBind: string,
+    localPort: number,
+    private readonly remoteHost: string,
+    private readonly remotePort: number,
+    private readonly jumpHostIds: string[],
+    private readonly conn: InstanceType<typeof SSHClient>,
+    private readonly jumpConns: InstanceType<typeof SSHClient>[],
+    private readonly timeoutMs = DEFAULT_SESSION_TTL_MS,
+    private readonly onDispose?: (id: string) => void,
+  ) {
+    this.boundPort = localPort;
+    conn.once('error', (error: Error) => this.markDead(error));
+    conn.once('end', () => this.markDead(new Error('SSH connection ended')));
+    conn.once('close', () => this.markDead(new Error('SSH connection closed')));
+    for (const jumpConn of jumpConns) {
+      jumpConn.once('error', (error: Error) => this.markDead(error));
+      jumpConn.once('end', () => this.markDead(new Error('Jump connection ended')));
+    }
+  }
+
+  async start(): Promise<void> {
+    if (this.disposed) {
+      throw new McpError(ErrorCode.InternalError, `Tunnel ${this.id} has been disposed`);
+    }
+    return new Promise((resolve, reject) => {
+      this.server = net.createServer((socket) => this.handleConnection(socket));
+      this.server.on('error', (error: NodeJS.ErrnoException) => {
+        this.closeConnections();
+        if (error.code === 'EADDRINUSE') {
+          reject(new McpError(ErrorCode.InvalidParams, `Local port ${this.boundPort} is already in use`));
+        } else {
+          reject(new McpError(ErrorCode.InternalError, `Failed to bind ${this.localBind}:${this.boundPort}: ${error.message}`));
+        }
+      });
+      this.server.listen(this.boundPort, this.localBind, () => {
+        const address = this.server!.address() as net.AddressInfo;
+        this.boundPort = address.port;
+        this.state = 'active';
+        this.startIdleTimer();
+        resolve();
+      });
+    });
+  }
+
+  getInfo(): PortForwardInfo {
+    const idleMs = this.idleStartAt !== null
+      ? Math.max(0, Math.floor((Date.now() - this.idleStartAt) / 1000))
+      : null;
+    return {
+      id: this.id,
+      hostId: this.hostId,
+      localBind: this.localBind,
+      localPort: this.boundPort,
+      remoteHost: this.remoteHost,
+      remotePort: this.remotePort,
+      jumpHosts: [...this.jumpHostIds],
+      state: this.state,
+      activeConnections: this.activeSockets.size,
+      totalConnections: this.totalConnections,
+      lastError: this.lastError,
+      idleMs,
+    };
+  }
+
+  dispose(): void {
+    if (this.disposed) {
+      return;
+    }
+    this.disposed = true;
+    this.clearIdleTimer();
+    this.closeServer();
+    this.destroySockets();
+    this.closeConnections();
+    this.state = 'closed';
+    this.onDispose?.(this.id);
+  }
+
+  private handleConnection(socket: net.Socket): void {
+    if (this.state !== 'active') {
+      socket.destroy();
+      return;
+    }
+    this.activeSockets.add(socket);
+    this.totalConnections += 1;
+    this.clearIdleTimer();
+    socket.on('error', () => socket.destroy());
+    socket.on('close', () => {
+      this.activeSockets.delete(socket);
+      if (this.activeSockets.size === 0) {
+        this.startIdleTimer();
+      }
+    });
+
+    this.conn.forwardOut('127.0.0.1', 0, this.remoteHost, this.remotePort, (error, stream) => {
+      if (error) {
+        this.lastError = `forwardOut to ${this.remoteHost}:${this.remotePort} failed: ${error.message}`;
+        socket.destroy();
+        return;
+      }
+      socket.pipe(stream);
+      stream.pipe(socket);
+      socket.on('close', () => stream.destroy());
+      stream.on('close', () => socket.destroy());
+      stream.on('error', () => socket.destroy());
+    });
+  }
+
+  private startIdleTimer(): void {
+    if (this.disposed || this.state !== 'active' || this.idleTimer) {
+      return;
+    }
+    this.idleStartAt = Date.now();
+    this.idleTimer = setTimeout(() => {
+      this.idleTimer = null;
+      this.dispose();
+    }, this.timeoutMs);
+  }
+
+  private clearIdleTimer(): void {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
+    this.idleStartAt = null;
+  }
+
+  private markDead(error: Error): void {
+    if (this.disposed || this.state === 'dead' || this.state === 'closed') {
+      return;
+    }
+    this.state = 'dead';
+    this.lastError = error.message;
+    this.clearIdleTimer();
+    this.closeServer();
+    this.destroySockets();
+    this.closeConnections();
+  }
+
+  private closeServer(): void {
+    if (this.server) {
+      this.server.close();
+      this.server = null;
+    }
+  }
+
+  private destroySockets(): void {
+    for (const socket of this.activeSockets) {
+      socket.destroy();
+    }
+    this.activeSockets.clear();
+  }
+
+  private closeConnections(): void {
+    this.conn.end();
+    for (const jumpConn of this.jumpConns) {
+      jumpConn.end();
     }
   }
 }
