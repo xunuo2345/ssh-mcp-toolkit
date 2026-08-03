@@ -1264,6 +1264,10 @@ server.tool(
         : new McpError(ErrorCode.InternalError, `Failed to start transfer: ${error instanceof Error ? error.message : String(error)}`);
     }
 
+    if (activeTransfers.has(id)) {
+      transfer.dispose();
+      throw new McpError(ErrorCode.InvalidParams, `Transfer '${id}' already exists`);
+    }
     activeTransfers.set(id, transfer);
     transfer.start().catch(() => {
       // start() records failures internally; nothing further to do.
@@ -1967,7 +1971,26 @@ export class ServerTransfer {
     private readonly targetPath: string,
     private readonly mode: 'direct' | 'stream' | 'hybrid',
     private readonly conns: TransferConnections,
-  ) {}
+  ) {
+    const source = conns.source;
+    source.conn.once?.('error', (error: Error) => this.markFailed(error.message));
+    source.conn.once?.('end', () => this.markFailed('SSH connection ended'));
+    source.conn.once?.('close', () => this.markFailed('SSH connection closed'));
+    for (const jumpConn of source.jumpConns) {
+      jumpConn.once?.('error', (error: Error) => this.markFailed(error.message));
+      jumpConn.once?.('end', () => this.markFailed('Jump connection ended'));
+    }
+    const target = conns.target;
+    if (target) {
+      target.conn.once?.('error', (error: Error) => this.markFailed(error.message));
+      target.conn.once?.('end', () => this.markFailed('SSH connection ended'));
+      target.conn.once?.('close', () => this.markFailed('SSH connection closed'));
+      for (const jumpConn of target.jumpConns) {
+        jumpConn.once?.('error', (error: Error) => this.markFailed(error.message));
+        jumpConn.once?.('end', () => this.markFailed('Jump connection ended'));
+      }
+    }
+  }
 
   async start(): Promise<void> {
     if (this.disposed) {
@@ -2073,6 +2096,13 @@ export class ServerTransfer {
     this.finish('completed', null);
   }
 
+  private markFailed(message: string): void {
+    if (this.state === 'completed' || this.state === 'failed' || this.state === 'cancelled') {
+      return;
+    }
+    this.finish('failed', message);
+  }
+
   private finish(state: TransferState, error: string | null): void {
     if (this.state === 'completed' || this.state === 'failed' || this.state === 'cancelled') {
       return;
@@ -2084,6 +2114,8 @@ export class ServerTransfer {
   }
 
   private async runStream(): Promise<void> {
+    this.transferredBytes = 0;
+    this.totalBytes = null;
     const sourceConn = this.conns.source;
     const targetConn = this.conns.target;
     if (!targetConn?.sftp || !sourceConn.sftp) {
@@ -2157,6 +2189,9 @@ export class ServerTransfer {
       return;
     }
     const channelAny = channel as any;
+    if (channelAny.exitCode === undefined) {
+      throw new Error('rsync channel ended without an exit code (the SSH connection may have dropped)');
+    }
     if (channelAny.exitCode !== 0) {
       throw new Error(
         `rsync exited with code ${channelAny.exitCode}${this.lastStderr ? `: ${this.lastStderr.trim()}` : ''}`

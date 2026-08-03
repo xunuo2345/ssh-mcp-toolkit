@@ -653,6 +653,8 @@ Transfer '0f7c...' started: db-primary:/var/backup/full.dump -> db-dr:/data/back
 
 The destination's parent directory is created automatically. The source is copied with `--partial --inplace --size-only` so an interrupted transfer leaves a resumable partial file.
 
+Because rsync runs with `--size-only`, a destination file already the same size as the source is treated as up to date and **skipped without re-verifying its contents** — delete the target or use `hybrid`/`stream` if you need content re-validation.
+
 ### Checking status / cancelling
 
 Tool: **`transfer-status`** with `transfer_id` returns JSON with `state`, `mode`, `transferredBytes`, `totalBytes`, `percent`, and `error`. Tool: **`transfer-cancel`** with `transfer_id` stops a running transfer.
