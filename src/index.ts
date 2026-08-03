@@ -637,6 +637,106 @@ export function escapeCommandForShell(command: string): string {
   return command.replace(/'/g, "'\"'\"'");
 }
 
+export type TransferMode = 'auto' | 'direct' | 'stream' | 'hybrid';
+export type TransferState = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
+
+export type TransferInfo = {
+  id: string;
+  mode: 'direct' | 'stream' | 'hybrid';
+  state: TransferState;
+  sourceHost: string;
+  sourcePath: string;
+  targetHost: string;
+  targetPath: string;
+  totalBytes: number | null;
+  transferredBytes: number;
+  percent: number | null;
+  error: string | null;
+  createdAt: number;
+  finishedAt: number | null;
+};
+
+export function validateTransferParams(params: {
+  sourceHost: string;
+  targetHost: string;
+  sourcePath: string;
+  targetPath: string;
+  mode?: string;
+  sizeThresholdMb?: number;
+}): void {
+  const { sourceHost, targetHost, sourcePath, targetPath, mode, sizeThresholdMb } = params;
+  if (mode !== undefined && !['auto', 'direct', 'stream', 'hybrid'].includes(mode)) {
+    throw new McpError(ErrorCode.InvalidParams, 'mode must be one of auto, direct, stream, hybrid');
+  }
+  if (typeof sourcePath !== 'string' || !sourcePath.startsWith('/')) {
+    throw new McpError(ErrorCode.InvalidParams, 'source_path must be an absolute remote path');
+  }
+  if (typeof targetPath !== 'string' || !targetPath.startsWith('/')) {
+    throw new McpError(ErrorCode.InvalidParams, 'target_path must be an absolute remote path');
+  }
+  if (sizeThresholdMb !== undefined && (!Number.isInteger(sizeThresholdMb) || sizeThresholdMb < 1)) {
+    throw new McpError(ErrorCode.InvalidParams, 'size_threshold_mb must be a positive integer');
+  }
+  if (sourceHost === targetHost) {
+    throw new McpError(ErrorCode.InvalidParams, 'source_host and target_host must differ');
+  }
+}
+
+export function resolveTransferMode(
+  requested: TransferMode,
+  sizeBytes: number | null,
+  thresholdBytes: number,
+  isDirectory: boolean,
+): 'direct' | 'stream' | 'hybrid' {
+  switch (requested) {
+    case 'direct':
+      return 'direct';
+    case 'stream':
+      return 'stream';
+    case 'hybrid':
+      return 'hybrid';
+    case 'auto':
+      if (isDirectory) return 'direct';
+      if (sizeBytes !== null && sizeBytes < thresholdBytes) return 'stream';
+      return 'direct';
+  }
+}
+
+export function parseRsyncProgress(line: string): { bytes: number; percent: number | null; speed: string | null } | null {
+  const match = /([0-9][0-9,]*)\s+(\d{1,3})%\s+([0-9.]+\s*[KMG]?B\/s)?/.exec(line);
+  if (!match) return null;
+  const bytes = Number.parseInt(match[1].replace(/,/g, ''), 10);
+  const percent = Number.parseInt(match[2], 10);
+  return { bytes, percent, speed: match[3] ?? null };
+}
+
+export function quoteShellArg(input: string): string {
+  return `'${input.replace(/'/g, `'\\''`)}'`;
+}
+
+export function buildDirectCommand(opts: {
+  targetUser: string;
+  targetHost: string;
+  targetPort: number;
+  sourcePath: string;
+  targetPath: string;
+}): string {
+  const { targetUser, targetHost, targetPort, sourcePath, targetPath } = opts;
+  const sshArgs = `-p ${targetPort} -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=15`;
+  const targetDir = posixPath.dirname(targetPath);
+  const mkdirRemote = quoteShellArg(`mkdir -p ${quoteShellArg(targetDir)}`);
+  const src = quoteShellArg(sourcePath);
+  const rsyncRemote = quoteShellArg(`${targetUser}@${targetHost}:${targetPath}`);
+  return (
+    `ssh ${sshArgs} ${targetUser}@${targetHost} ${mkdirRemote} && ` +
+    `rsync -a --partial --inplace --size-only --info=progress2 --no-motd -e ${quoteShellArg(`ssh ${sshArgs}`)} ${src} ${rsyncRemote}`
+  );
+}
+
+export function formatTransferStatus(info: TransferInfo): Record<string, unknown> {
+  return { ...info };
+}
+
 const activeSessions = new Map<string, PersistentSession>();
 const activeTunnels = new Map<string, PortForward>();
 const activeEgress = new Map<string, InternetEgress>();
