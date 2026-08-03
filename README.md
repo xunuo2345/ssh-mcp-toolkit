@@ -1,6 +1,6 @@
 # ssh-mcp-toolkit
 
-> A Model Context Protocol (MCP) server that gives LLM clients safe, persistent SSH access to remote machines — with multi-hop ProxyJump tunneling, SFTP file transfer, local port forwarding, and internet egress for internal servers.
+> A Model Context Protocol (MCP) server that gives LLM clients safe, persistent SSH access to remote machines — with multi-hop ProxyJump tunneling, SFTP file transfer, local port forwarding, internet egress for internal servers, and server-to-server transfers.
 
 ---
 
@@ -30,17 +30,18 @@
    - [Closing Sessions](#closing-sessions)
 10. [File Transfer](#file-transfer)
 11. [Internet Egress](#internet-egress)
-12. [Port Forwarding (Tunnels)](#port-forwarding-tunnels)
-13. [Authentication Modes](#authentication-modes)
-14. [Timeouts & Inactivity Handling](#timeouts--inactivity-handling)
-15. [Directory Structure](#directory-structure)
-16. [Using the MCP Tools](#using-the-mcp-tools)
-17. [Testing](#testing)
-18. [Troubleshooting](#troubleshooting)
-19. [Security Considerations](#security-considerations)
-20. [Contributing](#contributing)
-21. [Credits & Acknowledgements（致谢）](#credits--acknowledgements致谢)
-22. [License](#license)
+12. [Server-to-Server Transfer](#server-to-server-transfer)
+13. [Port Forwarding (Tunnels)](#port-forwarding-tunnels)
+14. [Authentication Modes](#authentication-modes)
+15. [Timeouts & Inactivity Handling](#timeouts--inactivity-handling)
+16. [Directory Structure](#directory-structure)
+17. [Using the MCP Tools](#using-the-mcp-tools)
+18. [Testing](#testing)
+19. [Troubleshooting](#troubleshooting)
+20. [Security Considerations](#security-considerations)
+21. [Contributing](#contributing)
+22. [Credits & Acknowledgements（致谢）](#credits--acknowledgements致谢)
+23. [License](#license)
 
 ---
 
@@ -64,6 +65,7 @@ Hosts that are not directly reachable can be tunneled through any number of jump
 | SFTP 文件传输 | `upload-file` / `download-file` | 复用同一条跳板链上传/下载文件，自动创建远端缺失的父目录 | [File Transfer](#file-transfer) |
 | 本地端口转发（隧道） | `open-tunnel` / `close-tunnel` / `list-tunnels` | 把内网应用端口暴露到本机 `localhost`（`ssh -L` 风格），支持多跳，2 小时无活跃连接自动回收 | [Port Forwarding (Tunnels)](#port-forwarding-tunnels) |
 | 内网出网（Internet Egress） | `open-egress` / `close-egress` / `list-egress` | 让内网服务器 B/C 经本地机器访问外网（`ssh -R` + 本地 HTTP 正向代理），可用于 `apt`/`pip`/`npm` 下包 | [Internet Egress](#internet-egress) |
+| 服务器间直传 | `start-transfer` / `transfer-status` / `transfer-cancel` | 两台已保存主机之间的文件传输：`direct`（源服务器上跑 rsync，本地 0 带宽）/ `stream`（经本地双 SFTP 流转发）/ `hybrid` / `auto` | [Server-to-Server Transfer](#server-to-server-transfer) |
 
 所有新增均向后兼容：原有 `hosts.json` 格式与既有工具调用方式完全不变。
 
@@ -78,6 +80,7 @@ Hosts that are not directly reachable can be tunneled through any number of jump
 - **SFTP file transfer:** upload and download files directly, including targets reached through a configured jump host.
 - **Local port forwarding:** expose an internal service's port to the local machine over the same SSH chain — including multi-hop setups — with no local `ssh` binary required.
 - **Internet egress:** let internal servers without direct internet access download packages through the local machine via an HTTP proxy on the jump host (`open-egress`).
+- **Server-to-server transfer:** copy files directly between two stored hosts — rsync on the source for large files (zero local bandwidth) or an SFTP pipe through the local machine when hosts can't reach each other (`start-transfer`).
 - **Timeout & cleanup safeguards:** sessions and tunnels auto-close after prolonged inactivity; commands are marked and monitored for completion.
 - **Structured listings:** query active sessions and saved hosts directly from the MCP client.
 
@@ -103,6 +106,9 @@ MCP Client ─┬─> add-host / edit-host / remove-host
             │
             ├─> open-egress ──> InternetEgress (forwardIn on A + inline HTTP proxy)
             │    close-egress / list-egress  └─> local machine is the egress
+            │
+            ├─> start-transfer ──> ServerTransfer (rsync on A | double SFTP pipe)
+            │    transfer-status / transfer-cancel  └─> A --direct--> B | A -> local -> B
             │
             └─> list-sessions
 
@@ -596,6 +602,70 @@ Tool: **`list-egress`** shows one line per egress (bind address, state, connecti
 
 ---
 
+## Server-to-Server Transfer
+
+Copy a file (or directory) directly between two stored hosts without touching the local disk. Useful for moving 200GB database dumps between servers when you don't want to download and re-upload them.
+
+### Modes
+
+| Mode | Data path | When to use |
+|---|---|---|
+| `direct` | source host → target host (rsync runs on the source) | Large files; source and target reach each other |
+| `stream` | source → local machine → target (two SFTP pipes) | Small files; hosts can't reach each other |
+| `hybrid` | tries `direct`, falls back to `stream` on failure | Unknown environment |
+| `auto` (default) | files under `size_threshold_mb` (100 MB) use `stream`, else `direct` | General use |
+
+### Starting a transfer
+
+Tool: **`start-transfer`**
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `source_host` | string | ✔ | — | Source host id in `hosts.json` |
+| `source_path` | string | ✔ | — | Absolute path on the source host (file or directory) |
+| `target_host` | string | ✔ | — | Target host id in `hosts.json` |
+| `target_path` | string | ✔ | — | Absolute destination path on the target host |
+| `mode` | enum | | `auto` | `auto` / `direct` / `stream` / `hybrid` |
+| `size_threshold_mb` | number | | `100` | Stream/direct threshold for `auto` |
+| `transfer_id` | string | | auto UUID | Identifier used by `transfer-status` / `transfer-cancel` |
+
+```json
+{
+  "source_host": "db-primary",
+  "source_path": "/var/backup/full.dump",
+  "target_host": "db-dr",
+  "target_path": "/data/backup/full.dump",
+  "mode": "auto"
+}
+```
+
+Response:
+
+```
+Transfer '0f7c...' started: db-primary:/var/backup/full.dump -> db-dr:/data/backup/full.dump (mode=auto->direct)
+```
+
+### Direct mode prerequisites
+
+`direct` runs rsync on the **source host**, so that host must:
+- have `rsync` and an `ssh` client installed, and
+- be able to reach the target host non-interactively (an ssh key for the target's user).
+
+The destination's parent directory is created automatically. The source is copied with `--partial --inplace --size-only` so an interrupted transfer leaves a resumable partial file.
+
+### Checking status / cancelling
+
+Tool: **`transfer-status`** with `transfer_id` returns JSON with `state`, `mode`, `transferredBytes`, `totalBytes`, `percent`, and `error`. Tool: **`transfer-cancel`** with `transfer_id` stops a running transfer.
+
+### Lifecycle & limitations
+
+- Transfers run inside the MCP server's own SSH sessions — closing the laptop or the MCP server interrupts them.
+- `stream` mode supports single files only; directories require `direct` (or `auto`, which routes directories to `direct`).
+- Terminal transfers stay queryable via `transfer-status` for the lifetime of the MCP server process.
+- `source_host` and `target_host` must differ.
+
+---
+
 ## Authentication Modes
 
 1. **Password** — stored in `hosts.json`; transmitted to `ssh2` during connection.
@@ -666,18 +736,26 @@ Below is a typical workflow using Claude Code (commands start with `/mcp`), but 
    ```
    → returns an egress id; machines that can reach A can then use `http://192.168.1.10:8080` as their HTTP proxy. Close it with `close-egress`.
 
-7. **Inspect**
+7. **Transfer files between servers (optional)**
+   ```
+   /mcp mcp-remote-ssh start-transfer {"source_host":"db-primary","source_path":"/var/backup/full.dump","target_host":"db-dr","target_path":"/data/backup/full.dump"}
+   ```
+   → returns a transfer id; `transfer-status` shows progress, `transfer-cancel` stops it.
+
+8. **Inspect**
    ```
    /mcp mcp-remote-ssh list-sessions
    /mcp mcp-remote-ssh list-hosts
    /mcp mcp-remote-ssh list-tunnels
    ```
 
-8. **Close session / tunnel**
+9. **Close session / tunnel**
    ```
    /mcp mcp-remote-ssh close-session {"sessionId":"<id>"}
    /mcp mcp-remote-ssh close-tunnel {"tunnel_id":"<id>"}
    /mcp mcp-remote-ssh close-egress {"egress_id":"<id>"}
+   /mcp mcp-remote-ssh transfer-status {"transfer_id":"<id>"}
+   /mcp mcp-remote-ssh transfer-cancel {"transfer_id":"<id>"}
    ```
 
 ---
@@ -750,6 +828,7 @@ Issues and feature requests are welcome via GitHub.
 - **跳板信息可见** —— `list-hosts` 输出附带 `jump=<id>`，`list-sessions` 展示完整跳板路径（`jump=gateway -> a -> b`）或 `direct`。
 - **本地端口转发（隧道）** —— 新增 `open-tunnel` / `close-tunnel` / `list-tunnels` 三个工具，把内网服务的端口通过专用 SSH 隧道暴露到本机回环地址（`ssh -L` 风格，纯 JavaScript 实现）。完全复用同一套多跳跳板链，无需本地 `ssh` 命令；每条隧道 2 小时无活跃连接自动回收，SSH 链路断开时标记为 `dead` 供 `list-tunnels` 查看。
 - **内网出网（Internet Egress）** —— 新增 `open-egress` / `close-egress` / `list-egress` 三个工具：在跳板机 A 上反向监听端口（`ssh -R` 风格），把内网 B/C 的 HTTP 代理流量经 SSH 隧道送回本地，由本地作为出口代理访问外网。无需内网开放任何入站端口，纯 JavaScript 实现。
+- **服务器间直传（Server-to-Server Transfer）** —— 新增 `start-transfer` / `transfer-status` / `transfer-cancel` 三个工具：在两台已保存主机之间传输文件。`direct` 在源服务器上用 rsync 直连目标（本地 0 带宽，适合 200GB 级别备份）；`stream` 经本地双 SFTP 流转发（适合小文件或服务器间不通）；`hybrid` 先直连失败降级流式；`auto` 按大小阈值自动选择。异步三件套便于大文件后台跟踪与取消。
 - **单元测试** —— 覆盖主机 schema、跳板链解析与跳板配置校验。
 
 以上新增均向后兼容：原有的 `hosts.json` 与原有的工具调用方式行为完全不变。
