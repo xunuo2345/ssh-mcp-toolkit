@@ -1237,12 +1237,13 @@ server.tool(
     }
 
     let transfer: ServerTransfer;
+    let targetConn: { conn: InstanceType<typeof SSHClient>; jumpConns: InstanceType<typeof SSHClient>[]; sftp: SFTPWrapper } | null = null;
     try {
-      if (decided === 'stream') {
-        const targetConn = await openSftpConnection(targetResolved);
+      if (decided === 'stream' || decided === 'hybrid') {
+        targetConn = await openSftpConnection(targetResolved);
         transfer = new ServerTransfer(
           id, source_host, target_host, sourceResolved, targetResolved,
-          source_path, target_path, 'stream',
+          source_path, target_path, decided,
           {
             source: sourceConn,
             target: targetConn,
@@ -1259,6 +1260,11 @@ server.tool(
       sourceConn.sftp.end();
       sourceConn.conn.end();
       for (const jumpConn of sourceConn.jumpConns) jumpConn.end();
+      if (targetConn) {
+        targetConn.sftp.end();
+        targetConn.conn.end();
+        for (const jumpConn of targetConn.jumpConns) jumpConn.end();
+      }
       throw error instanceof McpError
         ? error
         : new McpError(ErrorCode.InternalError, `Failed to start transfer: ${error instanceof Error ? error.message : String(error)}`);
@@ -2135,13 +2141,12 @@ export class ServerTransfer {
     });
     read.pipe(write);
     await new Promise<void>((resolve, reject) => {
-      write.on('finish', () => resolve());
-      write.on('close', () => {
-        if (this.cancelled) resolve();
-        else reject(new Error('target write stream closed before completion'));
-      });
-      read.on('error', (error: Error) => reject(error));
-      write.on('error', (error: Error) => reject(error));
+      let settled = false;
+      const once = (fn: (...args: any[]) => void) => (...args: any[]) => { if (!settled) { settled = true; fn(...args); } };
+      write.on('finish', once(resolve));
+      write.on('close', once(resolve));
+      read.on('error', once((error: Error) => reject(error)));
+      write.on('error', once((error: Error) => reject(error)));
     });
     this.complete();
   }
@@ -2165,6 +2170,10 @@ export class ServerTransfer {
       });
     });
     this.execChannel = channel;
+    let exitCode: number | undefined;
+    channel.on('exit', (code: number | undefined) => {
+      exitCode = code;
+    });
     channel.stderr?.on('data', (data: Buffer) => {
       this.lastStderr += data.toString('utf8');
     });
@@ -2173,7 +2182,7 @@ export class ServerTransfer {
         const parsed = parseRsyncProgress(record.trim());
         if (parsed) {
           this.transferredBytes = Math.max(this.transferredBytes, parsed.bytes);
-          if (parsed.percent !== null && this.totalBytes === null && parsed.bytes > 0) {
+          if (parsed.percent !== null && parsed.percent > 0 && this.totalBytes === null && parsed.bytes > 0) {
             this.totalBytes = Math.round((parsed.bytes * 100) / parsed.percent);
           }
         }
@@ -2189,12 +2198,13 @@ export class ServerTransfer {
       return;
     }
     const channelAny = channel as any;
-    if (channelAny.exitCode === undefined) {
+    const finalExitCode = exitCode ?? channelAny.exitCode;
+    if (finalExitCode === undefined) {
       throw new Error('rsync channel ended without an exit code (the SSH connection may have dropped)');
     }
-    if (channelAny.exitCode !== 0) {
+    if (finalExitCode !== 0) {
       throw new Error(
-        `rsync exited with code ${channelAny.exitCode}${this.lastStderr ? `: ${this.lastStderr.trim()}` : ''}`
+        `rsync exited with code ${finalExitCode}${this.lastStderr ? `: ${this.lastStderr.trim()}` : ''}`
       );
     }
     this.complete();
