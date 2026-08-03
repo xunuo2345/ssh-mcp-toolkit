@@ -1800,6 +1800,245 @@ export class InternetEgress {
   }
 }
 
+type TransferConnections = {
+  source: {
+    conn: InstanceType<typeof SSHClient>;
+    jumpConns: InstanceType<typeof SSHClient>[];
+    sftp?: SFTPWrapper;
+  };
+  target?: {
+    conn: InstanceType<typeof SSHClient>;
+    jumpConns: InstanceType<typeof SSHClient>[];
+    sftp?: SFTPWrapper;
+  };
+};
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+export class ServerTransfer {
+  private state: TransferState = 'pending';
+  private transferredBytes = 0;
+  private totalBytes: number | null = null;
+  private error: string | null = null;
+  private readonly createdAt = Date.now();
+  private finishedAt: number | null = null;
+  private cancelled = false;
+  private disposed = false;
+  private streams: Array<NodeJS.ReadableStream | NodeJS.WritableStream> = [];
+  private execChannel: ClientChannel | null = null;
+  private lastStderr = '';
+
+  constructor(
+    private readonly id: string,
+    private readonly sourceHostId: string,
+    private readonly targetHostId: string,
+    private readonly sourceResolved: ResolvedHost,
+    private readonly targetResolved: ResolvedHost,
+    private readonly sourcePath: string,
+    private readonly targetPath: string,
+    private readonly mode: 'direct' | 'stream' | 'hybrid',
+    private readonly conns: TransferConnections,
+  ) {}
+
+  async start(): Promise<void> {
+    if (this.disposed) {
+      throw new McpError(ErrorCode.InternalError, `Transfer ${this.id} has been disposed`);
+    }
+    this.state = 'running';
+    if (this.mode === 'stream') {
+      try {
+        await this.runStream();
+      } catch (error: any) {
+        if (!this.cancelled) this.finish('failed', errorMessage(error));
+      }
+      return;
+    }
+    if (this.mode === 'direct') {
+      try {
+        await this.runDirect();
+      } catch (error: any) {
+        if (!this.cancelled) this.finish('failed', errorMessage(error));
+      }
+      return;
+    }
+    let directError: unknown = null;
+    try {
+      await this.runDirect();
+      return;
+    } catch (error: any) {
+      directError = error;
+    }
+    if (this.cancelled) return;
+    try {
+      await this.runStream();
+    } catch (streamError: any) {
+      if (!this.cancelled) {
+        this.finish('failed', `direct: ${errorMessage(directError)}; stream fallback: ${errorMessage(streamError)}`);
+      }
+    }
+  }
+
+  getInfo(): TransferInfo {
+    const percent = this.totalBytes && this.totalBytes > 0
+      ? Math.min(100, Math.round((this.transferredBytes / this.totalBytes) * 100))
+      : null;
+    return {
+      id: this.id,
+      mode: this.mode,
+      state: this.state,
+      sourceHost: this.sourceHostId,
+      sourcePath: this.sourcePath,
+      targetHost: this.targetHostId,
+      targetPath: this.targetPath,
+      totalBytes: this.totalBytes,
+      transferredBytes: this.transferredBytes,
+      percent,
+      error: this.error,
+      createdAt: this.createdAt,
+      finishedAt: this.finishedAt,
+    };
+  }
+
+  async cancel(): Promise<void> {
+    if (this.state === 'completed' || this.state === 'failed' || this.state === 'cancelled') {
+      throw new McpError(ErrorCode.InvalidParams, `Transfer ${this.id} is already ${this.state}`);
+    }
+    this.cancelled = true;
+    for (const stream of this.streams) (stream as any).destroy();
+    if (this.execChannel) {
+      try {
+        this.execChannel.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    this.finish('cancelled', null);
+  }
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    for (const stream of this.streams) (stream as any).destroy();
+    if (this.execChannel) {
+      try {
+        this.execChannel.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    this.execChannel = null;
+    const source = this.conns.source;
+    source.sftp?.end();
+    source.conn.end();
+    for (const jumpConn of source.jumpConns) jumpConn.end();
+    const target = this.conns.target;
+    if (target) {
+      target.sftp?.end();
+      target.conn.end();
+      for (const jumpConn of target.jumpConns) jumpConn.end();
+    }
+  }
+
+  private complete(): void {
+    if (this.cancelled) return;
+    this.finish('completed', null);
+  }
+
+  private finish(state: TransferState, error: string | null): void {
+    if (this.state === 'completed' || this.state === 'failed' || this.state === 'cancelled') {
+      return;
+    }
+    this.state = state;
+    this.error = error;
+    this.finishedAt = Date.now();
+    this.dispose();
+  }
+
+  private async runStream(): Promise<void> {
+    const sourceConn = this.conns.source;
+    const targetConn = this.conns.target;
+    if (!targetConn?.sftp || !sourceConn.sftp) {
+      throw new Error('stream mode requires both source and target SFTP connections');
+    }
+    const stats = await sftpStat(sourceConn.sftp, this.sourcePath);
+    if (stats.isDirectory()) {
+      throw new Error('stream mode supports single files only; source is a directory');
+    }
+    this.totalBytes = stats.size;
+    await ensureRemoteParentDirectory(targetConn.sftp, this.targetPath);
+    const read = sourceConn.sftp.createReadStream(this.sourcePath);
+    const write = targetConn.sftp.createWriteStream(this.targetPath, { flags: 'w' });
+    this.streams = [read, write];
+    read.on('data', (chunk: Buffer) => {
+      this.transferredBytes += chunk.length;
+    });
+    read.pipe(write);
+    await new Promise<void>((resolve, reject) => {
+      write.on('finish', () => resolve());
+      write.on('close', () => {
+        if (this.cancelled) resolve();
+        else reject(new Error('target write stream closed before completion'));
+      });
+      read.on('error', (error: Error) => reject(error));
+      write.on('error', (error: Error) => reject(error));
+    });
+    this.complete();
+  }
+
+  private async runDirect(): Promise<void> {
+    const cfg = this.targetResolved.config;
+    if (!cfg.host || !cfg.username) {
+      throw new Error('target host configuration is incomplete');
+    }
+    const command = buildDirectCommand({
+      targetUser: cfg.username,
+      targetHost: cfg.host,
+      targetPort: cfg.port ?? 22,
+      sourcePath: this.sourcePath,
+      targetPath: this.targetPath,
+    });
+    const channel = await new Promise<ClientChannel>((resolve, reject) => {
+      this.conns.source.conn.exec(command, (error, stream) => {
+        if (error) reject(error);
+        else resolve(stream);
+      });
+    });
+    this.execChannel = channel;
+    channel.stderr?.on('data', (data: Buffer) => {
+      this.lastStderr += data.toString('utf8');
+    });
+    channel.on('data', (data: Buffer) => {
+      for (const record of data.toString('utf8').split('\r')) {
+        const parsed = parseRsyncProgress(record.trim());
+        if (parsed) {
+          this.transferredBytes = Math.max(this.transferredBytes, parsed.bytes);
+          if (parsed.percent !== null && this.totalBytes === null && parsed.bytes > 0) {
+            this.totalBytes = Math.round((parsed.bytes * 100) / parsed.percent);
+          }
+        }
+      }
+    });
+    await new Promise<void>((resolve, reject) => {
+      channel.on('close', () => resolve());
+      channel.on('error', (error: Error) => reject(error));
+    });
+    this.execChannel = null;
+    if (this.cancelled) {
+      this.finish('cancelled', null);
+      return;
+    }
+    const channelAny = channel as any;
+    if (channelAny.exitCode !== 0) {
+      throw new Error(
+        `rsync exited with code ${channelAny.exitCode}${this.lastStderr ? `: ${this.lastStderr.trim()}` : ''}`
+      );
+    }
+    this.complete();
+  }
+}
+
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
