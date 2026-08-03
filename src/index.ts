@@ -740,6 +740,7 @@ export function formatTransferStatus(info: TransferInfo): Record<string, unknown
 const activeSessions = new Map<string, PersistentSession>();
 const activeTunnels = new Map<string, PortForward>();
 const activeEgress = new Map<string, InternetEgress>();
+const activeTransfers = new Map<string, ServerTransfer>();
 const DEFAULT_SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
 
 const server = new McpServer({
@@ -1180,6 +1181,132 @@ server.tool(
     }
     const lines = [...activeEgress.values()].map((egress) => formatEgressLine(egress.getInfo()));
     return { content: [{ type: 'text', text: lines.join('\n') }] };
+  }
+);
+
+server.tool(
+  "start-transfer",
+  "Copy a file or directory between two stored hosts. Mode 'direct' runs rsync on the source host (zero local bandwidth; requires rsync and non-interactive ssh access to the target on the source host). Mode 'stream' pipes the file through the local machine over two SFTP channels (single files only). 'hybrid' tries direct then falls back to stream; 'auto' (default) uses a size threshold.",
+  {
+    source_host: z.string().describe("Identifier of the source host in hosts.json"),
+    source_path: z.string().describe("Absolute path of the source file or directory on the source host"),
+    target_host: z.string().describe("Identifier of the target host in hosts.json"),
+    target_path: z.string().describe("Absolute destination path on the target host"),
+    mode: z.enum(['auto', 'direct', 'stream', 'hybrid']).default('auto').describe("Transfer mode (default auto)"),
+    size_threshold_mb: z.number().int().default(100).describe("Files smaller than this (MB) use stream mode in 'auto' (default 100)"),
+    transfer_id: z.string().optional().describe("Optional transfer identifier; generated if omitted"),
+  },
+  async ({ source_host, source_path, target_host, target_path, mode, size_threshold_mb, transfer_id }) => {
+    validateTransferParams({
+      sourceHost: source_host,
+      targetHost: target_host,
+      sourcePath: source_path,
+      targetPath: target_path,
+      mode,
+      sizeThresholdMb: size_threshold_mb,
+    });
+    const id = transfer_id && transfer_id.trim() ? transfer_id.trim() : randomUUID();
+    if (activeTransfers.has(id)) {
+      throw new McpError(ErrorCode.InvalidParams, `Transfer '${id}' already exists`);
+    }
+
+    const sourceResolved = await resolveHost(source_host);
+    const targetResolved = await resolveHost(target_host);
+
+    let sourceConn: { conn: InstanceType<typeof SSHClient>; jumpConns: InstanceType<typeof SSHClient>[]; sftp: SFTPWrapper };
+    try {
+      sourceConn = await openSftpConnection(sourceResolved);
+    } catch (error: any) {
+      throw new McpError(ErrorCode.InternalError, `Failed to connect to source host '${source_host}': ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    let stats: Stats | null = null;
+    try {
+      stats = await sftpStat(sourceConn.sftp, source_path);
+    } catch {
+      // stat failure surfaces as a failed transfer
+    }
+
+    let decided: 'direct' | 'stream' | 'hybrid';
+    if (mode === 'auto') {
+      decided = resolveTransferMode('auto', stats && !stats.isDirectory() ? stats.size : null, size_threshold_mb * 1024 * 1024, stats?.isDirectory() ?? false);
+    } else if (mode === 'hybrid') {
+      decided = 'hybrid';
+    } else {
+      decided = mode;
+    }
+
+    let transfer: ServerTransfer;
+    try {
+      if (decided === 'stream') {
+        const targetConn = await openSftpConnection(targetResolved);
+        transfer = new ServerTransfer(
+          id, source_host, target_host, sourceResolved, targetResolved,
+          source_path, target_path, 'stream',
+          {
+            source: sourceConn,
+            target: targetConn,
+          },
+        );
+      } else {
+        transfer = new ServerTransfer(
+          id, source_host, target_host, sourceResolved, targetResolved,
+          source_path, target_path, decided,
+          { source: sourceConn },
+        );
+      }
+    } catch (error: any) {
+      sourceConn.sftp.end();
+      sourceConn.conn.end();
+      for (const jumpConn of sourceConn.jumpConns) jumpConn.end();
+      throw error instanceof McpError
+        ? error
+        : new McpError(ErrorCode.InternalError, `Failed to start transfer: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    activeTransfers.set(id, transfer);
+    transfer.start().catch(() => {
+      // start() records failures internally; nothing further to do.
+    });
+    return {
+      content: [{
+        type: 'text',
+        text: `Transfer '${id}' started: ${source_host}:${source_path} -> ${target_host}:${target_path} (mode=${mode}->${decided})`,
+      }],
+    };
+  }
+);
+
+server.tool(
+  "transfer-status",
+  "Query the status and progress of a server-to-server transfer.",
+  {
+    transfer_id: z.string().describe("Identifier of the transfer"),
+  },
+  async ({ transfer_id }) => {
+    const transfer = activeTransfers.get(transfer_id);
+    if (!transfer) {
+      throw new McpError(ErrorCode.InvalidParams, `Transfer '${transfer_id}' does not exist`);
+    }
+    return {
+      content: [{ type: 'text', text: JSON.stringify(formatTransferStatus(transfer.getInfo()), null, 2) }],
+    };
+  }
+);
+
+server.tool(
+  "transfer-cancel",
+  "Cancel a running server-to-server transfer.",
+  {
+    transfer_id: z.string().describe("Identifier of the transfer to cancel"),
+  },
+  async ({ transfer_id }) => {
+    const transfer = activeTransfers.get(transfer_id);
+    if (!transfer) {
+      throw new McpError(ErrorCode.InvalidParams, `Transfer '${transfer_id}' does not exist`);
+    }
+    await transfer.cancel();
+    return { content: [{ type: 'text', text: `Transfer '${transfer_id}' cancelled` }] };
   }
 );
 
