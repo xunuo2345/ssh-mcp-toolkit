@@ -110,6 +110,27 @@ describe('buildDirectCommand', () => {
   });
 });
 
+describe('formatRsyncFailureMessage', () => {
+  it('appends an install hint when rsync is missing on the source host', async () => {
+    const { formatRsyncFailureMessage } = await import('../src/index.js');
+    const msg = formatRsyncFailureMessage(
+      'rsync exited with code 127: sh: 1: rsync: not found',
+      'sh: 1: rsync: not found',
+    );
+    expect(msg).toContain('install it');
+    expect(msg).toContain('hybrid');
+  });
+
+  it('leaves other rsync failures untouched', async () => {
+    const { formatRsyncFailureMessage } = await import('../src/index.js');
+    const msg = formatRsyncFailureMessage(
+      'rsync exited with code 1: Permission denied (publickey)',
+      'Permission denied (publickey)',
+    );
+    expect(msg).not.toContain('install it');
+  });
+});
+
 function makeFakeSftp(size: number, isDir = false) {
   const calls = { stat: [] as string[], read: [] as string[], write: [] as string[], mkdir: [] as string[], end: 0 };
   const writeChunks: Buffer[] = [];

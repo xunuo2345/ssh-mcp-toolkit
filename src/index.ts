@@ -737,6 +737,13 @@ export function formatTransferStatus(info: TransferInfo): Record<string, unknown
   return { ...info };
 }
 
+export function formatRsyncFailureMessage(message: string, stderr: string): string {
+  if (/rsync/i.test(stderr) && /not found|cannot execute/i.test(stderr)) {
+    return `${message}. Hint: rsync is not installed on the source host — install it (e.g. 'apk add rsync', 'apt install rsync', 'yum install rsync') or use mode=hybrid/stream.`;
+  }
+  return message;
+}
+
 const activeSessions = new Map<string, PersistentSession>();
 const activeTunnels = new Map<string, PortForward>();
 const activeEgress = new Map<string, InternetEgress>();
@@ -2204,7 +2211,10 @@ export class ServerTransfer {
     }
     if (finalExitCode !== 0) {
       throw new Error(
-        `rsync exited with code ${finalExitCode}${this.lastStderr ? `: ${this.lastStderr.trim()}` : ''}`
+        formatRsyncFailureMessage(
+          `rsync exited with code ${finalExitCode}${this.lastStderr ? `: ${this.lastStderr.trim()}` : ''}`,
+          this.lastStderr,
+        )
       );
     }
     this.complete();
