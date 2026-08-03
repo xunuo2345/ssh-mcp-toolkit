@@ -245,6 +245,24 @@ describe('ServerTransfer', () => {
     expect(info.percent).toBe(100);
   });
 
+  it('direct mode ignores a 0% progress record when deriving totalBytes', async () => {
+    const { ServerTransfer } = await import('../src/index.js');
+    const { conn, channel } = makeFakeExecConn(0, '', '');
+    const transfer = new ServerTransfer('t3b', 'A', 'B', srcResolved as any, tgtResolved as any, '/s', '/t', 'direct',
+      { source: { conn: conn as any, jumpConns: [], sftp: undefined } },
+    );
+    const p = transfer.start();
+    await new Promise((r) => setImmediate(r));
+    channel.emit('data', Buffer.from('32,768 0% 0.00kB/s 0:00:00\r'));
+    channel.emit('data', Buffer.from('10,000,000 100% 5.00MB/s 0:00:10 (xfr#1, to-chk=0/1)\r'));
+    channel.emit('close');
+    await p;
+    const info = transfer.getInfo();
+    expect(info.state).toBe('completed');
+    expect(info.totalBytes).toBe(10000000);
+    expect(info.percent).toBe(100);
+  });
+
   it('direct mode fails on a non-zero exit', async () => {
     const { ServerTransfer } = await import('../src/index.js');
     const { conn, channel } = makeFakeExecConn(1, '', 'rsync: command not found\n');
