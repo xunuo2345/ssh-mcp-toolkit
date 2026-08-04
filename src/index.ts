@@ -2144,6 +2144,7 @@ export class ServerTransfer {
     return {
       id: this.id,
       mode: this.mode,
+      kind: 'server',
       state: this.state,
       sourceHost: this.sourceHostId,
       sourcePath: this.sourcePath,
