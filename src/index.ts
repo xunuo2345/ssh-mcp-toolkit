@@ -746,10 +746,15 @@ export function formatRsyncFailureMessage(message: string, stderr: string): stri
   return message;
 }
 
+export interface ActiveTransfer {
+  getInfo(): TransferInfo;
+  cancel(): Promise<void>;
+}
+
 const activeSessions = new Map<string, PersistentSession>();
 const activeTunnels = new Map<string, PortForward>();
 const activeEgress = new Map<string, InternetEgress>();
-const activeTransfers = new Map<string, ServerTransfer>();
+const activeTransfers = new Map<string, ActiveTransfer>();
 const DEFAULT_SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
 
 const server = new McpServer({
@@ -1326,6 +1331,93 @@ server.tool(
     }
     await transfer.cancel();
     return { content: [{ type: 'text', text: `Transfer '${transfer_id}' cancelled` }] };
+  }
+);
+
+server.tool(
+  "start-download",
+  "Download a file from a stored SSH host over SFTP in the background. Returns immediately with a transfer id; poll transfer-status for progress and cancel with transfer-cancel. Use this for large files that would time out the synchronous download-file tool.",
+  {
+    host_id: z.string().describe("Identifier of the source host"),
+    remote_path: z.string().min(1).describe("Path to the source file on the remote host"),
+    local_path: z.string().describe("Destination path on the MCP server machine (absolute or relative to its working directory)"),
+  },
+  async ({ host_id, remote_path, local_path }) => {
+    const resolvedLocalPath = resolvePath(local_path);
+    const id = randomUUID();
+    if (activeTransfers.has(id)) {
+      throw new McpError(ErrorCode.InvalidParams, `Transfer '${id}' already exists`);
+    }
+    const resolved = await resolveHost(host_id);
+    let conn: { conn: InstanceType<typeof SSHClient>; jumpConns: InstanceType<typeof SSHClient>[]; sftp: SFTPWrapper };
+    try {
+      conn = await openSftpConnection(resolved);
+    } catch (error: any) {
+      throw new McpError(ErrorCode.InternalError, `Failed to connect to host '${host_id}': ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const transfer = new FileTransfer(id, host_id, resolvedLocalPath, remote_path, 'download', conn);
+    if (activeTransfers.has(id)) {
+      transfer.dispose();
+      throw new McpError(ErrorCode.InvalidParams, `Transfer '${id}' already exists`);
+    }
+    activeTransfers.set(id, transfer);
+    transfer.start().catch(() => {
+      // start() records failures internally; nothing further to do.
+    });
+    return {
+      content: [{
+        type: 'text',
+        text: `Download '${id}' started: ${host_id}:${remote_path} -> '${resolvedLocalPath}'`,
+      }],
+    };
+  }
+);
+
+server.tool(
+  "start-upload",
+  "Upload a local file to a stored SSH host over SFTP in the background. Returns immediately with a transfer id; poll transfer-status for progress and cancel with transfer-cancel. Use this for large files that would time out the synchronous upload-file tool.",
+  {
+    host_id: z.string().describe("Identifier of the destination host"),
+    local_path: z.string().describe("Path to the local source file (absolute or relative to the MCP server process)"),
+    remote_path: z.string().min(1).describe("Destination path on the remote host"),
+  },
+  async ({ host_id, local_path, remote_path }) => {
+    const resolvedLocalPath = resolvePath(local_path);
+    try {
+      const localStats = await stat(resolvedLocalPath);
+      if (!localStats.isFile()) {
+        throw new McpError(ErrorCode.InvalidParams, `Local path '${resolvedLocalPath}' is not a file`);
+      }
+    } catch (error: any) {
+      if (error instanceof McpError) throw error;
+      throw new McpError(ErrorCode.InvalidParams, `Local file '${resolvedLocalPath}' cannot be read: ${error.message}`);
+    }
+    const id = randomUUID();
+    if (activeTransfers.has(id)) {
+      throw new McpError(ErrorCode.InvalidParams, `Transfer '${id}' already exists`);
+    }
+    const resolved = await resolveHost(host_id);
+    let conn: { conn: InstanceType<typeof SSHClient>; jumpConns: InstanceType<typeof SSHClient>[]; sftp: SFTPWrapper };
+    try {
+      conn = await openSftpConnection(resolved);
+    } catch (error: any) {
+      throw new McpError(ErrorCode.InternalError, `Failed to connect to host '${host_id}': ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const transfer = new FileTransfer(id, host_id, resolvedLocalPath, remote_path, 'upload', conn);
+    if (activeTransfers.has(id)) {
+      transfer.dispose();
+      throw new McpError(ErrorCode.InvalidParams, `Transfer '${id}' already exists`);
+    }
+    activeTransfers.set(id, transfer);
+    transfer.start().catch(() => {
+      // start() records failures internally; nothing further to do.
+    });
+    return {
+      content: [{
+        type: 'text',
+        text: `Upload '${id}' started: '${resolvedLocalPath}' -> ${host_id}:${remote_path}`,
+      }],
+    };
   }
 );
 
