@@ -8,6 +8,7 @@ const { Client: SSHClient, utils: sshUtils } = SSH2Module as typeof import('ssh2
 import { z } from 'zod';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { readFile, writeFile, mkdir, stat } from 'fs/promises';
+import { createReadStream, createWriteStream } from 'fs';
 import { posix as posixPath, resolve as resolvePath } from 'path';
 import os from 'os';
 import { randomUUID } from 'crypto';
@@ -643,6 +644,7 @@ export type TransferState = 'pending' | 'running' | 'completed' | 'failed' | 'ca
 export type TransferInfo = {
   id: string;
   mode: 'direct' | 'stream' | 'hybrid';
+  kind?: 'server' | 'download' | 'upload';
   state: TransferState;
   sourceHost: string;
   sourcePath: string;
@@ -2217,6 +2219,166 @@ export class ServerTransfer {
         )
       );
     }
+    this.complete();
+  }
+}
+
+export class FileTransfer {
+  private state: TransferState = 'pending';
+  private transferredBytes = 0;
+  private totalBytes: number | null = null;
+  private error: string | null = null;
+  private readonly createdAt = Date.now();
+  private finishedAt: number | null = null;
+  private cancelled = false;
+  private disposed = false;
+  private streams: Array<NodeJS.ReadableStream | NodeJS.WritableStream> = [];
+
+  constructor(
+    private readonly id: string,
+    private readonly hostId: string,
+    private readonly localPath: string,
+    private readonly remotePath: string,
+    private readonly direction: 'download' | 'upload',
+    private readonly conns: { conn: InstanceType<typeof SSHClient>; jumpConns: InstanceType<typeof SSHClient>[]; sftp: SFTPWrapper },
+  ) {
+    conns.conn.once?.('error', (error: Error) => this.markFailed(error.message));
+    conns.conn.once?.('end', () => this.markFailed('SSH connection ended'));
+    conns.conn.once?.('close', () => this.markFailed('SSH connection closed'));
+    for (const jumpConn of conns.jumpConns) {
+      jumpConn.once?.('error', (error: Error) => this.markFailed(error.message));
+      jumpConn.once?.('end', () => this.markFailed('Jump connection ended'));
+    }
+  }
+
+  async start(): Promise<void> {
+    if (this.disposed) {
+      throw new McpError(ErrorCode.InternalError, `Transfer ${this.id} has been disposed`);
+    }
+    this.state = 'running';
+    try {
+      if (this.direction === 'download') {
+        await this.runDownload();
+      } else {
+        await this.runUpload();
+      }
+    } catch (error: any) {
+      if (!this.cancelled) this.finish('failed', errorMessage(error));
+    }
+  }
+
+  getInfo(): TransferInfo {
+    const percent = this.totalBytes && this.totalBytes > 0
+      ? Math.min(100, Math.round((this.transferredBytes / this.totalBytes) * 100))
+      : null;
+    const download = this.direction === 'download';
+    return {
+      id: this.id,
+      mode: 'stream',
+      kind: this.direction,
+      state: this.state,
+      sourceHost: download ? this.hostId : 'local',
+      sourcePath: download ? this.remotePath : this.localPath,
+      targetHost: download ? 'local' : this.hostId,
+      targetPath: download ? this.localPath : this.remotePath,
+      totalBytes: this.totalBytes,
+      transferredBytes: this.transferredBytes,
+      percent,
+      error: this.error,
+      createdAt: this.createdAt,
+      finishedAt: this.finishedAt,
+    };
+  }
+
+  async cancel(): Promise<void> {
+    if (this.state === 'completed' || this.state === 'failed' || this.state === 'cancelled') {
+      throw new McpError(ErrorCode.InvalidParams, `Transfer ${this.id} is already ${this.state}`);
+    }
+    this.cancelled = true;
+    for (const stream of this.streams) (stream as any).destroy();
+    this.finish('cancelled', null);
+  }
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.conns.sftp.end();
+    this.conns.conn.end();
+    for (const jumpConn of this.conns.jumpConns) jumpConn.end();
+  }
+
+  private complete(): void {
+    if (this.cancelled) return;
+    this.finish('completed', null);
+  }
+
+  private markFailed(message: string): void {
+    if (this.state === 'completed' || this.state === 'failed' || this.state === 'cancelled') {
+      return;
+    }
+    this.finish('failed', message);
+  }
+
+  private finish(state: TransferState, error: string | null): void {
+    if (this.state === 'completed' || this.state === 'failed' || this.state === 'cancelled') {
+      return;
+    }
+    this.state = state;
+    this.error = error;
+    this.finishedAt = Date.now();
+    this.dispose();
+  }
+
+  private async runDownload(): Promise<void> {
+    this.transferredBytes = 0;
+    this.totalBytes = null;
+    const stats = await sftpStat(this.conns.sftp, this.remotePath);
+    if (stats.isDirectory()) {
+      throw new Error('download supports single files only; remote source is a directory');
+    }
+    this.totalBytes = stats.size;
+    const read = this.conns.sftp.createReadStream(this.remotePath);
+    const write = createWriteStream(this.localPath);
+    this.streams = [read, write];
+    read.on('data', (chunk: Buffer) => {
+      this.transferredBytes += chunk.length;
+    });
+    read.pipe(write);
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const once = (fn: (...args: any[]) => void) => (...args: any[]) => { if (!settled) { settled = true; fn(...args); } };
+      write.on('finish', once(resolve));
+      write.on('close', once(resolve));
+      read.on('error', once((error: Error) => reject(error)));
+      write.on('error', once((error: Error) => reject(error)));
+    });
+    this.complete();
+  }
+
+  private async runUpload(): Promise<void> {
+    this.transferredBytes = 0;
+    this.totalBytes = null;
+    const localStats = await stat(this.localPath);
+    if (!localStats.isFile()) {
+      throw new Error('upload source is not a file');
+    }
+    this.totalBytes = localStats.size;
+    await ensureRemoteParentDirectory(this.conns.sftp, this.remotePath);
+    const read = createReadStream(this.localPath);
+    const write = this.conns.sftp.createWriteStream(this.remotePath, { flags: 'w' });
+    this.streams = [read, write];
+    read.on('data', (chunk: string | Buffer) => {
+      this.transferredBytes += chunk.length;
+    });
+    read.pipe(write);
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const once = (fn: (...args: any[]) => void) => (...args: any[]) => { if (!settled) { settled = true; fn(...args); } };
+      write.on('finish', once(resolve));
+      write.on('close', once(resolve));
+      read.on('error', once((error: Error) => reject(error)));
+      write.on('error', once((error: Error) => reject(error)));
+    });
     this.complete();
   }
 }
