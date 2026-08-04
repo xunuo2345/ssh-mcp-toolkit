@@ -1303,7 +1303,7 @@ server.tool(
 
 server.tool(
   "transfer-status",
-  "Query the status and progress of a server-to-server transfer.",
+  "Query the status and progress of an active transfer (server-to-server, download, or upload).",
   {
     transfer_id: z.string().describe("Identifier of the transfer"),
   },
@@ -1320,7 +1320,7 @@ server.tool(
 
 server.tool(
   "transfer-cancel",
-  "Cancel a running server-to-server transfer.",
+  "Cancel a running transfer (server-to-server, download, or upload).",
   {
     transfer_id: z.string().describe("Identifier of the transfer to cancel"),
   },
@@ -2395,6 +2395,7 @@ export class FileTransfer {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    for (const stream of this.streams) (stream as any).destroy();
     this.conns.sftp.end();
     this.conns.conn.end();
     for (const jumpConn of this.conns.jumpConns) jumpConn.end();
@@ -2433,6 +2434,11 @@ export class FileTransfer {
     const read = this.conns.sftp.createReadStream(this.remotePath);
     const write = createWriteStream(this.localPath);
     this.streams = [read, write];
+    if (this.cancelled || this.disposed) {
+      read.destroy();
+      write.destroy();
+      throw new Error('transfer cancelled');
+    }
     read.on('data', (chunk: Buffer) => {
       this.transferredBytes += chunk.length;
     });
@@ -2460,6 +2466,11 @@ export class FileTransfer {
     const read = createReadStream(this.localPath);
     const write = this.conns.sftp.createWriteStream(this.remotePath, { flags: 'w' });
     this.streams = [read, write];
+    if (this.cancelled || this.disposed) {
+      read.destroy();
+      write.destroy();
+      throw new Error('transfer cancelled');
+    }
     read.on('data', (chunk: string | Buffer) => {
       this.transferredBytes += chunk.length;
     });

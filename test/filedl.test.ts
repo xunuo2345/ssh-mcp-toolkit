@@ -156,4 +156,25 @@ describe('FileTransfer', () => {
     expect(info.state).toBe('failed');
     expect(info.error).toBe('boom');
   });
+
+  it('tears down open streams and fails when the connection errors mid-download', async () => {
+    const { FileTransfer } = await import('../src/index.js');
+    const source = makeFakeSftp(100);
+    const dir = await mkdtemp(join(tmpdir(), 'mcp-dl3-'));
+    const local = join(dir, 'out.bin');
+    const conn = new EventEmitter() as any;
+    conn.end = () => {};
+    const transfer = new FileTransfer('f5', 'A', local, '/data/big.bin', 'download',
+      { conn, jumpConns: [], sftp: source.sftp as any },
+    );
+    const p = transfer.start();
+    await new Promise((r) => setImmediate(r));
+    source.getReadStream()!.write('partial');
+    conn.emit('error', new Error('boom'));
+    await p;
+    const info = transfer.getInfo();
+    expect(info.state).toBe('failed');
+    expect(info.error).toBe('boom');
+    await rm(dir, { recursive: true, force: true });
+  });
 });
