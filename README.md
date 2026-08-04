@@ -66,6 +66,7 @@ Hosts that are not directly reachable can be tunneled through any number of jump
 | 本地端口转发（隧道） | `open-tunnel` / `close-tunnel` / `list-tunnels` | 把内网应用端口暴露到本机 `localhost`（`ssh -L` 风格），支持多跳，2 小时无活跃连接自动回收 | [Port Forwarding (Tunnels)](#port-forwarding-tunnels) |
 | 内网出网（Internet Egress） | `open-egress` / `close-egress` / `list-egress` | 让内网服务器 B/C 经本地机器访问外网（`ssh -R` + 本地 HTTP 正向代理），可用于 `apt`/`pip`/`npm` 下包 | [Internet Egress](#internet-egress) |
 | 服务器间直传 | `start-transfer` / `transfer-status` / `transfer-cancel` | 两台已保存主机之间的文件传输：`direct`（源服务器上跑 rsync，本地 0 带宽）/ `stream`（经本地双 SFTP 流转发）/ `hybrid` / `auto` | [Server-to-Server Transfer](#server-to-server-transfer) |
+| 异步大文件下载/上传 | `start-download` / `start-upload`（配合 `transfer-status` / `transfer-cancel`） | 单文件后台异步传输，立即返回 transfer id；避免大文件（如 8GB）在同步 `download-file` / `upload-file` 上触发 MCP 客户端超时，旧同步工具保留用于小文件 | [File Transfer](#file-transfer) |
 
 所有新增均向后兼容：原有 `hosts.json` 格式与既有工具调用方式完全不变。
 
@@ -81,6 +82,7 @@ Hosts that are not directly reachable can be tunneled through any number of jump
 - **Local port forwarding:** expose an internal service's port to the local machine over the same SSH chain — including multi-hop setups — with no local `ssh` binary required.
 - **Internet egress:** let internal servers without direct internet access download packages through the local machine via an HTTP proxy on the jump host (`open-egress`).
 - **Server-to-server transfer:** copy files directly between two stored hosts — rsync on the source for large files (zero local bandwidth) or an SFTP pipe through the local machine when hosts can't reach each other (`start-transfer`).
+- **Async large-file transfer:** download or upload single files in the background — `start-download` / `start-upload` return a transfer id immediately and progress is polled via `transfer-status`, avoiding MCP client request timeouts on multi-GB files.
 - **Timeout & cleanup safeguards:** sessions and tunnels auto-close after prolonged inactivity; commands are marked and monitored for completion.
 - **Structured listings:** query active sessions and saved hosts directly from the MCP client.
 
@@ -109,6 +111,9 @@ MCP Client ─┬─> add-host / edit-host / remove-host
             │
             ├─> start-transfer ──> ServerTransfer (rsync on A | double SFTP pipe)
             │    transfer-status / transfer-cancel  └─> A --direct--> B | A -> local -> B
+            │
+            ├─> start-download / start-upload ──> FileTransfer (async SFTP pipe)
+            │    transfer-status / transfer-cancel  └─> background; transfer id returned immediately
             │
             └─> list-sessions
 
@@ -459,6 +464,39 @@ Tool: **`download-file`**
 
 The local destination directory must already exist. An existing local file at `local_path` is replaced.
 
+### Asynchronous upload/download (large files)
+
+Tool: **`start-upload`** and **`start-download`**
+
+The synchronous tools above (`upload-file` / `download-file`) keep the connection open until the file is fully transferred, so a very large file (e.g. an 8 GB dump) can exceed the MCP client's request timeout. For those, use the asynchronous tools — they return a **transfer id immediately** and keep transferring in the background:
+
+- **`start-upload`** — `host_id`, `local_path`, `remote_path` (same semantics as `upload-file`; the local file must exist, missing remote parent directories are created).
+- **`start-download`** — `host_id`, `remote_path`, `local_path` (same semantics as `download-file`; the local destination directory must already exist).
+
+```json
+{
+  "host_id": "internal-host",
+  "local_path": "C:/artifacts/large.tar.gz",
+  "remote_path": "/opt/releases/large.tar.gz"
+}
+```
+
+Response:
+
+```
+Upload '0f7c...' started: 'C:/artifacts/large.tar.gz' -> internal-host:/opt/releases/large.tar.gz
+```
+
+Progress is polled with `transfer-status` (pass the returned transfer id) and the transfer can be stopped with `transfer-cancel` — the same async trio used by server-to-server transfers. The `transfer-status` JSON now includes a `kind` field identifying the transfer type:
+
+| `kind` | Transfer |
+|---|---|
+| `server` | server-to-server (`start-transfer`) |
+| `download` | async local ← remote (`start-download`) |
+| `upload` | async local → remote (`start-upload`) |
+
+The synchronous `download-file` / `upload-file` tools are retained for small files and backward compatibility. Like server-to-server transfers, async transfers run inside the MCP server's own SSH session — closing the laptop or the MCP server interrupts them.
+
 ---
 
 ## Port Forwarding (Tunnels)
@@ -657,7 +695,7 @@ Because rsync runs with `--size-only`, a destination file already the same size 
 
 ### Checking status / cancelling
 
-Tool: **`transfer-status`** with `transfer_id` returns JSON with `state`, `mode`, `transferredBytes`, `totalBytes`, `percent`, and `error`. Tool: **`transfer-cancel`** with `transfer_id` stops a running transfer.
+Tool: **`transfer-status`** with `transfer_id` returns JSON with `state`, `kind`, `mode`, `transferredBytes`, `totalBytes`, `percent`, and `error`. Server-to-server transfers report `kind: 'server'`; transfers started by `start-download` / `start-upload` report `kind: 'download'` / `'upload'`. Tool: **`transfer-cancel`** with `transfer_id` stops a running transfer.
 
 ### Lifecycle & limitations
 
@@ -744,14 +782,21 @@ Below is a typical workflow using Claude Code (commands start with `/mcp`), but 
    ```
    → returns a transfer id; `transfer-status` shows progress, `transfer-cancel` stops it.
 
-8. **Inspect**
+8. **Transfer large files asynchronously (optional)**
+   ```
+   /mcp mcp-remote-ssh start-download {"host_id":"host","remote_path":"/var/log/app.log","local_path":"C:/downloads/app.log"}
+   /mcp mcp-remote-ssh start-upload {"host_id":"host","local_path":"C:/build/app.tar.gz","remote_path":"/tmp/app.tar.gz"}
+   ```
+   → each returns a transfer id immediately; `transfer-status` shows progress, `transfer-cancel` stops it. Prefer these over `download-file` / `upload-file` for files large enough to time out the synchronous tools.
+
+9. **Inspect**
    ```
    /mcp mcp-remote-ssh list-sessions
    /mcp mcp-remote-ssh list-hosts
    /mcp mcp-remote-ssh list-tunnels
    ```
 
-9. **Close session / tunnel**
+10. **Close session / tunnel**
    ```
    /mcp mcp-remote-ssh close-session {"sessionId":"<id>"}
    /mcp mcp-remote-ssh close-tunnel {"tunnel_id":"<id>"}
@@ -831,6 +876,7 @@ Issues and feature requests are welcome via GitHub.
 - **本地端口转发（隧道）** —— 新增 `open-tunnel` / `close-tunnel` / `list-tunnels` 三个工具，把内网服务的端口通过专用 SSH 隧道暴露到本机回环地址（`ssh -L` 风格，纯 JavaScript 实现）。完全复用同一套多跳跳板链，无需本地 `ssh` 命令；每条隧道 2 小时无活跃连接自动回收，SSH 链路断开时标记为 `dead` 供 `list-tunnels` 查看。
 - **内网出网（Internet Egress）** —— 新增 `open-egress` / `close-egress` / `list-egress` 三个工具：在跳板机 A 上反向监听端口（`ssh -R` 风格），把内网 B/C 的 HTTP 代理流量经 SSH 隧道送回本地，由本地作为出口代理访问外网。无需内网开放任何入站端口，纯 JavaScript 实现。
 - **服务器间直传（Server-to-Server Transfer）** —— 新增 `start-transfer` / `transfer-status` / `transfer-cancel` 三个工具：在两台已保存主机之间传输文件。`direct` 在源服务器上用 rsync 直连目标（本地 0 带宽，适合 200GB 级别备份）；`stream` 经本地双 SFTP 流转发（适合小文件或服务器间不通）；`hybrid` 先直连失败降级流式；`auto` 按大小阈值自动选择。异步三件套便于大文件后台跟踪与取消。
+- **异步大文件下载/上传（Async Large-File Transfer）** —— 新增 `start-download` / `start-upload` 两个工具：单文件经 SFTP 后台异步传输，立即返回 transfer id，用 `transfer-status` 轮询进度、`transfer-cancel` 取消，避免大文件（如 8GB）在同步的 `download-file` / `upload-file` 上触发 MCP 客户端请求超时；`transfer-status` 的 `kind` 字段区分 `server` / `download` / `upload` 三类传输。旧同步工具保留用于小文件与向后兼容。
 - **单元测试** —— 覆盖主机 schema、跳板链解析与跳板配置校验。
 
 以上新增均向后兼容：原有的 `hosts.json` 与原有的工具调用方式行为完全不变。
