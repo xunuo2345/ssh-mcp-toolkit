@@ -1394,7 +1394,7 @@ export class ShellCommandQueue {
     pushedUntil: number;
   } | null = null;
 
-  constructor(private readonly shell: { write(data: string, cb?: (err: Error | null) => void): void }) {}
+  constructor(private readonly shell: { write(data: string, cb?: (err: Error | null | undefined) => void): void }) {}
 
   get hasPending(): boolean {
     return this.pending !== null;
@@ -1499,12 +1499,7 @@ class PersistentSession {
   private conn: InstanceType<typeof SSHClient> | null = null;
   private jumpConns: InstanceType<typeof SSHClient>[] = [];
   private shell: ClientChannel | null = null;
-  private buffer = '';
-  private pendingCommand: {
-    resolve: (result: { output: string; exitCode: number }) => void;
-    reject: (error: Error) => void;
-    marker: string;
-  } | null = null;
+  private commandQueue: ShellCommandQueue | null = null;
   private inactivityTimer: NodeJS.Timeout | null = null;
   private disposed = false;
   private readonly createdAt = Date.now();
@@ -1569,16 +1564,16 @@ class PersistentSession {
 
         this.shell = stream;
         stream.setEncoding('utf8');
+        this.commandQueue = new ShellCommandQueue(stream);
         stream.on('data', (data: string) => {
-          this.buffer += data;
-          this.processPending();
+          this.commandQueue?.handleData(data);
         });
         stream.on('close', () => {
+          this.commandQueue?.handleClose();
           this.cleanup();
         });
         stream.stderr?.on('data', (data: string) => {
-          this.buffer += data;
-          this.processPending();
+          this.commandQueue?.handleData(data);
         });
 
         stream.write('export PS1=""\n');
@@ -1592,40 +1587,41 @@ class PersistentSession {
 
   async execute(command: string): Promise<{ output: string; exitCode: number }> {
     await this.ensureConnected();
-
-    if (!this.shell) {
+    if (!this.commandQueue) {
       throw new McpError(ErrorCode.InternalError, 'SSH shell not ready');
     }
-    if (this.pendingCommand) {
-      throw new McpError(ErrorCode.InternalError, 'Another command is still running in this session');
-    }
-
-    this.lastCommand = command;
-    this.resetInactivityTimer();
-
-    const token = randomUUID();
-    const marker = `__MCP_DONE__${token}__`;
-
     return new Promise((resolve, reject) => {
-      this.pendingCommand = {
-        marker,
-        resolve,
-        reject,
-      };
-
-      const commandWithNewline = command.endsWith('\n') ? command : command + '\n';
-      this.shell!.write(commandWithNewline, (err) => {
-        if (err) {
-          this.rejectPending(err);
-          return;
-        }
-        this.shell!.write(`printf '${marker}%d\n' $?\n`, (printfErr) => {
-          if (printfErr) {
-            this.rejectPending(printfErr);
-          }
-        });
+      this.launch(command, {
+        onDone: resolve,
+        onError: reject,
       });
     });
+  }
+
+  launch(command: string, callbacks: CommandCallbacks): void {
+    if (!this.commandQueue) {
+      throw new McpError(ErrorCode.InternalError, 'SSH shell not ready');
+    }
+    this.lastCommand = command;
+    this.resetInactivityTimer();
+    this.commandQueue.launch(command, {
+      onData: callbacks.onData,
+      onDone: (result) => {
+        callbacks.onDone?.(result);
+        this.resetInactivityTimer();
+      },
+      onError: (error) => {
+        callbacks.onError?.(error);
+        this.resetInactivityTimer();
+      },
+    });
+  }
+
+  interrupt(): void {
+    if (!this.commandQueue) {
+      throw new McpError(ErrorCode.InternalError, 'SSH shell not ready');
+    }
+    this.commandQueue.interrupt();
   }
 
   dispose(): void {
@@ -1646,46 +1642,6 @@ class PersistentSession {
     }, this.timeoutMs);
   }
 
-  private processPending(): void {
-    if (!this.pendingCommand) {
-      return;
-    }
-
-    const { marker, resolve } = this.pendingCommand;
-    const markerIndex = this.buffer.indexOf(marker);
-    if (markerIndex === -1) {
-      return;
-    }
-
-    const afterMarker = this.buffer.slice(markerIndex + marker.length);
-    const newlineIndex = afterMarker.indexOf('\n');
-    if (newlineIndex === -1) {
-      return;
-    }
-
-    const exitCodeText = afterMarker.slice(0, newlineIndex).trim();
-    const remaining = afterMarker.slice(newlineIndex + 1);
-
-    const output = this.buffer.slice(0, markerIndex).replace(/\r/g, '');
-    const exitCode = Number.parseInt(exitCodeText, 10);
-
-    this.buffer = remaining;
-    this.pendingCommand = null;
-
-    const finalOutput = output.replace(/__MCP_READY__\s*/g, '').replace(/\s+$/, '');
-
-    resolve({ output: finalOutput, exitCode: Number.isNaN(exitCode) ? 0 : exitCode });
-    this.resetInactivityTimer();
-  }
-
-  private rejectPending(error: Error): void {
-    if (!this.pendingCommand) {
-      return;
-    }
-    this.pendingCommand.reject(error);
-    this.pendingCommand = null;
-  }
-
   private cleanup(error?: Error): void {
     if (this.inactivityTimer) {
       clearTimeout(this.inactivityTimer);
@@ -1697,6 +1653,7 @@ class PersistentSession {
       this.shell.end();
       this.shell = null;
     }
+    this.commandQueue = null;
 
     if (this.conn) {
       this.conn.removeAllListeners();
@@ -1709,13 +1666,6 @@ class PersistentSession {
       jumpConn.end();
     }
     this.jumpConns = [];
-
-    if (this.pendingCommand) {
-      this.pendingCommand.reject(error ?? new Error('SSH session closed'));
-      this.pendingCommand = null;
-    }
-
-    this.buffer = '';
 
     if (this.disposed) {
       this.onDispose?.(this.id);
