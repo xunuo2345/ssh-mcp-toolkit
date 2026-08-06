@@ -27,6 +27,7 @@
    - [Starting a Session](#starting-a-session)
    - [Listing Sessions](#listing-sessions)
    - [Executing Commands](#executing-commands)
+   - [Async Command Execution](#async-command-execution)
    - [Closing Sessions](#closing-sessions)
 10. [File Transfer](#file-transfer)
 11. [Internet Egress](#internet-egress)
@@ -66,6 +67,7 @@ Hosts that are not directly reachable can be tunneled through any number of jump
 | 本地端口转发（隧道） | `open-tunnel` / `close-tunnel` / `list-tunnels` | 把内网应用端口暴露到本机 `localhost`（`ssh -L` 风格），支持多跳，2 小时无活跃连接自动回收 | [Port Forwarding (Tunnels)](#port-forwarding-tunnels) |
 | 内网出网（Internet Egress） | `open-egress` / `close-egress` / `list-egress` | 让内网服务器 B/C 经本地机器访问外网（`ssh -R` + 本地 HTTP 正向代理），可用于 `apt`/`pip`/`npm` 下包 | [Internet Egress](#internet-egress) |
 | 服务器间直传 | `start-transfer` / `transfer-status` / `transfer-cancel` | 两台已保存主机之间的文件传输：`direct`（源服务器上跑 rsync，本地 0 带宽）/ `stream`（经本地双 SFTP 流转发）/ `hybrid` / `auto` | [Server-to-Server Transfer](#server-to-server-transfer) |
+| 异步命令执行 | `start-exec` / `exec-status` / `exec-logs` / `exec-cancel` | 长命令（跑批/构建/迁移）后台执行、立即返回 `run_id`，可增量读取运行中的输出并可取消；规避同步 `exec` 的 MCP 客户端超时；结果保留 10 分钟 | [Session Management](#session-management) |
 
 所有新增均向后兼容：原有 `hosts.json` 格式与既有工具调用方式完全不变。
 
@@ -81,6 +83,7 @@ Hosts that are not directly reachable can be tunneled through any number of jump
 - **Local port forwarding:** expose an internal service's port to the local machine over the same SSH chain — including multi-hop setups — with no local `ssh` binary required.
 - **Internet egress:** let internal servers without direct internet access download packages through the local machine via an HTTP proxy on the jump host (`open-egress`).
 - **Server-to-server transfer:** copy files directly between two stored hosts — rsync on the source for large files (zero local bandwidth) or an SFTP pipe through the local machine when hosts can't reach each other (`start-transfer`).
+- **Async command execution:** run long-running commands (batch jobs, builds, migrations) in the background with `start-exec`, then poll incremental output with `exec-logs` and the final result with `exec-status` — no MCP request timeouts on the synchronous `exec` tool.
 - **Timeout & cleanup safeguards:** sessions and tunnels auto-close after prolonged inactivity; commands are marked and monitored for completion.
 - **Structured listings:** query active sessions and saved hosts directly from the MCP client.
 
@@ -95,6 +98,8 @@ MCP Client ─┬─> add-host / edit-host / remove-host
             │
             ├─> start-session ─┬─> PersistentSession (ssh2 shell)
             │                  ├─> exec (reuses shell, captures stdout/stderr)
+            │                  ├─> start-exec ──> ExecRun (background, streaming logs)
+            │                  │    exec-status / exec-logs / exec-cancel
             │                  └─> close-session / auto-timeout
             │
             ├─> upload-file / download-file ─> temporary SFTP connection
@@ -394,6 +399,62 @@ Example output:
 ```
 /home/user
 ```
+
+### Async Command Execution
+
+`start-exec` runs a command in the background of an existing session's shell and returns a `run_id` immediately, so long-running commands (batch jobs, builds, migrations) no longer block the MCP client — the synchronous `exec` tool waits for completion, which can hit request timeouts. The old `exec` tool is retained for short, fast commands.
+
+#### Starting a run
+
+Tool: **`start-exec`**
+
+```json
+{
+  "session_id": "fff4b34b-56dd-4711-9555-c04e8b64249b",
+  "command": "npm run build"
+}
+```
+
+The command is sanitized exactly like `exec`. The response returns the `run_id` immediately; the command keeps running afterwards:
+
+```
+Command '7f1c…' started on session 'fff4…'
+```
+
+#### Status and full output
+
+Tool: **`exec-status`** with `run_id` returns JSON with the full accumulated `output`, the `state` (`running` / `completed` / `failed` / `cancelled`), `exitCode`, and timestamps:
+
+```json
+{
+  "run_id": "7f1c…",
+  "session_id": "fff4…",
+  "command": "npm run build",
+  "state": "running",
+  "output": "…",
+  "exitCode": null,
+  "startedAt": 1750000000000,
+  "finishedAt": null,
+  "cancelRequested": false,
+  "expiresAt": null
+}
+```
+
+#### Streaming logs
+
+Tool: **`exec-logs`** with `run_id` and an `offset` (character index, default `0`) returns only the output produced after that point. Use the returned `nextOffset` as the next `offset` to poll incrementally while the command is still running:
+
+```json
+{ "run_id": "7f1c…", "state": "running", "output": "…new output…", "nextOffset": 412, "exitCode": null }
+```
+
+#### Cancelling
+
+Tool: **`exec-cancel`** with `run_id` sends Ctrl-C to the session's shell, aborting the foreground command and marking the run `cancelled`. Only a `running` run can be cancelled.
+
+#### Retention
+
+A finished run (completed, failed, or cancelled) stays queryable via `exec-status` / `exec-logs` for **10 minutes** after it finishes, then is pruned automatically the next time a run is started. Running runs are never pruned. If the session is closed while a run is still `running`, the run resolves to `failed`.
 
 ### Closing Sessions
 
@@ -720,38 +781,46 @@ Below is a typical workflow using Claude Code (commands start with `/mcp`), but 
    /mcp mcp-remote-ssh exec {"session_id":"<id>","command":"ls -la"}
    ```
 
-4. **Transfer files (optional)**
+4. **Run long-running commands in the background (optional)**
+   ```
+   /mcp mcp-remote-ssh start-exec {"session_id":"<id>","command":"npm run build"}
+   /mcp mcp-remote-ssh exec-logs {"run_id":"<run_id>","offset":0}
+   /mcp mcp-remote-ssh exec-status {"run_id":"<run_id>"}
+   ```
+   → `start-exec` returns a `run_id` immediately; poll `exec-logs` (`nextOffset` → next `offset`) for incremental output and `exec-status` for the final result. Cancel with `exec-cancel`.
+
+5. **Transfer files (optional)**
    ```
    /mcp mcp-remote-ssh upload-file {"host_id":"host","local_path":"C:/build/app.tar.gz","remote_path":"/tmp/app.tar.gz"}
    /mcp mcp-remote-ssh download-file {"host_id":"host","remote_path":"/var/log/app.log","local_path":"C:/downloads/app.log"}
    ```
 
-5. **Expose an internal service (optional)**
+6. **Expose an internal service (optional)**
    ```
    /mcp mcp-remote-ssh open-tunnel {"host_id":"host","remote_port":8080,"local_port":8080}
    ```
    → returns a tunnel id; the service is then reachable at `http://localhost:8080`. Close it with `close-tunnel`.
 
-6. **Provide internet access to internal machines (optional)**
+7. **Provide internet access to internal machines (optional)**
    ```
    /mcp mcp-remote-ssh open-egress {"host_id":"A","proxy_bind":"192.168.1.10","proxy_port":8080}
    ```
    → returns an egress id; machines that can reach A can then use `http://192.168.1.10:8080` as their HTTP proxy. Close it with `close-egress`.
 
-7. **Transfer files between servers (optional)**
+8. **Transfer files between servers (optional)**
    ```
    /mcp mcp-remote-ssh start-transfer {"source_host":"db-primary","source_path":"/var/backup/full.dump","target_host":"db-dr","target_path":"/data/backup/full.dump"}
    ```
    → returns a transfer id; `transfer-status` shows progress, `transfer-cancel` stops it.
 
-8. **Inspect**
+9. **Inspect**
    ```
    /mcp mcp-remote-ssh list-sessions
    /mcp mcp-remote-ssh list-hosts
    /mcp mcp-remote-ssh list-tunnels
    ```
 
-9. **Close session / tunnel**
+10. **Close session / tunnel**
    ```
    /mcp mcp-remote-ssh close-session {"sessionId":"<id>"}
    /mcp mcp-remote-ssh close-tunnel {"tunnel_id":"<id>"}
