@@ -86,6 +86,17 @@ describe('ShellCommandQueue', () => {
     expect(writes).toEqual(['\u0003']);
   });
 
+  it('interrupt re-sends the completion marker after Ctrl-C', async () => {
+    const { ShellCommandQueue } = await import('../src/index.js');
+    const { shell, writes } = makeFakeShell();
+    const q = new ShellCommandQueue(shell as any);
+    q.launch('sleep 30', {});
+    const marker = markerFromWrites(writes);
+    q.interrupt();
+    expect(writes[2]).toBe('\u0003');
+    expect(writes[3]).toContain(`printf '${marker}%d\n' $?`);
+  });
+
   it('launch rejects a second concurrent command', async () => {
     const { ShellCommandQueue } = await import('../src/index.js');
     const { shell } = makeFakeShell();
