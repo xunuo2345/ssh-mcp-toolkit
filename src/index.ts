@@ -1007,7 +1007,7 @@ server.tool(
     try {
       session.launch(sanitizedCommand, {
         onData: (chunk) => {
-          run.output += chunk;
+          run.output += chunk.replace(/\r/g, '');
         },
         onDone: (result) => {
           run.output = result.output;
@@ -1039,6 +1039,7 @@ server.tool(
     run_id: z.string().describe("Identifier of the command run"),
   },
   async ({ run_id }) => {
+    pruneExpiredExecRuns(activeExecRuns, Date.now());
     const run = activeExecRuns.get(run_id);
     if (!run) {
       throw new McpError(ErrorCode.InvalidParams, `Run '${run_id}' does not exist`);
@@ -1058,6 +1059,7 @@ server.tool(
     offset: z.number().int().min(0).default(0).describe("Character offset into the accumulated output to read from (default 0)"),
   },
   async ({ run_id, offset }) => {
+    pruneExpiredExecRuns(activeExecRuns, Date.now());
     const run = activeExecRuns.get(run_id);
     if (!run) {
       throw new McpError(ErrorCode.InvalidParams, `Run '${run_id}' does not exist`);
@@ -1767,8 +1769,6 @@ class PersistentSession {
     if (!this.commandQueue) {
       throw new McpError(ErrorCode.InternalError, 'SSH shell not ready');
     }
-    this.lastCommand = command;
-    this.resetInactivityTimer();
     this.commandQueue.launch(command, {
       onData: callbacks.onData,
       onDone: (result) => {
@@ -1780,6 +1780,8 @@ class PersistentSession {
         this.resetInactivityTimer();
       },
     });
+    this.lastCommand = command;
+    this.resetInactivityTimer();
   }
 
   interrupt(): void {
