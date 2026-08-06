@@ -761,6 +761,7 @@ const activeSessions = new Map<string, PersistentSession>();
 const activeTunnels = new Map<string, PortForward>();
 const activeEgress = new Map<string, InternetEgress>();
 const activeTransfers = new Map<string, ServerTransfer>();
+const activeExecRuns = new Map<string, ExecRun>();
 const DEFAULT_SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
 
 const server = new McpServer({
@@ -1493,6 +1494,43 @@ export function resolveExecFinishState(cancelRequested: boolean, exitCode: numbe
     return 'cancelled';
   }
   return exitCode === 0 ? 'completed' : 'failed';
+}
+
+export function formatExecStatus(run: ExecRun): Record<string, unknown> {
+  return { ...run };
+}
+
+export function formatExecLogs(run: ExecRun, offset: number): Record<string, unknown> {
+  const safeOffset = Number.isFinite(offset) && offset > 0 ? Math.floor(offset) : 0;
+  const output = run.output.slice(safeOffset);
+  return {
+    run_id: run.run_id,
+    state: run.state,
+    output,
+    nextOffset: run.output.length,
+    exitCode: run.exitCode,
+  };
+}
+
+export function pruneExpiredExecRuns(runs: Map<string, ExecRun>, now: number): void {
+  for (const [id, run] of runs) {
+    if (run.expiresAt !== null && run.expiresAt <= now) {
+      runs.delete(id);
+    }
+  }
+}
+
+export function resolveExecRunSessionFailure(run: ExecRun, sessionExists: boolean): ExecRun {
+  if (run.state !== 'running' || sessionExists) {
+    return run;
+  }
+  const finishedAt = Date.now();
+  return {
+    ...run,
+    state: 'failed',
+    finishedAt,
+    expiresAt: finishedAt + 10 * 60 * 1000,
+  };
 }
 
 class PersistentSession {

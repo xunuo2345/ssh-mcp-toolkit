@@ -105,3 +105,70 @@ describe('ShellCommandQueue', () => {
     expect(q.hasPending).toBe(false);
   });
 });
+
+describe('exec run helpers', () => {
+  function makeRun(overrides: Partial<any> = {}): any {
+    return {
+      run_id: 'r1',
+      session_id: 's1',
+      command: 'echo hi',
+      state: 'running',
+      output: 'partial',
+      exitCode: null,
+      startedAt: 1000,
+      finishedAt: null,
+      cancelRequested: false,
+      expiresAt: null,
+      ...overrides,
+    };
+  }
+
+  it('formatExecStatus returns the full run shape', async () => {
+    const { formatExecStatus } = await import('../src/index.js');
+    const status = formatExecStatus(makeRun({ state: 'completed', exitCode: 0, output: 'hi' }));
+    expect(status.state).toBe('completed');
+    expect(status.exitCode).toBe(0);
+    expect(status.output).toBe('hi');
+  });
+
+  it('formatExecLogs slices output from an offset and reports nextOffset', async () => {
+    const { formatExecLogs } = await import('../src/index.js');
+    const logs = formatExecLogs(makeRun({ output: 'abcdef' }), 2);
+    expect(logs.output).toBe('cdef');
+    expect(logs.nextOffset).toBe(6);
+  });
+
+  it('formatExecLogs with an out-of-range offset returns empty output', async () => {
+    const { formatExecLogs } = await import('../src/index.js');
+    const logs = formatExecLogs(makeRun({ output: 'abc' }), 10);
+    expect(logs.output).toBe('');
+    expect(logs.nextOffset).toBe(3);
+  });
+
+  it('pruneExpiredExecRuns removes expired entries but keeps running ones', async () => {
+    const { pruneExpiredExecRuns } = await import('../src/index.js');
+    const runs = new Map([
+      ['r1', makeRun({ run_id: 'r1', expiresAt: 5000 })],
+      ['r2', makeRun({ run_id: 'r2', expiresAt: 20000 })],
+      ['r3', makeRun({ run_id: 'r3', state: 'running', expiresAt: null })],
+    ]);
+    pruneExpiredExecRuns(runs, 10000);
+    expect([...runs.keys()]).toEqual(['r2', 'r3']);
+  });
+
+  it('resolveExecRunSessionFailure marks a running run failed when the session is gone', async () => {
+    const { resolveExecRunSessionFailure } = await import('../src/index.js');
+    const result = resolveExecRunSessionFailure(makeRun(), false);
+    expect(result.state).toBe('failed');
+    expect(result.finishedAt).not.toBeNull();
+    expect(result.expiresAt).not.toBeNull();
+  });
+
+  it('resolveExecRunSessionFailure leaves a completed run untouched', async () => {
+    const { resolveExecRunSessionFailure } = await import('../src/index.js');
+    const completed = makeRun({ state: 'completed', finishedAt: 2000, expiresAt: 5000 });
+    const result = resolveExecRunSessionFailure(completed, false);
+    expect(result.state).toBe('completed');
+    expect(result.finishedAt).toBe(2000);
+  });
+});
