@@ -1087,8 +1087,8 @@ server.tool(
     if (!session) {
       throw new McpError(ErrorCode.InternalError, `Session '${run.session_id}' no longer exists`);
     }
-    run.cancelRequested = true;
     session.interrupt();
+    run.cancelRequested = true;
     return { content: [{ type: 'text', text: `Cancellation requested for run '${run_id}'` }] };
   }
 );
@@ -1546,6 +1546,10 @@ export class ShellCommandQueue {
   }
 
   handleData(data: string): void {
+    if (!this.pending) {
+      this.buffer = '';
+      return;
+    }
     this.buffer += data;
     this.processPending();
   }
@@ -1583,6 +1587,9 @@ export class ShellCommandQueue {
     const output = this.buffer.slice(0, markerIndex).replace(/\r/g, '');
     const exitCode = Number.parseInt(exitCodeText, 10);
     this.buffer = remaining;
+    if (this.buffer.startsWith('__MCP_DONE__') || /^\s*$/.test(this.buffer)) {
+      this.buffer = '';
+    }
     const pending = this.pending;
     this.pending = null;
     const finalOutput = output.replace(/__MCP_READY__\s*/g, '').replace(/\s+$/, '');
@@ -1801,6 +1808,8 @@ class PersistentSession {
   }
 
   private cleanup(error?: Error): void {
+    this.commandQueue?.handleClose();
+
     if (this.inactivityTimer) {
       clearTimeout(this.inactivityTimer);
       this.inactivityTimer = null;

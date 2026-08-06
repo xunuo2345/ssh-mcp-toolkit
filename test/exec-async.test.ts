@@ -115,6 +115,33 @@ describe('ShellCommandQueue', () => {
     expect(err).not.toBeNull();
     expect(q.hasPending).toBe(false);
   });
+
+  it('completes when the marker UUID is split across data chunks', async () => {
+    const { ShellCommandQueue } = await import('../src/index.js');
+    const { shell, writes } = makeFakeShell();
+    const q = new ShellCommandQueue(shell as any);
+    let done: { output: string; exitCode: number } | null = null;
+    q.launch('echo hi', { onDone: (r) => { done = r; } });
+    const marker = markerFromWrites(writes);
+    const mid = Math.floor(marker.length / 2);
+    q.handleData(`split marker${marker.slice(0, mid)}`);
+    expect(done).toBeNull();
+    expect(q.hasPending).toBe(true);
+    q.handleData(`${marker.slice(mid)}0\n`);
+    expect(done).toEqual({ output: 'split marker', exitCode: 0 });
+    expect(q.hasPending).toBe(false);
+  });
+
+  it('handleClose on a pending run reaches onError and clears the run', async () => {
+    const { ShellCommandQueue } = await import('../src/index.js');
+    const { shell } = makeFakeShell();
+    const q = new ShellCommandQueue(shell as any);
+    let err: Error | null = null;
+    q.launch('sleep 1', { onError: (e) => { err = e; } });
+    q.handleClose();
+    expect(err).not.toBeNull();
+    expect(q.hasPending).toBe(false);
+  });
 });
 
 describe('exec run helpers', () => {
