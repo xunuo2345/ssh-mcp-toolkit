@@ -977,6 +977,123 @@ server.tool(
 );
 
 server.tool(
+  "start-exec",
+  "Execute a shell command on an existing SSH session in the background. Returns immediately with a run id; poll exec-status for the result and exec-logs for incremental output. Use this for long-running commands that would time out the synchronous exec tool.",
+  {
+    session_id: z.string().describe("Identifier of the session to use"),
+    command: z.string().describe("Command to execute"),
+  },
+  async ({ session_id, command }) => {
+    const session = activeSessions.get(session_id);
+    if (!session) {
+      throw new McpError(ErrorCode.InvalidParams, `Session '${session_id}' does not exist`);
+    }
+    pruneExpiredExecRuns(activeExecRuns, Date.now());
+    const sanitizedCommand = sanitizeCommand(command);
+    const run_id = randomUUID();
+    const run: ExecRun = {
+      run_id,
+      session_id,
+      command: sanitizedCommand,
+      state: 'running',
+      output: '',
+      exitCode: null,
+      startedAt: Date.now(),
+      finishedAt: null,
+      cancelRequested: false,
+      expiresAt: null,
+    };
+    activeExecRuns.set(run_id, run);
+    try {
+      session.launch(sanitizedCommand, {
+        onData: (chunk) => {
+          run.output += chunk;
+        },
+        onDone: (result) => {
+          run.output = result.output;
+          run.exitCode = result.exitCode;
+          run.state = resolveExecFinishState(run.cancelRequested, result.exitCode);
+          run.finishedAt = Date.now();
+          run.expiresAt = run.finishedAt + 10 * 60 * 1000;
+        },
+        onError: () => {
+          run.state = 'failed';
+          run.finishedAt = Date.now();
+          run.expiresAt = run.finishedAt + 10 * 60 * 1000;
+        },
+      });
+    } catch (error: any) {
+      activeExecRuns.delete(run_id);
+      throw new McpError(ErrorCode.InternalError, `Failed to start command: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return {
+      content: [{ type: 'text', text: `Command '${run_id}' started on session '${session_id}'` }],
+    };
+  }
+);
+
+server.tool(
+  "exec-status",
+  "Query the status and full output of a background command run.",
+  {
+    run_id: z.string().describe("Identifier of the command run"),
+  },
+  async ({ run_id }) => {
+    const run = activeExecRuns.get(run_id);
+    if (!run) {
+      throw new McpError(ErrorCode.InvalidParams, `Run '${run_id}' does not exist`);
+    }
+    const resolved = resolveExecRunSessionFailure(run, activeSessions.has(run.session_id));
+    return {
+      content: [{ type: 'text', text: JSON.stringify(formatExecStatus(resolved), null, 2) }],
+    };
+  }
+);
+
+server.tool(
+  "exec-logs",
+  "Read incremental output from a background command run, starting at a character offset.",
+  {
+    run_id: z.string().describe("Identifier of the command run"),
+    offset: z.number().int().min(0).default(0).describe("Character offset into the accumulated output to read from (default 0)"),
+  },
+  async ({ run_id, offset }) => {
+    const run = activeExecRuns.get(run_id);
+    if (!run) {
+      throw new McpError(ErrorCode.InvalidParams, `Run '${run_id}' does not exist`);
+    }
+    const resolved = resolveExecRunSessionFailure(run, activeSessions.has(run.session_id));
+    return {
+      content: [{ type: 'text', text: JSON.stringify(formatExecLogs(resolved, offset), null, 2) }],
+    };
+  }
+);
+
+server.tool(
+  "exec-cancel",
+  "Cancel a running background command by sending Ctrl-C to its session shell.",
+  {
+    run_id: z.string().describe("Identifier of the command run to cancel"),
+  },
+  async ({ run_id }) => {
+    const run = activeExecRuns.get(run_id);
+    if (!run) {
+      throw new McpError(ErrorCode.InvalidParams, `Run '${run_id}' does not exist`);
+    }
+    if (run.state !== 'running') {
+      throw new McpError(ErrorCode.InvalidParams, `Run '${run_id}' is already ${run.state}`);
+    }
+    const session = activeSessions.get(run.session_id);
+    if (!session) {
+      throw new McpError(ErrorCode.InternalError, `Session '${run.session_id}' no longer exists`);
+    }
+    run.cancelRequested = true;
+    session.interrupt();
+    return { content: [{ type: 'text', text: `Cancellation requested for run '${run_id}'` }] };
+  }
+);
+
+server.tool(
   "close-session",
   "Close an existing persistent SSH session.",
   {
