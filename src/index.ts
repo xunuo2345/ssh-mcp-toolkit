@@ -656,6 +656,19 @@ export type TransferInfo = {
   finishedAt: number | null;
 };
 
+export type ExecRun = {
+  run_id: string;
+  session_id: string;
+  command: string;
+  state: 'running' | 'completed' | 'failed' | 'cancelled';
+  output: string;
+  exitCode: number | null;
+  startedAt: number;
+  finishedAt: number | null;
+  cancelRequested: boolean;
+  expiresAt: number | null;
+};
+
 export function validateTransferParams(params: {
   sourceHost: string;
   targetHost: string;
@@ -1358,6 +1371,128 @@ async function getOrCreateSession(id: string, resolved: ResolvedHost, forceNew =
 
   await session.ensureConnected();
   return session;
+}
+
+export type CommandCallbacks = {
+  onData?: (chunk: string) => void;
+  onDone?: (result: { output: string; exitCode: number }) => void;
+  onError?: (error: Error) => void;
+};
+
+/**
+ * Serialises shell command execution over a single shell stream: one command at
+ * a time, completion detected via a `__MCP_DONE__{uuid}__` marker, output
+ * streamed incrementally through onData until the marker is consumed.
+ */
+export class ShellCommandQueue {
+  private buffer = '';
+  private pending: {
+    marker: string;
+    onData?: (chunk: string) => void;
+    onDone?: (result: { output: string; exitCode: number }) => void;
+    onError?: (error: Error) => void;
+    pushedUntil: number;
+  } | null = null;
+
+  constructor(private readonly shell: { write(data: string, cb?: (err: Error | null) => void): void }) {}
+
+  get hasPending(): boolean {
+    return this.pending !== null;
+  }
+
+  launch(command: string, callbacks: CommandCallbacks): void {
+    if (this.pending) {
+      throw new Error('Another command is still running in this session');
+    }
+    const token = randomUUID();
+    const marker = `__MCP_DONE__${token}__`;
+    this.pending = {
+      marker,
+      onData: callbacks.onData,
+      onDone: callbacks.onDone,
+      onError: callbacks.onError,
+      pushedUntil: 0,
+    };
+    const commandWithNewline = command.endsWith('\n') ? command : command + '\n';
+    this.shell.write(commandWithNewline, (err) => {
+      if (err) {
+        this.rejectPending(err);
+        return;
+      }
+      this.shell.write(`printf '${marker}%d\n' $?\n`, (printfErr) => {
+        if (printfErr) {
+          this.rejectPending(printfErr);
+        }
+      });
+    });
+  }
+
+  handleData(data: string): void {
+    this.buffer += data;
+    this.processPending();
+  }
+
+  handleClose(): void {
+    this.rejectPending(new Error('SSH session closed'));
+  }
+
+  interrupt(): void {
+    this.shell.write('\u0003');
+  }
+
+  private processPending(): void {
+    if (!this.pending) {
+      return;
+    }
+    const { marker } = this.pending;
+    const markerIndex = this.buffer.indexOf(marker);
+    if (markerIndex === -1) {
+      this.pushIncrement(this.buffer.length);
+      return;
+    }
+    const afterMarker = this.buffer.slice(markerIndex + marker.length);
+    const newlineIndex = afterMarker.indexOf('\n');
+    if (newlineIndex === -1) {
+      this.pushIncrement(markerIndex);
+      return;
+    }
+    this.pushIncrement(markerIndex);
+    const exitCodeText = afterMarker.slice(0, newlineIndex).trim();
+    const remaining = afterMarker.slice(newlineIndex + 1);
+    const output = this.buffer.slice(0, markerIndex).replace(/\r/g, '');
+    const exitCode = Number.parseInt(exitCodeText, 10);
+    this.buffer = remaining;
+    const pending = this.pending;
+    this.pending = null;
+    const finalOutput = output.replace(/__MCP_READY__\s*/g, '').replace(/\s+$/, '');
+    pending.onDone?.({ output: finalOutput, exitCode: Number.isNaN(exitCode) ? 0 : exitCode });
+  }
+
+  private pushIncrement(upTo: number): void {
+    if (!this.pending) {
+      return;
+    }
+    if (this.pending.onData && this.pending.pushedUntil < upTo) {
+      this.pending.onData(this.buffer.slice(this.pending.pushedUntil, upTo));
+    }
+    this.pending.pushedUntil = Math.max(this.pending.pushedUntil, upTo);
+  }
+
+  private rejectPending(error: Error): void {
+    if (!this.pending) {
+      return;
+    }
+    const pending = this.pending;
+    this.pending = null;
+    pending.onError?.(error);
+  }
+}
+
+export function resolveExecFinishState(cancelRequested: boolean, exitCode: number): 'completed' | 'failed' | 'cancelled' {
+  if (cancelRequested) {
+    return 'cancelled';
+  }
+  return exitCode === 0 ? 'completed' : 'failed';
 }
 
 class PersistentSession {
