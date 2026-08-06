@@ -497,6 +497,8 @@ Progress is polled with `transfer-status` (pass the returned transfer id) and th
 
 The synchronous `download-file` / `upload-file` tools are retained for small files and backward compatibility. Like server-to-server transfers, async transfers run inside the MCP server's own SSH session — closing the laptop or the MCP server interrupts them.
 
+A cancelled or failed transfer leaves a partial destination file and overwrites an existing one at the destination path (there is no resume). 取消或失败的传输会在目标路径留下不完整的文件，且会覆盖该路径上已有的同名文件（当前不支持断点续传）。
+
 ---
 
 ## Port Forwarding (Tunnels)

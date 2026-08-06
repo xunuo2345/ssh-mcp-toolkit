@@ -2333,7 +2333,7 @@ export class FileTransfer {
     private readonly localPath: string,
     private readonly remotePath: string,
     private readonly direction: 'download' | 'upload',
-    private readonly conns: { conn: InstanceType<typeof SSHClient>; jumpConns: InstanceType<typeof SSHClient>[]; sftp: SFTPWrapper },
+    private conns: { conn: InstanceType<typeof SSHClient>; jumpConns: InstanceType<typeof SSHClient>[]; sftp: SFTPWrapper },
   ) {
     conns.conn.once?.('error', (error: Error) => this.markFailed(error.message));
     conns.conn.once?.('end', () => this.markFailed('SSH connection ended'));
@@ -2399,6 +2399,8 @@ export class FileTransfer {
     this.conns.sftp.end();
     this.conns.conn.end();
     for (const jumpConn of this.conns.jumpConns) jumpConn.end();
+    this.streams = [];
+    this.conns = null as any;
   }
 
   private complete(): void {
