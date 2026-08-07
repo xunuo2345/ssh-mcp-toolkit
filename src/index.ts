@@ -978,12 +978,13 @@ server.tool(
 
 server.tool(
   "start-exec",
-  "Execute a shell command on an existing SSH session in the background. Returns immediately with a run id; poll exec-status for the result and exec-logs for incremental output. Use this for long-running commands that would time out the synchronous exec tool.",
+  "Execute a shell command on an existing SSH session in the background. Returns immediately with a run id; poll exec-status for the result and exec-logs for incremental output. Use this for long-running commands that would time out the synchronous exec tool. For stdin-reading programs (menus, REPLs), pass interactive:true to omit the completion marker; the run stays running until exec-cancel or session close.",
   {
     session_id: z.string().describe("Identifier of the session to use"),
     command: z.string().describe("Command to execute"),
+    interactive: z.boolean().default(false).describe("Launch in interactive mode (default false): writes only the command without the completion marker, so stdin-reading programs like menus are not fed the marker line. The run stays running until exec-cancel or session close. Use with exec-input."),
   },
-  async ({ session_id, command }) => {
+  async ({ session_id, command, interactive }) => {
     const session = activeSessions.get(session_id);
     if (!session) {
       throw new McpError(ErrorCode.InvalidParams, `Session '${session_id}' does not exist`);
@@ -1021,7 +1022,7 @@ server.tool(
           run.finishedAt = Date.now();
           run.expiresAt = run.finishedAt + 10 * 60 * 1000;
         },
-      });
+      }, { interactive });
     } catch (error: any) {
       activeExecRuns.delete(run_id);
       throw new McpError(ErrorCode.InternalError, `Failed to start command: ${error instanceof Error ? error.message : String(error)}`);
@@ -1554,7 +1555,7 @@ export class ShellCommandQueue {
     return this.pending !== null;
   }
 
-  launch(command: string, callbacks: CommandCallbacks): void {
+  launch(command: string, callbacks: CommandCallbacks, options?: { interactive?: boolean }): void {
     if (this.pending) {
       throw new Error('Another command is still running in this session');
     }
@@ -1571,6 +1572,9 @@ export class ShellCommandQueue {
     this.shell.write(commandWithNewline, (err) => {
       if (err) {
         this.rejectPending(err);
+        return;
+      }
+      if (options?.interactive) {
         return;
       }
       this.shell.write(`printf '${marker}%d\n' $?\n`, (printfErr) => {
@@ -1807,7 +1811,7 @@ export class PersistentSession {
     });
   }
 
-  launch(command: string, callbacks: CommandCallbacks): void {
+  launch(command: string, callbacks: CommandCallbacks, options?: { interactive?: boolean }): void {
     if (!this.commandQueue) {
       throw new McpError(ErrorCode.InternalError, 'SSH shell not ready');
     }
@@ -1824,7 +1828,7 @@ export class PersistentSession {
         callbacks.onError?.(error);
         this.resetInactivityTimer();
       },
-    });
+    }, options);
     this.lastCommand = command;
     this.resetInactivityTimer();
   }

@@ -30,6 +30,18 @@ describe('ShellCommandQueue.sendInput', () => {
   });
 });
 
+describe('ShellCommandQueue.launch interactive mode', () => {
+  it('interactive launch writes only the command without the completion marker', async () => {
+    const { ShellCommandQueue } = await import('../src/index.js');
+    const { shell, writes } = makeFakeShell();
+    const q = new ShellCommandQueue(shell as any);
+    q.launch('menu', { onData: () => {}, onDone: () => {}, onError: () => {} }, { interactive: true });
+    expect(writes.length).toBe(1);
+    expect(writes[0]).toBe('menu\n');
+    expect(writes.some((w) => w.includes('__MCP_DONE__'))).toBe(false);
+  });
+});
+
 describe('PersistentSession.sendInput', () => {
   it('forwards input to the command queue', async () => {
     const { PersistentSession } = await import('../src/index.js');
