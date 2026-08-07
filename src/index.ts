@@ -1839,6 +1839,7 @@ export class PersistentSession {
       throw new McpError(ErrorCode.InternalError, 'SSH shell not ready');
     }
     this.commandQueue.sendInput(text);
+    this.resetInactivityTimer();
   }
 
   interrupt(): void {

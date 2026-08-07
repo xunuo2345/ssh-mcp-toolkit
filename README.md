@@ -472,6 +472,8 @@ Typical scenario: a **jump-host asset-selection menu**. `start-exec` launches th
 
 > Interactive TUI commands never finish, so the run stays `running` while you interact with it — use `exec-cancel` to interrupt it when done.
 
+> Note: programs that trap or ignore SIGINT (Ctrl-C) may not be interruptible via `exec-cancel` — closing the session is the fallback. 捕获或忽略 SIGINT 的程序可能无法通过 exec-cancel 中断，可关闭会话作为兜底。
+
 #### Retention
 
 A finished run (completed, failed, or cancelled) stays queryable via `exec-status` / `exec-logs` for **10 minutes** after it finishes, then is pruned automatically the next time a run is started. Running runs are never pruned. If the session is closed while a run is still `running`, the run resolves to `failed`.
@@ -759,7 +761,7 @@ Tool: **`transfer-status`** with `transfer_id` returns JSON with `state`, `mode`
 
 ## Timeouts & Inactivity Handling
 
-- Each session has a **global inactivity timeout** (default 2 hours). Timer resets whenever a command executes successfully.
+- Each session has a **global inactivity timeout** (default 2 hours). Timer resets whenever a command executes successfully, on incoming command output, and on `exec-input`. Inactivity means no command output and no input activity — a continuously-streaming (`tail -f`-style) or interactive session stays alive. 闲置指既无命令输出也无输入活动：持续流式输出或正在交互的会话不会被回收。
 - If the timer elapses, the session cleans up the SSH connection, shell, and resolver buffer, and removes itself from `activeSessions`.
 - Command completion uses a UUID marker: `printf '__MCP_DONE__{uuid}%d\n' $?`. Output before the marker is returned; numeric code after the marker becomes the exit status.
 - Each tunnel shares the same **2-hour inactivity timeout**, but only counts while **no connection** is flowing through it. The timer is cleared as soon as a connection opens and restarts after the last one closes. Internet egress tunnels behave the same way.
