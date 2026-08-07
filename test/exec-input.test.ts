@@ -51,6 +51,32 @@ describe('ShellCommandQueue.launch interactive mode', () => {
     expect(writes[2]).toBe('\n');
     expect(writes[3]).toContain(`printf '__MCP_DONE__`);
   });
+
+  // Regression for the review finding: if a program's output coincidentally
+  // contains the literal `__MCP_DONE__{uuid}__0\n` text (e.g. a user-pasted
+  // UUID), an interactive run must NOT prematurely complete.
+  it('interactive run ignores coincidental __MCP_DONE__ text in output and stays running', async () => {
+    const { ShellCommandQueue } = await import('../src/index.js');
+    const { shell, writes } = makeFakeShell();
+    const q = new ShellCommandQueue(shell as any);
+    const chunks: string[] = [];
+    let done: { output: string; exitCode: number } | null = null;
+    q.launch(
+      'menu',
+      { onData: (c) => chunks.push(c), onDone: (r) => { done = r; } },
+      { interactive: true },
+    );
+    const collision = 'some output\n__MCP_DONE__aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee__0\nmore output';
+    q.handleData(collision);
+    expect(q.hasPending).toBe(true);
+    expect(done).toBeNull();
+    expect(chunks.join('')).toBe(collision);
+    // Program continues to receive more input normally.
+    q.handleData('still running\n');
+    expect(q.hasPending).toBe(true);
+    expect(done).toBeNull();
+    expect(writes.some((w) => w.includes('__MCP_DONE__'))).toBe(false);
+  });
 });
 
 describe('PersistentSession.sendInput', () => {
@@ -108,5 +134,49 @@ describe('exec-input tool result formatting', () => {
     const result = formatExecInputResult(makeRun({ output: 'abc' }), 10);
     expect(result.output).toBe('');
     expect(result.nextOffset).toBe(3);
+  });
+});
+
+describe('validateExecInputPostState', () => {
+  function makeRun(overrides: Partial<any> = {}): any {
+    return {
+      run_id: 'r1',
+      session_id: 's1',
+      command: 'menu',
+      state: 'running',
+      output: '',
+      exitCode: null,
+      startedAt: 1000,
+      finishedAt: null,
+      cancelRequested: false,
+      expiresAt: null,
+      interactive: true,
+      ...overrides,
+    };
+  }
+
+  // Re-check the post-state guard for the cancel race: if exec-cancel
+  // transitions the run during the wait_ms window, the text was already
+  // written to the shell and may have been executed as a command.
+  it('throws when the run transitioned to cancelled during input', async () => {
+    const { validateExecInputPostState } = await import('../src/index.js');
+    expect(() => validateExecInputPostState(makeRun({ state: 'cancelled' }), 'r1'))
+      .toThrow(/cancelled.*during exec-input.*may have been executed/);
+  });
+
+  it('throws when the run transitioned to failed during input', async () => {
+    const { validateExecInputPostState } = await import('../src/index.js');
+    expect(() => validateExecInputPostState(makeRun({ state: 'failed' }), 'r1'))
+      .toThrow(/failed.*during exec-input/);
+  });
+
+  it('does not throw when the run is still running', async () => {
+    const { validateExecInputPostState } = await import('../src/index.js');
+    expect(() => validateExecInputPostState(makeRun({ state: 'running' }), 'r1')).not.toThrow();
+  });
+
+  it('does not throw when the run completed normally (program consumed input and exited)', async () => {
+    const { validateExecInputPostState } = await import('../src/index.js');
+    expect(() => validateExecInputPostState(makeRun({ state: 'completed', exitCode: 0 }), 'r1')).not.toThrow();
   });
 });

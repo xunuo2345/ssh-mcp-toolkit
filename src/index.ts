@@ -1129,6 +1129,7 @@ server.tool(
       await new Promise((resolve) => setTimeout(resolve, wait_ms));
     }
     const afterInput = resolveExecRunSessionFailure(run, activeSessions.has(run.session_id));
+    validateExecInputPostState(afterInput, run_id);
     return {
       content: [{ type: 'text', text: JSON.stringify(formatExecInputResult(afterInput, offset), null, 2) }],
     };
@@ -1640,6 +1641,17 @@ export class ShellCommandQueue {
       this.pushIncrement(this.buffer.length);
       return;
     }
+    // The completion path is only safe when a marker was actually injected
+    // for this run (non-interactive launch, or post-interrupt). Otherwise,
+    // any `__MCP_DONE__{uuid}__` text that happens to appear in interactive
+    // program output (e.g. user-pasted UUIDs) is treated as ordinary data —
+    // reaching the completion path here would also trigger `pushIncrement`'s
+    // buffer trim with `!markerExpected`, leaving `buffer.slice(0, markerIndex)`
+    // to return garbage as `run.output`.
+    if (!this.pending.markerExpected) {
+      this.pushIncrement(this.buffer.length);
+      return;
+    }
     const afterMarker = this.buffer.slice(markerIndex + marker.length);
     const newlineIndex = afterMarker.indexOf('\n');
     if (newlineIndex === -1) {
@@ -1717,6 +1729,24 @@ export function formatExecLogs(run: ExecRun, offset: number): Record<string, unk
 
 export function formatExecInputResult(run: ExecRun, offset: number): Record<string, unknown> {
   return formatExecLogs(run, offset);
+}
+
+/**
+ * Verify the state of an exec run after a synchronous input was delivered
+ * via `exec-input`. If the run has transitioned out of `running` to a
+ * terminal-failure state (`cancelled` or `failed`), the input text was
+ * already written to the shell and may have been executed as a command —
+ * the exact risk the `interactive:true` gate exists to prevent. A
+ * `completed` state is fine (the program consumed the input and exited
+ * normally), and `running` is fine (no race).
+ */
+export function validateExecInputPostState(run: ExecRun, runId: string): void {
+  if (run.state !== 'running' && run.state !== 'completed') {
+    throw new McpError(
+      ErrorCode.InternalError,
+      `Run '${runId}' state changed to '${run.state}' during exec-input; the text was delivered to the shell and may have been executed as a command`,
+    );
+  }
 }
 
 export function pruneExpiredExecRuns(runs: Map<string, ExecRun>, now: number): void {
