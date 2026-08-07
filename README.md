@@ -465,14 +465,18 @@ Tool: **`exec-input`** with `run_id`, `text`, `offset` (character index, default
 Typical scenario: a **jump-host asset-selection menu**. `start-exec` launches the menu command, then `exec-input` sends the menu digits one at a time, stepping through the prompts into the target server's shell:
 
 ```
-/mcp mcp-remote-ssh start-exec {"session_id":"<id>","command":"<资产菜单命令>"}
+/mcp mcp-remote-ssh start-exec {"session_id":"<id>","command":"<资产菜单命令>","interactive":true}
 /mcp mcp-remote-ssh exec-input {"run_id":"<run_id>","text":"1\n","offset":0}
 /mcp mcp-remote-ssh exec-input {"run_id":"<run_id>","text":"2\n","offset":"<nextOffset>"}
 ```
 
 > Interactive TUI commands never finish, so the run stays `running` while you interact with it — use `exec-cancel` to interrupt it when done.
 
-> Note: programs that trap or ignore SIGINT (Ctrl-C) may not be interruptible via `exec-cancel` — closing the session is the fallback. 捕获或忽略 SIGINT 的程序可能无法通过 exec-cancel 中断，可关闭会话作为兜底。
+> If an interactive program exits on its own, the run stays `running` and blocks further commands on that session until `exec-cancel` (marking it `cancelled`). 交互式程序自行退出后，run 仍显示 running，且会阻塞该会话后续命令，需用 exec-cancel 标为 cancelled 才能继续。
+
+> After an interactive program exits, `exec-input` text is executed by the shell as a command, not delivered to the program. 程序退出后，exec-input 发送的文本会被 shell 当作命令执行，而不是传给程序。
+
+> Note: programs that trap or ignore SIGINT (Ctrl-C) may not be interruptible via `exec-cancel` — the `\n` + completion marker that interrupt injects will be consumed as ordinary **stdin data**, not as keys, so it will not reach a running command. Closing the session is the fallback. 捕获或忽略 SIGINT 的程序可能无法通过 exec-cancel 中断：中断时注入的换行与完成标记只会被当作普通 stdin 数据（而非按键）读走，不会送达正在运行的程序，可关闭会话作为兜底。
 
 #### Retention
 
@@ -808,9 +812,14 @@ Below is a typical workflow using Claude Code (commands start with `/mcp`), but 
    /mcp mcp-remote-ssh start-exec {"session_id":"<id>","command":"npm run build"}
    /mcp mcp-remote-ssh exec-logs {"run_id":"<run_id>","offset":0}
    /mcp mcp-remote-ssh exec-status {"run_id":"<run_id>"}
+   ```
+   → `start-exec` returns a `run_id` immediately; poll `exec-logs` (`nextOffset` → next `offset`) for incremental output and `exec-status` for the final result. Cancel with `exec-cancel`.
+
+   Interactive programs (menus, REPLs) must be launched with `interactive:true`; `exec-input` is only valid against such runs, driving their stdin and reading the incremental output:
+   ```
+   /mcp mcp-remote-ssh start-exec {"session_id":"<id>","command":"<菜单命令>","interactive":true}
    /mcp mcp-remote-ssh exec-input {"run_id":"<run_id>","text":"1\n","offset":0}
    ```
-   → `start-exec` returns a `run_id` immediately; poll `exec-logs` (`nextOffset` → next `offset`) for incremental output and `exec-status` for the final result. Cancel with `exec-cancel`. For interactive programs (e.g. a jump-host asset menu), send input with `exec-input` and read the returned incremental output.
 
 5. **Transfer files (optional)**
    ```

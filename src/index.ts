@@ -667,6 +667,7 @@ export type ExecRun = {
   finishedAt: number | null;
   cancelRequested: boolean;
   expiresAt: number | null;
+  interactive: boolean;
 };
 
 export function validateTransferParams(params: {
@@ -1003,6 +1004,7 @@ server.tool(
       finishedAt: null,
       cancelRequested: false,
       expiresAt: null,
+      interactive,
     };
     activeExecRuns.set(run_id, run);
     try {
@@ -1098,7 +1100,7 @@ server.tool(
 
 server.tool(
   "exec-input",
-  "Send input to the stdin of a running background command (e.g. selecting an option in an interactive menu). Returns the incremental output produced after the input, sliced from the given character offset. Pass the returned nextOffset as the next offset to step through an interactive session.",
+  "Send input to the stdin of a running interactive background command (one launched with interactive:true, e.g. selecting an option in a jump-host asset menu). Rejects runs launched without interactive:true — for a non-interactive run the command may have finished and the text would then be executed at the shell prompt. Returns the incremental output produced after the input, sliced from the given character offset. Pass the returned nextOffset as the next offset to step through an interactive session.",
   {
     run_id: z.string().describe("Identifier of the command run to send input to"),
     text: z.string().describe("Input to write to the command's stdin (include a newline/return as needed, e.g. '1\\n')"),
@@ -1114,6 +1116,9 @@ server.tool(
     const resolved = resolveExecRunSessionFailure(run, activeSessions.has(run.session_id));
     if (resolved.state !== 'running') {
       throw new McpError(ErrorCode.InvalidParams, `Run '${run_id}' is already ${resolved.state}`);
+    }
+    if (!resolved.interactive) {
+      throw new McpError(ErrorCode.InvalidParams, `Run '${run_id}' is not interactive (start it with interactive:true to send input)`);
     }
     const session = activeSessions.get(run.session_id);
     if (!session) {

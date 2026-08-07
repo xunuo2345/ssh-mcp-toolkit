@@ -91,6 +91,7 @@ describe('exec-input tool result formatting', () => {
       finishedAt: null,
       cancelRequested: false,
       expiresAt: null,
+      interactive: true,
       ...overrides,
     };
   }

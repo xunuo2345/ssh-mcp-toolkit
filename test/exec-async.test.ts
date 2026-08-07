@@ -158,6 +158,7 @@ describe('exec run helpers', () => {
       finishedAt: null,
       cancelRequested: false,
       expiresAt: null,
+      interactive: false,
       ...overrides,
     };
   }
@@ -168,6 +169,7 @@ describe('exec run helpers', () => {
     expect(status.state).toBe('completed');
     expect(status.exitCode).toBe(0);
     expect(status.output).toBe('hi');
+    expect(status.interactive).toBe(false);
   });
 
   it('formatExecLogs slices output from an offset and reports nextOffset', async () => {
