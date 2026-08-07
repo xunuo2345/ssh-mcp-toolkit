@@ -1560,6 +1560,10 @@ export class ShellCommandQueue {
     this.rejectPending(new Error('SSH session closed'));
   }
 
+  sendInput(text: string): void {
+    this.shell.write(text);
+  }
+
   interrupt(): void {
     this.shell.write('\u0003');
     if (this.pending) {
@@ -1662,7 +1666,7 @@ export function resolveExecRunSessionFailure(run: ExecRun, sessionExists: boolea
   };
 }
 
-class PersistentSession {
+export class PersistentSession {
   private conn: InstanceType<typeof SSHClient> | null = null;
   private jumpConns: InstanceType<typeof SSHClient>[] = [];
   private shell: ClientChannel | null = null;
@@ -1770,7 +1774,10 @@ class PersistentSession {
       throw new McpError(ErrorCode.InternalError, 'SSH shell not ready');
     }
     this.commandQueue.launch(command, {
-      onData: callbacks.onData,
+      onData: (chunk) => {
+        callbacks.onData?.(chunk);
+        this.resetInactivityTimer();
+      },
       onDone: (result) => {
         callbacks.onDone?.(result);
         this.resetInactivityTimer();
@@ -1782,6 +1789,13 @@ class PersistentSession {
     });
     this.lastCommand = command;
     this.resetInactivityTimer();
+  }
+
+  sendInput(text: string): void {
+    if (!this.commandQueue) {
+      throw new McpError(ErrorCode.InternalError, 'SSH shell not ready');
+    }
+    this.commandQueue.sendInput(text);
   }
 
   interrupt(): void {
