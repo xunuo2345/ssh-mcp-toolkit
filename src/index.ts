@@ -1605,6 +1605,7 @@ export class ShellCommandQueue {
   interrupt(): void {
     this.shell.write('\u0003');
     if (this.pending) {
+      this.shell.write('\n');
       this.shell.write(`printf '${this.pending.marker}%d\n' $?\n`);
     }
   }

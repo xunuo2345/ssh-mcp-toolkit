@@ -40,6 +40,17 @@ describe('ShellCommandQueue.launch interactive mode', () => {
     expect(writes[0]).toBe('menu\n');
     expect(writes.some((w) => w.includes('__MCP_DONE__'))).toBe(false);
   });
+
+  it('interrupt in interactive mode writes Ctrl-C, newline, then the completion marker', async () => {
+    const { ShellCommandQueue } = await import('../src/index.js');
+    const { shell, writes } = makeFakeShell();
+    const q = new ShellCommandQueue(shell as any);
+    q.launch('menu', { onData: () => {}, onDone: () => {}, onError: () => {} }, { interactive: true });
+    q.interrupt();
+    expect(writes[1]).toBe('\u0003');
+    expect(writes[2]).toBe('\n');
+    expect(writes[3]).toContain(`printf '__MCP_DONE__`);
+  });
 });
 
 describe('PersistentSession.sendInput', () => {

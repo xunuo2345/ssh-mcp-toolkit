@@ -94,7 +94,8 @@ describe('ShellCommandQueue', () => {
     const marker = markerFromWrites(writes);
     q.interrupt();
     expect(writes[2]).toBe('\u0003');
-    expect(writes[3]).toContain(`printf '${marker}%d\n' $?`);
+    expect(writes[3]).toBe('\n');
+    expect(writes[4]).toContain(`printf '${marker}%d\n' $?`);
   });
 
   it('launch rejects a second concurrent command', async () => {
