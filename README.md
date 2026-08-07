@@ -68,6 +68,7 @@ Hosts that are not directly reachable can be tunneled through any number of jump
 | 内网出网（Internet Egress） | `open-egress` / `close-egress` / `list-egress` | 让内网服务器 B/C 经本地机器访问外网（`ssh -R` + 本地 HTTP 正向代理），可用于 `apt`/`pip`/`npm` 下包 | [Internet Egress](#internet-egress) |
 | 服务器间直传 | `start-transfer` / `transfer-status` / `transfer-cancel` | 两台已保存主机之间的文件传输：`direct`（源服务器上跑 rsync，本地 0 带宽）/ `stream`（经本地双 SFTP 流转发）/ `hybrid` / `auto` | [Server-to-Server Transfer](#server-to-server-transfer) |
 | 异步命令执行 | `start-exec` / `exec-status` / `exec-logs` / `exec-cancel` | 长命令（跑批/构建/迁移）后台执行、立即返回 `run_id`，可增量读取运行中的输出并可取消；规避同步 `exec` 的 MCP 客户端超时；结果保留 10 分钟 | [Session Management](#session-management) |
+| 交互式输入 | `exec-input` | 向运行中命令的 stdin 发送输入并返回增量输出（`offset` 切片 + `wait_ms` 等待）；典型场景：跳板机资产选择菜单，逐层输入数字跳转到目标服务器 shell；交互式 TUI 命令永不结束，可用 `exec-cancel` 中断 | [Session Management](#session-management) |
 
 所有新增均向后兼容：原有 `hosts.json` 格式与既有工具调用方式完全不变。
 
@@ -84,6 +85,7 @@ Hosts that are not directly reachable can be tunneled through any number of jump
 - **Internet egress:** let internal servers without direct internet access download packages through the local machine via an HTTP proxy on the jump host (`open-egress`).
 - **Server-to-server transfer:** copy files directly between two stored hosts — rsync on the source for large files (zero local bandwidth) or an SFTP pipe through the local machine when hosts can't reach each other (`start-transfer`).
 - **Async command execution:** run long-running commands (batch jobs, builds, migrations) in the background with `start-exec`, then poll incremental output with `exec-logs` and the final result with `exec-status` — no MCP request timeouts on the synchronous `exec` tool.
+- **Interactive command input:** drive interactive programs (jump-host asset menus, setup wizards) by sending stdin to a running background command with `exec-input` and reading the incremental output — the run stays `running` until the program exits, so interrupt it with `exec-cancel` when done.
 - **Timeout & cleanup safeguards:** sessions and tunnels auto-close after prolonged inactivity; commands are marked and monitored for completion.
 - **Structured listings:** query active sessions and saved hosts directly from the MCP client.
 
@@ -452,6 +454,24 @@ Tool: **`exec-logs`** with `run_id` and an `offset` (character index, default `0
 
 Tool: **`exec-cancel`** with `run_id` sends Ctrl-C to the session's shell, aborting the foreground command and marking the run `cancelled`. Only a `running` run can be cancelled.
 
+#### Interactive input
+
+Tool: **`exec-input`** with `run_id`, `text`, `offset` (character index, default `0`), and `wait_ms` (default `400`) writes `text` to the run's stdin, waits `wait_ms` for the output it triggers, and returns the incremental output produced after `offset` — the same JSON shape as `exec-logs`. Pass the returned `nextOffset` as the next `offset` to step through an interactive session:
+
+```json
+{ "run_id": "7f1c…", "state": "running", "output": "…new output…", "nextOffset": 821, "exitCode": null }
+```
+
+Typical scenario: a **jump-host asset-selection menu**. `start-exec` launches the menu command, then `exec-input` sends the menu digits one at a time, stepping through the prompts into the target server's shell:
+
+```
+/mcp mcp-remote-ssh start-exec {"session_id":"<id>","command":"<资产菜单命令>"}
+/mcp mcp-remote-ssh exec-input {"run_id":"<run_id>","text":"1\n","offset":0}
+/mcp mcp-remote-ssh exec-input {"run_id":"<run_id>","text":"2\n","offset":"<nextOffset>"}
+```
+
+> Interactive TUI commands never finish, so the run stays `running` while you interact with it — use `exec-cancel` to interrupt it when done.
+
 #### Retention
 
 A finished run (completed, failed, or cancelled) stays queryable via `exec-status` / `exec-logs` for **10 minutes** after it finishes, then is pruned automatically the next time a run is started. Running runs are never pruned. If the session is closed while a run is still `running`, the run resolves to `failed`.
@@ -786,8 +806,9 @@ Below is a typical workflow using Claude Code (commands start with `/mcp`), but 
    /mcp mcp-remote-ssh start-exec {"session_id":"<id>","command":"npm run build"}
    /mcp mcp-remote-ssh exec-logs {"run_id":"<run_id>","offset":0}
    /mcp mcp-remote-ssh exec-status {"run_id":"<run_id>"}
+   /mcp mcp-remote-ssh exec-input {"run_id":"<run_id>","text":"1\n","offset":0}
    ```
-   → `start-exec` returns a `run_id` immediately; poll `exec-logs` (`nextOffset` → next `offset`) for incremental output and `exec-status` for the final result. Cancel with `exec-cancel`.
+   → `start-exec` returns a `run_id` immediately; poll `exec-logs` (`nextOffset` → next `offset`) for incremental output and `exec-status` for the final result. Cancel with `exec-cancel`. For interactive programs (e.g. a jump-host asset menu), send input with `exec-input` and read the returned incremental output.
 
 5. **Transfer files (optional)**
    ```
