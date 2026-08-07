@@ -1096,6 +1096,40 @@ server.tool(
 );
 
 server.tool(
+  "exec-input",
+  "Send input to the stdin of a running background command (e.g. selecting an option in an interactive menu). Returns the incremental output produced after the input, sliced from the given character offset. Pass the returned nextOffset as the next offset to step through an interactive session.",
+  {
+    run_id: z.string().describe("Identifier of the command run to send input to"),
+    text: z.string().describe("Input to write to the command's stdin (include a newline/return as needed, e.g. '1\\n')"),
+    offset: z.number().int().min(0).default(0).describe("Character offset into the accumulated output to return from (default 0)"),
+    wait_ms: z.number().int().min(0).max(30000).default(400).describe("Milliseconds to wait for output produced by this input (default 400)"),
+  },
+  async ({ run_id, text, offset, wait_ms }) => {
+    pruneExpiredExecRuns(activeExecRuns, Date.now());
+    const run = activeExecRuns.get(run_id);
+    if (!run) {
+      throw new McpError(ErrorCode.InvalidParams, `Run '${run_id}' does not exist`);
+    }
+    const resolved = resolveExecRunSessionFailure(run, activeSessions.has(run.session_id));
+    if (resolved.state !== 'running') {
+      throw new McpError(ErrorCode.InvalidParams, `Run '${run_id}' is already ${resolved.state}`);
+    }
+    const session = activeSessions.get(run.session_id);
+    if (!session) {
+      throw new McpError(ErrorCode.InternalError, `Session '${run.session_id}' no longer exists`);
+    }
+    session.sendInput(text);
+    if (wait_ms > 0) {
+      await new Promise((resolve) => setTimeout(resolve, wait_ms));
+    }
+    const afterInput = resolveExecRunSessionFailure(run, activeSessions.has(run.session_id));
+    return {
+      content: [{ type: 'text', text: JSON.stringify(formatExecInputResult(afterInput, offset), null, 2) }],
+    };
+  }
+);
+
+server.tool(
   "close-session",
   "Close an existing persistent SSH session.",
   {
@@ -1643,6 +1677,10 @@ export function formatExecLogs(run: ExecRun, offset: number): Record<string, unk
     nextOffset: run.output.length,
     exitCode: run.exitCode,
   };
+}
+
+export function formatExecInputResult(run: ExecRun, offset: number): Record<string, unknown> {
+  return formatExecLogs(run, offset);
 }
 
 export function pruneExpiredExecRuns(runs: Map<string, ExecRun>, now: number): void {

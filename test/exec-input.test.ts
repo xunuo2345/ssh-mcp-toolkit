@@ -54,3 +54,35 @@ describe('PersistentSession.sendInput', () => {
     expect(() => session.sendInput('x')).toThrow(/SSH shell not ready/);
   });
 });
+
+describe('exec-input tool result formatting', () => {
+  function makeRun(overrides: Partial<any> = {}): any {
+    return {
+      run_id: 'r1',
+      session_id: 's1',
+      command: 'menu',
+      state: 'running',
+      output: 'DEFAULT MENU\n请输入 : ',
+      exitCode: null,
+      startedAt: 1000,
+      finishedAt: null,
+      cancelRequested: false,
+      expiresAt: null,
+      ...overrides,
+    };
+  }
+
+  it('formatExecInputResult slices output from an offset', async () => {
+    const { formatExecInputResult } = await import('../src/index.js');
+    const result = formatExecInputResult(makeRun({ output: 'abcd' }), 2);
+    expect(result.output).toBe('cd');
+    expect(result.nextOffset).toBe(4);
+  });
+
+  it('formatExecInputResult with an out-of-range offset returns empty output', async () => {
+    const { formatExecInputResult } = await import('../src/index.js');
+    const result = formatExecInputResult(makeRun({ output: 'abc' }), 10);
+    expect(result.output).toBe('');
+    expect(result.nextOffset).toBe(3);
+  });
+});
