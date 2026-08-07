@@ -133,6 +133,49 @@ describe('ShellCommandQueue', () => {
     expect(q.hasPending).toBe(false);
   });
 
+  it('interactive launch delivers chunked output without ever producing a marker', async () => {
+    const { ShellCommandQueue } = await import('../src/index.js');
+    const { shell, writes } = makeFakeShell();
+    const q = new ShellCommandQueue(shell as any);
+    const chunks: string[] = [];
+    let done: { output: string; exitCode: number } | null = null;
+    q.launch(
+      'cat',
+      { onData: (c) => chunks.push(c), onDone: (r) => { done = r; } },
+      { interactive: true },
+    );
+
+    // Interactive mode must NOT inject the completion marker
+    expect(writes.find((w) => w.includes('printf'))).toBeUndefined();
+    expect(writes).toEqual(['cat\n']);
+
+    q.handleData('hello ');
+    q.handleData('world');
+    expect(chunks).toEqual(['hello ', 'world']);
+    // No marker ever arrives, so done is never set
+    expect(done).toBeNull();
+    expect(q.hasPending).toBe(true);
+  });
+
+  it('interactive launch trims the internal buffer to bound memory growth across chunks', async () => {
+    const { ShellCommandQueue } = await import('../src/index.js');
+    const { shell } = makeFakeShell();
+    const q = new ShellCommandQueue(shell as any);
+    const chunks: string[] = [];
+    q.launch('cat', { onData: (c) => chunks.push(c) }, { interactive: true });
+    const big = 'x'.repeat(10_000);
+    q.handleData(big);
+    q.handleData(big);
+    q.handleData(big);
+    expect(chunks.join('').length).toBe(30_000);
+    // After pushIncrement trims the already-delivered prefix, the internal
+    // buffer holds only the tail (one chunk at most), not the cumulative
+    // 30k characters. Bounded by the size of a single handleData chunk.
+    const internal = (q as any).buffer as string;
+    expect(internal.length).toBeLessThanOrEqual(10_000);
+    expect(internal.length).toBeLessThan(30_000);
+  });
+
   it('handleClose on a pending run reaches onError and clears the run', async () => {
     const { ShellCommandQueue } = await import('../src/index.js');
     const { shell } = makeFakeShell();

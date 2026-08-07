@@ -1552,6 +1552,17 @@ export class ShellCommandQueue {
     onDone?: (result: { output: string; exitCode: number }) => void;
     onError?: (error: Error) => void;
     pushedUntil: number;
+    /**
+     * Whether a marker may appear in the output for this pending run.
+     * - Non-interactive runs inject the marker at launch → true from the start.
+     * - Interactive runs do NOT inject a marker → false until `interrupt()`
+     *   re-injects one (which flips this to true).
+     * Used to gate buffer trimming in `pushIncrement`: the completion path
+     * in `processPending` reads `buffer.slice(0, markerIndex)` AFTER calling
+     * `pushIncrement(markerIndex)`, so trim must be skipped whenever a
+     * marker could be present.
+     */
+    markerExpected: boolean;
   } | null = null;
 
   constructor(private readonly shell: { write(data: string, cb?: (err: Error | null | undefined) => void): void }) {}
@@ -1572,6 +1583,7 @@ export class ShellCommandQueue {
       onDone: callbacks.onDone,
       onError: callbacks.onError,
       pushedUntil: 0,
+      markerExpected: !options?.interactive,
     };
     const commandWithNewline = command.endsWith('\n') ? command : command + '\n';
     this.shell.write(commandWithNewline, (err) => {
@@ -1610,6 +1622,9 @@ export class ShellCommandQueue {
   interrupt(): void {
     this.shell.write('\u0003');
     if (this.pending) {
+      // We just re-injected the marker, so a marker may now appear in
+      // subsequent output. Trim is now unsafe (see pending.markerExpected).
+      this.pending.markerExpected = true;
       this.shell.write('\n');
       this.shell.write(`printf '${this.pending.marker}%d\n' $?\n`);
     }
@@ -1654,6 +1669,17 @@ export class ShellCommandQueue {
       this.pending.onData(this.buffer.slice(this.pending.pushedUntil, upTo));
     }
     this.pending.pushedUntil = Math.max(this.pending.pushedUntil, upTo);
+    // Bound the buffer for runs where no marker is expected (interactive
+    // launches that have not been interrupted yet). Safe to trim here
+    // because `processPending` can only reach the marker-completion path
+    // when `markerExpected` is true, and that path does
+    // `this.buffer.slice(0, markerIndex)` *after* this call — if we trimmed
+    // while a marker might be present, that slice would return the marker
+    // prefix. See `pending.markerExpected`.
+    if (!this.pending.markerExpected && upTo > 0) {
+      this.buffer = this.buffer.slice(upTo);
+      this.pending.pushedUntil = 0;
+    }
   }
 
   private rejectPending(error: Error): void {
