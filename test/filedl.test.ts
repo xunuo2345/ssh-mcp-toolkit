@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { PassThrough, Writable, EventEmitter } from 'stream';
-import { mkdtemp, writeFile, readFile, rm } from 'fs/promises';
+import { mkdtemp, writeFile, readFile, rm, stat } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
@@ -8,15 +8,25 @@ import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
 function makeFakeSftp(size: number, isDir = false) {
   const calls = { stat: [] as string[], read: [] as string[], write: [] as string[], mkdir: [] as string[], end: 0 };
   const writeChunks: Buffer[] = [];
+  const recorded: Buffer[] = [];
   let readStream: PassThrough | null = null;
+  let readCount = 0;
   const sftp = {
     stat(path: string, cb: (error: Error | null, stats?: any) => void) {
       calls.stat.push(path);
       cb(null, { size, isDirectory: () => isDir });
     },
-    createReadStream(path: string) {
+    createReadStream(path: string, opts?: any) {
       calls.read.push(path);
+      readCount += 1;
       readStream = new PassThrough();
+      if (readCount > 1) {
+        const start = opts?.start ?? 0;
+        const data = Buffer.concat(recorded).subarray(start);
+        setImmediate(() => readStream!.end(data));
+      } else {
+        readStream.on('data', (chunk: Buffer) => recorded.push(chunk));
+      }
       return readStream;
     },
     createWriteStream(path: string) {
@@ -28,6 +38,10 @@ function makeFakeSftp(size: number, isDir = false) {
         },
       });
     },
+    rename(from: string, to: string, cb: (error: Error | null) => void) {
+      calls.rename.push([from, to]);
+      cb(null);
+    },
     mkdir(path: string, _opts: any, cb: (error: Error | null) => void) {
       calls.mkdir.push(path);
       cb(null);
@@ -37,6 +51,15 @@ function makeFakeSftp(size: number, isDir = false) {
     },
   };
   return { sftp, calls, writeChunks, getReadStream: () => readStream };
+}
+
+async function waitForReadStream(source: ReturnType<typeof makeFakeSftp>): Promise<PassThrough> {
+  for (let i = 0; i < 200; i++) {
+    const rs = source.getReadStream();
+    if (rs) return rs;
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  throw new Error('read stream never created');
 }
 
 function makeDirCreatingSftp() {
@@ -75,16 +98,16 @@ function makeDirCreatingSftp() {
 describe('FileTransfer', () => {
   it('download mode completes, counts bytes, and writes the local file', async () => {
     const { FileTransfer } = await import('../src/index.js');
-    const source = makeFakeSftp(10);
+    const source = makeFakeSftp(5);
     const dir = await mkdtemp(join(tmpdir(), 'mcp-dl-'));
     const local = join(dir, 'out.bin');
     const transfer = new FileTransfer('f1', 'A', local, '/data/big.bin', 'download',
       { conn: { end() {} } as any, jumpConns: [], sftp: source.sftp as any },
     );
     const p = transfer.start();
-    await new Promise((r) => setImmediate(r));
-    source.getReadStream()!.write('hello');
-    source.getReadStream()!.end();
+    const rs = await waitForReadStream(source);
+    rs.write('hello');
+    rs.end();
     await p;
     const info = transfer.getInfo();
     expect(info.state).toBe('completed');
@@ -95,9 +118,10 @@ describe('FileTransfer', () => {
     expect(info.targetPath).toBe(local);
     expect(info.mode).toBe('single');
     expect(info.transferredBytes).toBe(5);
-    expect(info.totalBytes).toBe(10);
-    expect(info.percent).toBe(50);
+    expect(info.totalBytes).toBe(5);
+    expect(info.percent).toBe(100);
     expect(await readFile(local, 'utf8')).toBe('hello');
+    await expect(stat(join(dir, 'out.bin.part'))).rejects.toThrow();
     await rm(dir, { recursive: true, force: true });
   });
 
@@ -135,8 +159,8 @@ describe('FileTransfer', () => {
       { conn: { end() {} } as any, jumpConns: [], sftp: source.sftp as any },
     );
     const p = transfer.start();
-    await new Promise((r) => setImmediate(r));
-    source.getReadStream()!.write('partial');
+    const rs = await waitForReadStream(source);
+    rs.write('partial');
     await new Promise((r) => setTimeout(r, 10));
     await transfer.cancel();
     await p;
@@ -169,8 +193,8 @@ describe('FileTransfer', () => {
       { conn, jumpConns: [], sftp: source.sftp as any },
     );
     const p = transfer.start();
-    await new Promise((r) => setImmediate(r));
-    source.getReadStream()!.write('partial');
+    const rs = await waitForReadStream(source);
+    rs.write('partial');
     conn.emit('error', new Error('boom'));
     await p;
     const info = transfer.getInfo();

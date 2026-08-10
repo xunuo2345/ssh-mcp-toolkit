@@ -7,7 +7,7 @@ import SSH2Module from 'ssh2';
 const { Client: SSHClient, utils: sshUtils } = SSH2Module as typeof import('ssh2');
 import { z } from 'zod';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { readFile, writeFile, mkdir, stat } from 'fs/promises';
+import { readFile, writeFile, mkdir, stat, rename, rm } from 'fs/promises';
 import { createReadStream, createWriteStream } from 'fs';
 import { posix as posixPath, resolve as resolvePath } from 'path';
 import os from 'os';
@@ -673,6 +673,16 @@ export function sha256File(path: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const hash = createHash('sha256');
     const stream = createReadStream(path);
+    stream.on('data', (chunk: Buffer | string) => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+    stream.on('error', reject);
+  });
+}
+
+async function sha256Remote(sftp: SFTPWrapper, remotePath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = createHash('sha256');
+    const stream = sftp.createReadStream(remotePath);
     stream.on('data', (chunk: Buffer | string) => hash.update(chunk));
     stream.on('end', () => resolve(hash.digest('hex')));
     stream.on('error', reject);
@@ -2355,6 +2365,7 @@ export class FileTransfer {
   private cancelled = false;
   private disposed = false;
   private streams: Array<NodeJS.ReadableStream | NodeJS.WritableStream> = [];
+  private partPath: string;
 
   constructor(
     private readonly id: string,
@@ -2364,6 +2375,9 @@ export class FileTransfer {
     private readonly direction: 'download' | 'upload',
     private conns: { conn: InstanceType<typeof SSHClient>; jumpConns: InstanceType<typeof SSHClient>[]; sftp: SFTPWrapper },
   ) {
+    this.partPath = direction === 'download'
+      ? partPathFor(localPath)
+      : partPathFor(remotePath);
     conns.conn.once?.('error', (error: Error) => this.markFailed(error.message));
     conns.conn.once?.('end', () => this.markFailed('SSH connection ended'));
     conns.conn.once?.('close', () => this.markFailed('SSH connection closed'));
@@ -2465,26 +2479,57 @@ export class FileTransfer {
       throw new Error('download supports single files only; remote source is a directory');
     }
     this.totalBytes = stats.size;
-    const read = this.conns.sftp.createReadStream(this.remotePath);
-    const write = createWriteStream(this.localPath);
-    this.streams = [read, write];
-    if (this.cancelled || this.disposed) {
-      read.destroy();
-      write.destroy();
-      throw new Error('transfer cancelled');
+    let partSize: number | null = null;
+    try {
+      const partStats = await stat(this.partPath);
+      partSize = partStats.size;
+    } catch {
+      partSize = null;
     }
-    read.on('data', (chunk: Buffer) => {
-      this.transferredBytes += chunk.length;
-    });
-    read.pipe(write);
-    await new Promise<void>((resolve, reject) => {
-      let settled = false;
-      const once = (fn: (...args: any[]) => void) => (...args: any[]) => { if (!settled) { settled = true; fn(...args); } };
-      write.on('finish', once(resolve));
-      write.on('close', once(resolve));
-      read.on('error', once((error: Error) => reject(error)));
-      write.on('error', once((error: Error) => reject(error)));
-    });
+    const offset = resolveResumeOffset(partSize, stats.size);
+    if (partSize !== null && partSize > stats.size) {
+      await rm(this.partPath, { force: true });
+    }
+    this.transferredBytes = offset;
+    if (offset < stats.size) {
+      const read = this.conns.sftp.createReadStream(this.remotePath, { start: offset });
+      const write = createWriteStream(this.partPath, { flags: offset > 0 ? 'a' : 'w' });
+      this.streams = [read, write];
+      if (this.cancelled || this.disposed) {
+        read.destroy();
+        write.destroy();
+        throw new Error('transfer cancelled');
+      }
+      read.on('data', (chunk: Buffer) => {
+        this.transferredBytes += chunk.length;
+      });
+      read.pipe(write);
+      await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const once = (fn: (...args: any[]) => void) => (...args: any[]) => { if (!settled) { settled = true; fn(...args); } };
+        write.on('finish', once(resolve));
+        write.on('close', once(resolve));
+        read.on('error', once((error: Error) => reject(error)));
+        write.on('error', once((error: Error) => reject(error)));
+      });
+      if (this.disposed || this.cancelled) {
+        throw new Error('transfer cancelled');
+      }
+      const partStats = await stat(this.partPath);
+      if (partStats.size !== stats.size) {
+        throw new Error(`size mismatch: expected ${stats.size}, got ${partStats.size}`);
+      }
+      const partHash = await sha256File(this.partPath);
+      const remoteHash = await sha256Remote(this.conns.sftp, this.remotePath);
+      if (partHash !== remoteHash) {
+        throw new Error(`sha256 mismatch: expected ${remoteHash}, got ${partHash}`);
+      }
+    }
+    const partStats = await stat(this.partPath);
+    if (partStats.size !== stats.size) {
+      throw new Error(`size mismatch: expected ${stats.size}, got ${partStats.size}`);
+    }
+    await rename(this.partPath, this.localPath);
     this.complete();
   }
 
