@@ -52,7 +52,7 @@ describe('partPathFor', () => {
 });
 
 describe('FileTransfer download resume', () => {
-  function makeFakeSftpForResume(sourceSize: number, sourceContent: Buffer) {
+  function makeFakeSftpForResume(sourceSize: number, sourceContent: Buffer, corruptRead = false) {
     const calls = { read: [] as Array<{ path: string; start?: number }>, end: 0 };
     let started = 0;
     const sftp = {
@@ -63,7 +63,7 @@ describe('FileTransfer download resume', () => {
         calls.read.push({ path, start: opts?.start });
         const start = opts?.start ?? 0;
         started = start;
-        const content = sourceContent.subarray(start);
+        const content = corruptRead ? Buffer.alloc(sourceSize, 0xff) : sourceContent.subarray(start);
         const r = new Readable();
         r._read = () => {};
         r.push(content);
@@ -145,6 +145,39 @@ describe('FileTransfer download resume', () => {
     const finalContent = await readFile(local);
     expect(finalContent).toEqual(full);
     expect(transfer.getInfo().state).toBe('completed');
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('download with a corrupt equal-size .part fails, preserves .part and no target', async () => {
+    const { FileTransfer, partPathFor } = await import('../src/index.js');
+    const dir = await mkdtemp(join(tmpdir(), 'resume-dl5-'));
+    const local = join(dir, 'file.bin');
+    const part = partPathFor(local);
+    const full = Buffer.from('0123456789ABCDEF'); // 16 bytes
+    await writeFile(part, full); // .part matches source size but content is corrupt
+    const source = makeFakeSftpForResume(16, full, true); // corruptRead: verification stream returns wrong bytes
+    const transfer = new FileTransfer('r5', 'A', local, '/remote/file.bin', 'download',
+      { conn: { end() {} } as any, jumpConns: [], sftp: source.sftp as any });
+    await transfer.start();
+    expect(transfer.getInfo().state).toBe('failed');
+    await expect(stat(part)).resolves.toBeDefined(); // .part preserved
+    await expect(stat(local)).rejects.toThrow(); // no target written
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('download with a size-mismatched .part fails, preserves .part and no target', async () => {
+    const { FileTransfer, partPathFor } = await import('../src/index.js');
+    const dir = await mkdtemp(join(tmpdir(), 'resume-dl6-'));
+    const local = join(dir, 'file.bin');
+    const part = partPathFor(local);
+    const partial = Buffer.from('01234567'); // read stream serves only 8 bytes
+    const source = makeFakeSftpForResume(16, partial); // source claims 16 bytes
+    const transfer = new FileTransfer('r6', 'A', local, '/remote/file.bin', 'download',
+      { conn: { end() {} } as any, jumpConns: [], sftp: source.sftp as any });
+    await transfer.start();
+    expect(transfer.getInfo().state).toBe('failed');
+    await expect(stat(part)).resolves.toBeDefined(); // .part preserved
+    await expect(stat(local)).rejects.toThrow(); // no target written
     await rm(dir, { recursive: true, force: true });
   });
 });
@@ -273,6 +306,21 @@ describe('FileTransfer upload resume', () => {
     await transfer.start();
     expect(transfer.getInfo().state).toBe('failed');
     expect(transfer.getInfo().error).toContain('injected write failure');
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('upload of a 0-byte file completes and renames', async () => {
+    const { FileTransfer, partPathFor } = await import('../src/index.js');
+    const dir = await mkdtemp(join(tmpdir(), 'resume-up5-'));
+    const local = join(dir, 'empty.bin');
+    await writeFile(local, Buffer.alloc(0));
+    const remote = makeRemoteSftpForResume();
+    const transfer = new FileTransfer('u5', 'A', local, '/remote/dst.bin', 'upload',
+      { conn: { end() {} } as any, jumpConns: [], sftp: remote.sftp as any });
+    await transfer.start();
+    expect(transfer.getInfo().state).toBe('completed');
+    expect(remote.calls.rename).toEqual([{ from: partPathFor('/remote/dst.bin'), to: '/remote/dst.bin' }]);
+    expect(remote.getContent().length).toBe(0);
     await rm(dir, { recursive: true, force: true });
   });
 });

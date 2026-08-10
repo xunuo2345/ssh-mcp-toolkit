@@ -2495,6 +2495,7 @@ export class FileTransfer {
     const offset = resolveResumeOffset(partSize, stats.size);
     if (partSize !== null && partSize > stats.size) {
       await rm(this.partPath, { force: true });
+      partSize = null;
     }
     if (offset === stats.size && partSize === null && stats.size === 0) {
       await writeFile(this.partPath, '');
@@ -2616,6 +2617,7 @@ export class FileTransfer {
           if (writeError) return;
           maybeResolve();
         });
+        const MAX_INFLIGHT = 64;
         localRead.on('data', (chunk: string | Buffer) => {
           const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
           pendingWrites += 1;
@@ -2627,9 +2629,15 @@ export class FileTransfer {
               reject(err);
               return;
             }
+            if (pendingWrites < MAX_INFLIGHT) {
+              localRead.resume();
+            }
             maybeResolve();
           });
           position += buf.length;
+          if (pendingWrites >= MAX_INFLIGHT) {
+            localRead.pause();
+          }
         });
       });
     } finally {
