@@ -684,6 +684,28 @@ export function validateTransferParams(params: {
   }
 }
 
+export function resolveLocalStatError(error: any, localPath: string): McpError {
+  if (error instanceof McpError) {
+    return error;
+  }
+  if (error?.code === 'EACCES' || error?.code === 'EPERM') {
+    return new McpError(ErrorCode.InternalError, `Local file '${localPath}' cannot be read (permission denied)`);
+  }
+  return new McpError(ErrorCode.InvalidParams, `Local file '${localPath}' cannot be read: ${error.message}`);
+}
+
+export async function assertLocalDestinationParent(parent: string): Promise<void> {
+  let parentStats;
+  try {
+    parentStats = await stat(parent);
+  } catch (error: any) {
+    throw new McpError(ErrorCode.InvalidParams, `Local destination directory '${parent}' does not exist`);
+  }
+  if (!parentStats.isDirectory()) {
+    throw new McpError(ErrorCode.InvalidParams, `Local destination parent '${parent}' is not a directory`);
+  }
+}
+
 export function resolveTransferMode(
   requested: TransferMode,
   sizeBytes: number | null,
@@ -1344,6 +1366,7 @@ server.tool(
   },
   async ({ host_id, remote_path, local_path }) => {
     const resolvedLocalPath = resolvePath(local_path);
+    await assertLocalDestinationParent(posixPath.dirname(resolvedLocalPath));
     const id = randomUUID();
     const resolved = await resolveHost(host_id);
     let conn: { conn: InstanceType<typeof SSHClient>; jumpConns: InstanceType<typeof SSHClient>[]; sftp: SFTPWrapper };
@@ -1382,11 +1405,7 @@ server.tool(
         throw new McpError(ErrorCode.InvalidParams, `Local path '${resolvedLocalPath}' is not a file`);
       }
     } catch (error: any) {
-      if (error instanceof McpError) throw error;
-      if (error?.code === 'EACCES' || error?.code === 'EPERM') {
-        throw new McpError(ErrorCode.InternalError, `Local file '${resolvedLocalPath}' cannot be read (permission denied)`);
-      }
-      throw new McpError(ErrorCode.InvalidParams, `Local file '${resolvedLocalPath}' cannot be read: ${error.message}`);
+      throw resolveLocalStatError(error, resolvedLocalPath);
     }
     const id = randomUUID();
     const resolved = await resolveHost(host_id);
@@ -2418,6 +2437,9 @@ export class FileTransfer {
     this.transferredBytes = 0;
     this.totalBytes = null;
     const stats = await sftpStat(this.conns.sftp, this.remotePath);
+    if (this.disposed || this.cancelled) {
+      throw new Error('transfer cancelled');
+    }
     if (stats.isDirectory()) {
       throw new Error('download supports single files only; remote source is a directory');
     }
@@ -2449,11 +2471,17 @@ export class FileTransfer {
     this.transferredBytes = 0;
     this.totalBytes = null;
     const localStats = await stat(this.localPath);
+    if (this.disposed || this.cancelled) {
+      throw new Error('transfer cancelled');
+    }
     if (!localStats.isFile()) {
       throw new Error('upload source is not a file');
     }
     this.totalBytes = localStats.size;
     await ensureRemoteParentDirectory(this.conns.sftp, this.remotePath);
+    if (this.disposed || this.cancelled) {
+      throw new Error('transfer cancelled');
+    }
     const read = createReadStream(this.localPath);
     const write = this.conns.sftp.createWriteStream(this.remotePath, { flags: 'w' });
     this.streams = [read, write];

@@ -3,6 +3,7 @@ import { PassThrough, Writable, EventEmitter } from 'stream';
 import { mkdtemp, writeFile, readFile, rm } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
 
 function makeFakeSftp(size: number, isDir = false) {
   const calls = { stat: [] as string[], read: [] as string[], write: [] as string[], mkdir: [] as string[], end: 0 };
@@ -175,6 +176,69 @@ describe('FileTransfer', () => {
     const info = transfer.getInfo();
     expect(info.state).toBe('failed');
     expect(info.error).toBe('boom');
+    await rm(dir, { recursive: true, force: true });
+  });
+});
+
+describe('resolveLocalStatError', () => {
+  it('maps EACCES to InternalError with a permission message', async () => {
+    const { resolveLocalStatError } = await import('../src/index.js');
+    const err: any = new Error('EACCES: permission denied');
+    err.code = 'EACCES';
+    const mapped = resolveLocalStatError(err, '/local/file.txt');
+    expect(mapped).toBeInstanceOf(McpError);
+    expect((mapped as McpError).code).toBe(ErrorCode.InternalError);
+    expect((mapped as McpError).message).toContain('permission denied');
+  });
+
+  it('maps EPERM to InternalError with a permission message', async () => {
+    const { resolveLocalStatError } = await import('../src/index.js');
+    const err: any = new Error('EPERM: operation not permitted');
+    err.code = 'EPERM';
+    const mapped = resolveLocalStatError(err, '/local/file.txt');
+    expect((mapped as McpError).code).toBe(ErrorCode.InternalError);
+  });
+
+  it('maps ENOENT to InvalidParams', async () => {
+    const { resolveLocalStatError } = await import('../src/index.js');
+    const err: any = new Error('ENOENT: no such file');
+    err.code = 'ENOENT';
+    const mapped = resolveLocalStatError(err, '/local/missing.txt');
+    expect((mapped as McpError).code).toBe(ErrorCode.InvalidParams);
+    expect((mapped as McpError).message).toContain("Local file '/local/missing.txt' cannot be read: ENOENT: no such file");
+  });
+
+  it('passes through an existing McpError unchanged', async () => {
+    const { resolveLocalStatError } = await import('../src/index.js');
+    const original = new McpError(ErrorCode.InvalidParams, 'not a file');
+    expect(resolveLocalStatError(original, '/local/file.txt')).toBe(original);
+  });
+});
+
+describe('assertLocalDestinationParent', () => {
+  it('accepts an existing directory', async () => {
+    const { assertLocalDestinationParent } = await import('../src/index.js');
+    await expect(assertLocalDestinationParent(tmpdir())).resolves.toBeUndefined();
+  });
+
+  it('rejects a missing parent directory with InvalidParams', async () => {
+    const { assertLocalDestinationParent } = await import('../src/index.js');
+    const missing = join(tmpdir(), `mcp-parent-missing-${Date.now()}`);
+    const err = await assertLocalDestinationParent(missing).catch((e: any) => e);
+    expect(err).toBeInstanceOf(McpError);
+    expect(err.code).toBe(ErrorCode.InvalidParams);
+    expect(err.message).toContain('does not exist');
+  });
+
+  it('rejects a parent that is not a directory', async () => {
+    const { assertLocalDestinationParent } = await import('../src/index.js');
+    const dir = await mkdtemp(join(tmpdir(), 'mcp-parent-file-'));
+    const file = join(dir, 'not-a-dir');
+    await writeFile(file, 'x', 'utf8');
+    const err = await assertLocalDestinationParent(file).catch((e: any) => e);
+    expect(err).toBeInstanceOf(McpError);
+    expect(err.code).toBe(ErrorCode.InvalidParams);
+    expect(err.message).toContain('is not a directory');
     await rm(dir, { recursive: true, force: true });
   });
 });
