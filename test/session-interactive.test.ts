@@ -53,17 +53,17 @@ describe('PersistentSession session-level output buffer', () => {
 });
 
 describe('session output formatting', () => {
-  it('formats output slice and nextOffset', async () => {
+  it('formats output slice and absolute nextOffset', async () => {
     const { formatSessionOutput } = await import('../src/index.js');
-    const r = formatSessionOutput('MENU> [1] asset\n', 6);
+    const r = formatSessionOutput('MENU> [1] asset\n', 6, 100);
     expect(r.output).toBe('[1] asset\n');
-    expect(r.nextOffset).toBe(16);
+    expect(r.nextOffset).toBe(100); // absolute buffer length, not slice length
   });
 
   it('clamps a negative offset to zero', async () => {
     const { formatSessionOutput } = await import('../src/index.js');
-    const r = formatSessionOutput('abc', -5);
+    const r = formatSessionOutput('abc', -5, 42);
     expect(r.output).toBe('abc');
-    expect(r.nextOffset).toBe(3);
+    expect(r.nextOffset).toBe(42);
   });
 });
