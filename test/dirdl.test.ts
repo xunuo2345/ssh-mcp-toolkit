@@ -67,19 +67,21 @@ describe('DirectoryTransfer listing', () => {
         (entries[parent] ??= []).push({ filename: name, attrs: { size: info.size, isDirectory: () => false } });
       }
     }
+    const consumed: Record<string, boolean> = {};
     const sftp = {
       opendir(path: string, cb: (err: Error | null, handle?: Buffer) => void) { cb(null, Buffer.from(path)); },
       readdir(handle: Buffer, cb: (err: Error | null, list?: any[]) => void) {
         const key = handle.toString();
-        const list = entries[key] ?? [];
-        if (list.length === 0) { cb(null, []); }
-        else { cb(null, list); }
+        if (consumed[key]) { cb(null, []); return; }
+        consumed[key] = true;
+        cb(null, entries[key] ?? []);
       },
       stat(path: string, cb: (err: Error | null, stats?: any) => void) {
         const info = tree[path];
         if (info) cb(null, { size: info.size, isDirectory: () => !!info.dir });
         else cb(new Error('ENOENT') as any);
       },
+      close(_handle: Buffer, cb: (err: Error | null) => void) { cb(null); },
       end() {},
     };
     return sftp;
@@ -101,6 +103,25 @@ describe('DirectoryTransfer listing', () => {
     expect(listing).toEqual([
       { relPath: 'a.bin', size: 100 },
       { relPath: 'sub/b.bin', size: 200 },
+    ]);
+  });
+
+  it('lists the local tree for upload-dir', async () => {
+    const { DirectoryTransfer } = await import('../src/index.js');
+    const tree = {
+      '/local/data': { size: 0, dir: true },
+      '/local/data/file.txt': { size: 42 },
+      '/local/data/nested': { size: 0, dir: true },
+      '/local/data/nested/deep.bin': { size: 7 },
+    };
+    const sftp = makeDirSftp(tree);
+    const t = new DirectoryTransfer('d2', 'A', '/remote/data', '/local/data', 'upload-dir',
+      { conn: { end() {} } as any, jumpConns: [], sftp: sftp as any });
+    (t as any).conns = { conn: { end() {} }, jumpConns: [], sftp };
+    const listing = await (t as any).listFiles('/local/data');
+    expect(listing).toEqual([
+      { relPath: 'file.txt', size: 42 },
+      { relPath: 'nested/deep.bin', size: 7 },
     ]);
   });
 });

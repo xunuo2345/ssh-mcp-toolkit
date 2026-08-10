@@ -3201,7 +3201,7 @@ export class DirectoryTransfer {
     }
     this.state = 'running';
     try {
-      const entries = await this.listFiles(this.sourcePath);
+      const entries = await this.listFiles(this.direction === 'upload-dir' ? this.targetPath : this.sourcePath);
       const { filesTotal, totalBytes } = dirEntriesToTotal(entries);
       this.filesTotal = filesTotal;
       this.totalBytes = totalBytes;
@@ -3247,24 +3247,27 @@ export class DirectoryTransfer {
       const handle = await new Promise<Buffer>((resolve, reject) => {
         this.conns.sftp.opendir(dirPath, (err, h) => err ? reject(err) : resolve(h));
       });
-      let list: any[] = [];
-      while (true) {
-        const page = await new Promise<any[]>((resolve, reject) => {
-          this.conns.sftp.readdir(handle, (err, l) => err ? reject(err) : resolve(l ?? []));
-        });
-        if (page.length === 0) break;
-        list = list.concat(page);
-        if (page.length < 100) break;
-      }
-      for (const item of list) {
-        const name = item.filename;
-        if (name === '.' || name === '..') continue;
-        const relPath = relDir ? `${relDir}/${name}` : name;
-        if (item.attrs.isDirectory()) {
-          await walk(`${dirPath}/${name}`, relPath);
-        } else {
-          out.push({ relPath, size: item.attrs.size ?? 0 });
+      try {
+        let list: any[] = [];
+        while (true) {
+          const page = await new Promise<any[]>((resolve, reject) => {
+            this.conns.sftp.readdir(handle, (err, l) => err ? reject(err) : resolve(l ?? []));
+          });
+          if (page.length === 0) break;
+          list = list.concat(page);
         }
+        for (const item of list) {
+          const name = item.filename;
+          if (name === '.' || name === '..') continue;
+          const relPath = relDir ? `${relDir}/${name}` : name;
+          if (item.attrs.isDirectory()) {
+            await walk(`${dirPath}/${name}`, relPath);
+          } else {
+            out.push({ relPath, size: item.attrs.size ?? 0 });
+          }
+        }
+      } finally {
+        await new Promise<void>((resolve) => this.conns.sftp.close(handle, () => resolve()));
       }
     };
     await walk(rootPath, '');
