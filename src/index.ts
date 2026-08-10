@@ -296,6 +296,12 @@ function sftpStat(sftp: SFTPWrapper, remotePath: string): Promise<Stats> {
   });
 }
 
+function sftpRename(sftp: SFTPWrapper, from: string, to: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    sftp.rename(from, to, (err) => err ? reject(err) : resolve());
+  });
+}
+
 function sftpMkdir(sftp: SFTPWrapper, remotePath: string): Promise<void> {
   return new Promise((resolve, reject) => {
     sftp.mkdir(remotePath, { mode: 0o755 }, (error) => error ? reject(error) : resolve());
@@ -2547,27 +2553,69 @@ export class FileTransfer {
     if (this.disposed || this.cancelled) {
       throw new Error('transfer cancelled');
     }
-    const read = createReadStream(this.localPath);
-    const write = this.conns.sftp.createWriteStream(this.remotePath, { flags: 'w' });
-    this.streams = [read, write];
-    if (this.cancelled || this.disposed) {
-      read.destroy();
-      write.destroy();
+    let partSize: number | null = null;
+    try {
+      const partStats = await sftpStat(this.conns.sftp, this.partPath);
+      partSize = partStats.size;
+    } catch {
+      partSize = null;
+    }
+    const offset = resolveResumeOffset(partSize, localStats.size);
+    if (partSize !== null && partSize > localStats.size) {
+      await this.removeRemotePart();
+    }
+    this.transferredBytes = offset;
+    await this.uploadWithOffset(this.localPath, this.partPath, offset);
+    if (this.disposed || this.cancelled) {
       throw new Error('transfer cancelled');
     }
-    read.on('data', (chunk: string | Buffer) => {
-      this.transferredBytes += chunk.length;
-    });
-    read.pipe(write);
-    await new Promise<void>((resolve, reject) => {
-      let settled = false;
-      const once = (fn: (...args: any[]) => void) => (...args: any[]) => { if (!settled) { settled = true; fn(...args); } };
-      write.on('finish', once(resolve));
-      write.on('close', once(resolve));
-      read.on('error', once((error: Error) => reject(error)));
-      write.on('error', once((error: Error) => reject(error)));
-    });
+    const remoteStats = await sftpStat(this.conns.sftp, this.partPath);
+    if (remoteStats.size !== localStats.size) {
+      throw new Error(`size mismatch: expected ${localStats.size}, got ${remoteStats.size}`);
+    }
+    const localHash = await sha256File(this.localPath);
+    const remoteHash = await sha256Remote(this.conns.sftp, this.partPath);
+    if (localHash !== remoteHash) {
+      throw new Error(`sha256 mismatch: expected ${localHash}, got ${remoteHash}`);
+    }
+    await sftpRename(this.conns.sftp, this.partPath, this.remotePath);
     this.complete();
+  }
+
+  private async uploadWithOffset(localPath: string, remotePartPath: string, offset: number): Promise<void> {
+    const handle = await new Promise<Buffer>((resolve, reject) => {
+      this.conns.sftp.open(remotePartPath, offset > 0 ? 'a' : 'w', (err, h) => err ? reject(err) : resolve(h));
+    });
+    try {
+      const localRead = createReadStream(localPath, { start: offset });
+      this.streams = [localRead];
+      localRead.on('data', (chunk: string | Buffer) => {
+        this.transferredBytes += chunk.length;
+      });
+      let position = offset;
+      await new Promise<void>((resolve, reject) => {
+        localRead.on('error', reject);
+        localRead.on('end', resolve);
+        localRead.on('data', (chunk: string | Buffer) => {
+          const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          this.conns.sftp.write(handle, buf, 0, buf.length, position, (err) => {
+            if (err) {
+              localRead.destroy();
+              reject(err);
+            }
+          });
+          position += buf.length;
+        });
+      });
+    } finally {
+      await new Promise<void>((resolve) => this.conns.sftp.close(handle, () => resolve()));
+    }
+  }
+
+  private async removeRemotePart(): Promise<void> {
+    await new Promise<void>((resolve) => {
+      this.conns.sftp.unlink(this.partPath, () => resolve());
+    });
   }
 }
 

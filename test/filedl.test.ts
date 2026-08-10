@@ -6,7 +6,7 @@ import { tmpdir } from 'os';
 import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
 
 function makeFakeSftp(size: number, isDir = false) {
-  const calls = { stat: [] as string[], read: [] as string[], write: [] as string[], mkdir: [] as string[], end: 0 };
+  const calls = { stat: [] as string[], read: [] as string[], write: [] as string[], open: [] as string[], mkdir: [] as string[], end: 0 };
   const writeChunks: Buffer[] = [];
   const recorded: Buffer[] = [];
   let readStream: PassThrough | null = null;
@@ -38,6 +38,23 @@ function makeFakeSftp(size: number, isDir = false) {
         },
       });
     },
+    open(path: string, flags: string, cb: (error: Error | null, handle?: Buffer) => void) {
+      calls.open.push(path);
+      cb(null, Buffer.from([1]));
+    },
+    write(handle: Buffer, buf: Buffer, offset: number, length: number, position: number, cb: (error: Error | null) => void) {
+      writeChunks.push(buf.subarray(offset, offset + length));
+      cb(null);
+    },
+    close(handle: Buffer, cb: (error: Error | null) => void) {
+      cb(null);
+    },
+    rename(from: string, to: string, cb: (error: Error | null) => void) {
+      cb(null);
+    },
+    unlink(path: string, cb: (error: Error | null) => void) {
+      cb(null);
+    },
     mkdir(path: string, _opts: any, cb: (error: Error | null) => void) {
       calls.mkdir.push(path);
       cb(null);
@@ -59,12 +76,16 @@ async function waitForReadStream(source: ReturnType<typeof makeFakeSftp>): Promi
 }
 
 function makeDirCreatingSftp() {
-  const calls = { mkdir: [] as string[], write: [] as string[] };
+  const calls = { mkdir: [] as string[], open: [] as string[] };
   const writeChunks: Buffer[] = [];
   const existing = new Set<string>(['/']);
+  const files = new Map<string, Buffer>();
+  const handles = new Map<Buffer, string>();
   const sftp = {
     stat(path: string, cb: (error: Error | null, stats?: any) => void) {
-      if (existing.has(path)) {
+      if (files.has(path)) {
+        cb(null, { size: files.get(path)!.length, isDirectory: () => false });
+      } else if (existing.has(path)) {
         cb(null, { size: 0, isDirectory: () => true });
       } else {
         const err: any = new Error('No such file');
@@ -77,14 +98,41 @@ function makeDirCreatingSftp() {
       calls.mkdir.push(path);
       cb(null);
     },
-    createWriteStream(path: string) {
-      calls.write.push(path);
-      return new Writable({
-        write(chunk: Buffer, _encoding: BufferEncoding, done: () => void) {
-          writeChunks.push(chunk);
-          done();
-        },
-      });
+    open(path: string, flags: string, cb: (error: Error | null, handle?: Buffer) => void) {
+      calls.open.push(path);
+      const handle = Buffer.from([1]);
+      handles.set(handle, path);
+      cb(null, handle);
+    },
+    write(handle: Buffer, buf: Buffer, offset: number, length: number, position: number, cb: (error: Error | null) => void) {
+      const path = handles.get(handle) ?? '';
+      const chunk = buf.subarray(offset, offset + length);
+      writeChunks.push(chunk);
+      const prev = files.get(path) ?? Buffer.alloc(0);
+      const next = Buffer.alloc(position + chunk.length);
+      prev.copy(next);
+      chunk.copy(next, position);
+      files.set(path, next);
+      cb(null);
+    },
+    close(handle: Buffer, cb: (error: Error | null) => void) {
+      cb(null);
+    },
+    rename(from: string, to: string, cb: (error: Error | null) => void) {
+      const data = files.get(from);
+      if (data !== undefined) files.set(to, data);
+      files.delete(from);
+      cb(null);
+    },
+    unlink(path: string, cb: (error: Error | null) => void) {
+      files.delete(path);
+      cb(null);
+    },
+    createReadStream(path: string) {
+      const data = files.get(path) ?? Buffer.alloc(0);
+      const rs = new PassThrough();
+      setImmediate(() => rs.end(data));
+      return rs;
     },
     end() {},
   };

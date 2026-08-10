@@ -148,3 +148,94 @@ describe('FileTransfer download resume', () => {
     await rm(dir, { recursive: true, force: true });
   });
 });
+
+describe('FileTransfer upload resume', () => {
+  function makeRemoteSftpForResume(initial?: Buffer, corruptRead = false) {
+    const calls = {
+      open: [] as Array<{ path: string; flags: string }>,
+      write: [] as Array<{ position: number; len: number }>,
+      rename: [] as Array<{ from: string; to: string }>,
+      fstat: [] as number[],
+      end: 0,
+    };
+    let remoteContent = Buffer.from(initial ?? Buffer.alloc(0));
+    const handles: Array<{ path: string }> = [];
+    const sftp = {
+      stat(path: string, cb: (error: Error | null, stats?: any) => void) {
+        cb(null, { size: remoteContent.length, isDirectory: () => true });
+      },
+      open(path: string, flags: string, cb: (error: Error | null, handle?: Buffer) => void) {
+        calls.open.push({ path, flags });
+        handles.push({ path });
+        cb(null, Buffer.from([handles.length]));
+      },
+      write(handle: Buffer, buf: Buffer, offset: number, length: number, position: number, cb: (error: Error | null) => void) {
+        calls.write.push({ position, len: length });
+        const endPos = position + length;
+        if (endPos > remoteContent.length) {
+          const grown = Buffer.alloc(endPos);
+          remoteContent.copy(grown);
+          buf.copy(grown, position);
+          remoteContent = grown;
+        } else {
+          buf.copy(remoteContent, position);
+        }
+        cb(null);
+      },
+      close(handle: Buffer, cb: (error: Error | null) => void) {
+        cb(null);
+      },
+      fstat(handle: Buffer, cb: (error: Error | null, stats?: any) => void) {
+        cb(null, { size: remoteContent.length });
+      },
+      rename(from: string, to: string, cb: (error: Error | null) => void) {
+        calls.rename.push({ from, to });
+        cb(null);
+      },
+      createReadStream(path: string) {
+        const data = corruptRead ? Buffer.alloc(remoteContent.length, 0xff) : remoteContent;
+        const r = new Readable();
+        r._read = () => {};
+        r.push(data);
+        r.push(null);
+        return r;
+      },
+      end() { calls.end += 1; },
+    };
+    return { sftp, calls, getContent: () => remoteContent };
+  }
+
+  it('upload resumes from the remote .part offset, renames and verifies', async () => {
+    const { FileTransfer, partPathFor } = await import('../src/index.js');
+    const dir = await mkdtemp(join(tmpdir(), 'resume-up-'));
+    const local = join(dir, 'src.bin');
+    const full = Buffer.from('local source data 1234567890');
+    await writeFile(local, full);
+    const seeded = full.subarray(0, 8); // pre-existing remote .part with 8 bytes
+    const remote = makeRemoteSftpForResume(seeded);
+    const transfer = new FileTransfer('u1', 'A', local, '/remote/dst.bin', 'upload',
+      { conn: { end() {} } as any, jumpConns: [], sftp: remote.sftp as any });
+    await transfer.start();
+    expect(transfer.getInfo().state).toBe('completed');
+    expect(remote.getContent().equals(full)).toBe(true);
+    expect(remote.calls.open).toEqual([{ path: partPathFor('/remote/dst.bin'), flags: 'a' }]); // resumed in append mode
+    expect(remote.calls.write[0].position).toBe(8); // resumed from offset 8
+    expect(remote.calls.rename).toEqual([{ from: partPathFor('/remote/dst.bin'), to: '/remote/dst.bin' }]);
+    expect(remote.calls.write.length).toBeGreaterThan(0);
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('upload reports failed on sha256 mismatch without renaming', async () => {
+    const { FileTransfer } = await import('../src/index.js');
+    const dir = await mkdtemp(join(tmpdir(), 'resume-up2-'));
+    const local = join(dir, 'src.bin');
+    await writeFile(local, Buffer.from('content that will mismatch'));
+    const remote = makeRemoteSftpForResume(undefined, true); // corruptRead: hash-verification stream returns wrong bytes
+    const transfer = new FileTransfer('u2', 'A', local, '/remote/dst.bin', 'upload',
+      { conn: { end() {} } as any, jumpConns: [], sftp: remote.sftp as any });
+    await transfer.start();
+    expect(transfer.getInfo().state).toBe('failed');
+    expect(remote.calls.rename).toEqual([]);
+    await rm(dir, { recursive: true, force: true });
+  });
+});
