@@ -1666,6 +1666,68 @@ server.tool(
 );
 
 server.tool(
+  "start-download-dir",
+  "Recursively download a directory from a stored SSH host over SFTP in the background. Returns immediately with a transfer id; poll transfer-status for progress (filesDone/filesTotal) and cancel with transfer-cancel. Re-running resumes: already-complete files (size + sha256 match) are skipped. Use for model/data directories.",
+  {
+    host_id: z.string().describe("Identifier of the source host"),
+    remote_dir: z.string().min(1).describe("Remote source directory"),
+    local_dir: z.string().min(1).describe("Local destination directory (created if missing)"),
+    concurrency: z.number().int().min(1).max(16).default(4).describe("Max concurrent files to transfer (default 4)"),
+    chunk_threads: z.number().int().min(1).max(16).default(4).describe("Max parallel segments per large file (default 4)"),
+    chunk_size_mb: z.number().int().min(1).default(8).describe("Files at least this many MB are chunked (default 8)"),
+  },
+  async ({ host_id, remote_dir, local_dir, concurrency, chunk_threads, chunk_size_mb }) => {
+    const resolvedLocalDir = resolvePath(local_dir);
+    const id = randomUUID();
+    const resolved = await resolveHost(host_id);
+    let conn: { conn: InstanceType<typeof SSHClient>; jumpConns: InstanceType<typeof SSHClient>[]; sftp: SFTPWrapper };
+    try {
+      conn = await openSftpConnection(resolved);
+    } catch (error: any) {
+      throw new McpError(ErrorCode.InternalError, `Failed to connect to host '${host_id}': ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const transfer = new DirectoryTransfer(id, host_id, remote_dir, resolvedLocalDir, 'download-dir',
+      conn, { concurrency, chunkThreads: chunk_threads, chunkSize: chunk_size_mb * 1024 * 1024 });
+    activeTransfers.set(id, transfer);
+    transfer.start().catch(() => {});
+    return {
+      content: [{ type: 'text', text: `Directory download '${id}' started: ${host_id}:${remote_dir} -> '${resolvedLocalDir}'` }],
+    };
+  }
+);
+
+server.tool(
+  "start-upload-dir",
+  "Recursively upload a directory to a stored SSH host over SFTP in the background. Returns immediately with a transfer id; poll transfer-status for progress (filesDone/filesTotal) and cancel with transfer-cancel. Re-running resumes: already-complete files (size + sha256 match) are skipped.",
+  {
+    host_id: z.string().describe("Identifier of the destination host"),
+    local_dir: z.string().min(1).describe("Local source directory"),
+    remote_dir: z.string().min(1).describe("Remote destination directory (created if missing)"),
+    concurrency: z.number().int().min(1).max(16).default(4).describe("Max concurrent files to transfer (default 4)"),
+    chunk_threads: z.number().int().min(1).max(16).default(4).describe("Max parallel segments per large file (default 4)"),
+    chunk_size_mb: z.number().int().min(1).default(8).describe("Files at least this many MB are chunked (default 8)"),
+  },
+  async ({ host_id, local_dir, remote_dir, concurrency, chunk_threads, chunk_size_mb }) => {
+    const resolvedLocalDir = resolvePath(local_dir);
+    const id = randomUUID();
+    const resolved = await resolveHost(host_id);
+    let conn: { conn: InstanceType<typeof SSHClient>; jumpConns: InstanceType<typeof SSHClient>[]; sftp: SFTPWrapper };
+    try {
+      conn = await openSftpConnection(resolved);
+    } catch (error: any) {
+      throw new McpError(ErrorCode.InternalError, `Failed to connect to host '${host_id}': ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const transfer = new DirectoryTransfer(id, host_id, resolvedLocalDir, remote_dir, 'upload-dir',
+      conn, { concurrency, chunkThreads: chunk_threads, chunkSize: chunk_size_mb * 1024 * 1024 });
+    activeTransfers.set(id, transfer);
+    transfer.start().catch(() => {});
+    return {
+      content: [{ type: 'text', text: `Directory upload '${id}' started: '${resolvedLocalDir}' -> ${host_id}:${remote_dir}` }],
+    };
+  }
+);
+
+server.tool(
   "start-download",
   "Download a file from a stored SSH host over SFTP in the background. Returns immediately with a transfer id; poll transfer-status for progress and cancel with transfer-cancel. Use this for large files that would time out the synchronous download-file tool.",
   {
@@ -3342,9 +3404,11 @@ export class DirectoryTransfer {
     private readonly targetPath: string,
     private readonly direction: 'download-dir' | 'upload-dir',
     private conns: { conn: InstanceType<typeof SSHClient>; jumpConns: InstanceType<typeof SSHClient>[]; sftp: SFTPWrapper },
-    options?: { concurrency?: number },
+    options?: { concurrency?: number; chunkThreads?: number; chunkSize?: number },
   ) {
     this.concurrency = Math.max(1, options?.concurrency ?? 4);
+    this.chunkThreads = Math.max(1, Math.floor(options?.chunkThreads ?? 4));
+    this.chunkSize = options?.chunkSize ?? 8 * 1024 * 1024;
     conns.conn.once?.('error', (error: Error) => this.markFailed(error.message));
     conns.conn.once?.('end', () => this.markFailed('SSH connection ended'));
     conns.conn.once?.('close', () => this.markFailed('SSH connection closed'));
@@ -3355,6 +3419,8 @@ export class DirectoryTransfer {
   }
 
   private readonly concurrency: number;
+  private readonly chunkThreads: number;
+  private readonly chunkSize: number;
 
   async start(): Promise<void> {
     if (this.disposed) {
@@ -3479,6 +3545,7 @@ export class DirectoryTransfer {
       download ? sourcePath : targetPath,
       download ? 'download' : 'upload',
       this.conns as any,
+      { chunkThreads: this.chunkThreads, chunkSize: this.chunkSize },
     );
     await ft.start();
     const info = ft.getInfo();
