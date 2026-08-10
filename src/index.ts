@@ -751,14 +751,14 @@ export function chunkSegments(
     return [{ start: offset, end: fileSize }];
   }
   const segCount = Math.min(t, Math.floor(remaining / chunkSize));
-  const segBytes = Math.ceil(remaining / segCount);
+  const segBytesBase = Math.floor(remaining / segCount);
+  const extra = remaining % segCount;
   const segs: Array<{ start: number; end: number }> = [];
   for (let i = 0; i < segCount; i++) {
-    const start = offset + i * segBytes;
-    const end = Math.min(fileSize, start + segBytes);
-    if (end > start) {
-      segs.push({ start, end });
-    }
+    const segLen = segBytesBase + (i < extra ? 1 : 0);
+    const start = offset + (i === 0 ? 0 : segs[i - 1].end - offset);
+    const end = start + segLen;
+    segs.push({ start, end });
   }
   return segs;
 }

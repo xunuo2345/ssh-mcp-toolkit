@@ -44,4 +44,13 @@ describe('dir helpers', () => {
     // chunkSize=8 means segments must be >= 8 bytes; 10-byte remaining stays 1 segment
     expect(chunkSegments(10, 0, 8, 4)).toEqual([{ start: 0, end: 10 }]);
   });
+
+  it('never produces a segment smaller than chunkSize', async () => {
+    const { chunkSegments } = await import('../src/index.js');
+    const segs = chunkSegments(31, 0, 10, 4);
+    for (const s of segs) {
+      expect(s.end - s.start).toBeGreaterThanOrEqual(10);
+    }
+    expect(segs[segs.length - 1].end).toBe(31);
+  });
 });
