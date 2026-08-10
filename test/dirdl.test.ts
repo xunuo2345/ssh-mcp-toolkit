@@ -168,7 +168,8 @@ describe('FileTransfer chunked download', () => {
         const { Readable } = require('stream');
         const r = new Readable();
         r._read = () => {};
-        r.push(full.subarray(opts?.start ?? 0, opts?.end ?? full.length));
+        const end = opts?.end ?? full.length;
+        r.push(full.subarray(opts?.start ?? 0, Math.min(end + 1, full.length)));
         r.push(null);
         return r;
       },
@@ -183,6 +184,79 @@ describe('FileTransfer chunked download', () => {
     expect(new Set(starts).size).toBeGreaterThan(1); // distinct range starts prove parallel segments
     const finalContent = await readFile(local);
     expect(finalContent.length).toBe(100);
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('does not read past EOF on the final chunk (strict server errors on probe)', async () => {
+    const { FileTransfer } = await import('../src/index.js');
+    const { mkdtemp, readFile, rm } = await import('fs/promises');
+    const { join } = await import('path');
+    const { tmpdir } = await import('os');
+    const dir = await mkdtemp(join(tmpdir(), 'chunk-eof-'));
+    const local = join(dir, 'big.bin');
+    const full = Buffer.alloc(100, 0x42);
+    const sftp = {
+      stat(p: string, cb: (e: Error | null, s?: any) => void) { cb(null, { size: full.length, isDirectory: () => false }); },
+      createReadStream(p: string, opts?: any) {
+        const { Readable } = require('stream');
+        const r = new Readable();
+        r._read = () => {};
+        if (opts?.end !== undefined && opts.end >= full.length) {
+          r.destroy(new Error('read past EOF'));
+          return r;
+        }
+        const start = opts?.start ?? 0;
+        const end = opts?.end === undefined ? full.length - 1 : opts.end;
+        r.push(full.subarray(start, Math.min(end + 1, full.length)));
+        r.push(null);
+        return r;
+      },
+      end() {},
+    };
+    const ft = new FileTransfer('x3', 'A', local, '/remote/big.bin', 'download',
+      { conn: { end() {} } as any, jumpConns: [], sftp: sftp as any },
+      { chunkThreads: 4, chunkSize: 50 });
+    await ft.start();
+    expect(ft.getInfo().state).toBe('completed');
+    expect((await readFile(local)).length).toBe(100);
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('tears down sibling read streams when a segment fails', async () => {
+    const { FileTransfer } = await import('../src/index.js');
+    const { mkdtemp, rm } = await import('fs/promises');
+    const { join } = await import('path');
+    const { tmpdir } = await import('os');
+    const dir = await mkdtemp(join(tmpdir(), 'chunk-sib-'));
+    const local = join(dir, 'big.bin');
+    const full = Buffer.alloc(100, 0x42);
+    const destroyed: number[] = [];
+    let callCount = 0;
+    const sftp = {
+      stat(p: string, cb: (e: Error | null, s?: any) => void) { cb(null, { size: full.length, isDirectory: () => false }); },
+      createReadStream(p: string, opts?: any) {
+        const { Readable } = require('stream');
+        const r = new Readable();
+        r._read = () => {};
+        if (callCount++ === 0) {
+          r.destroy(new Error('segment 0 read failed'));
+        } else {
+          r.push(full.subarray(opts.start, Math.min(opts.end + 1, full.length)));
+          r.push(null);
+        }
+        const origDestroy = r.destroy.bind(r);
+        r.destroy = (err?: Error) => { destroyed.push(opts.start); return origDestroy(err); };
+        return r;
+      },
+      end() {},
+    };
+    const ft = new FileTransfer('x4', 'A', local, '/remote/big.bin', 'download',
+      { conn: { end() {} } as any, jumpConns: [], sftp: sftp as any },
+      { chunkThreads: 4, chunkSize: 50 });
+    await ft.start();
+    expect(ft.getInfo().state).toBe('failed');
+    expect(ft.getInfo().error).toContain('segment 0 read failed');
+    expect(destroyed).toContain(50);
     await rm(dir, { recursive: true, force: true });
   });
 });

@@ -3180,9 +3180,11 @@ export class FileTransfer {
 
   private async downloadChunks(segs: Array<{ start: number; end: number }>): Promise<void> {
     const fd = await open(this.partPath, 'w');
+    const reads: Array<NodeJS.ReadableStream> = [];
     try {
       await Promise.all(segs.map(async (seg) => {
-        const read = this.conns.sftp.createReadStream(this.remotePath, { start: seg.start, end: seg.end });
+        const read = this.conns.sftp.createReadStream(this.remotePath, { start: seg.start, end: seg.end - 1 });
+        reads.push(read);
         this.streams.push(read);
         let position = seg.start;
         let streamEnded = false;
@@ -3236,6 +3238,9 @@ export class FileTransfer {
           });
         });
       }));
+    } catch (err) {
+      reads.forEach((r) => (r as any).destroy());
+      throw err;
     } finally {
       await fd.close();
     }
@@ -3245,9 +3250,11 @@ export class FileTransfer {
     const handle = await new Promise<Buffer>((resolve, reject) => {
       this.conns.sftp.open(this.partPath, 'w', (err, h) => err ? reject(err) : resolve(h));
     });
+    const reads: Array<NodeJS.ReadableStream> = [];
     try {
       await Promise.all(segs.map(async (seg) => {
-        const localRead = createReadStream(this.localPath, { start: seg.start, end: seg.end });
+        const localRead = createReadStream(this.localPath, { start: seg.start, end: seg.end - 1 });
+        reads.push(localRead);
         this.streams.push(localRead);
         let position = seg.start;
         let streamEnded = false;
@@ -3299,6 +3306,9 @@ export class FileTransfer {
           });
         });
       }));
+    } catch (err) {
+      reads.forEach((r) => (r as any).destroy());
+      throw err;
     } finally {
       if (this.conns) {
         await new Promise<void>((resolve) => this.conns.sftp.close(handle, () => resolve()));
