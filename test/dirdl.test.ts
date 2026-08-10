@@ -129,30 +129,24 @@ describe('DirectoryTransfer listing', () => {
 describe('DirectoryTransfer concurrency', () => {
   it('runs at most N file transfers concurrently', async () => {
     const { DirectoryTransfer } = await import('../src/index.js');
-    // fake: a slow transfer that records concurrent in-flight count
     let maxActive = 0;
     let active = 0;
-    const { FileTransfer } = await import('../src/index.js');
-    const origStart = FileTransfer.prototype.start;
-    FileTransfer.prototype.start = async function () {
+    const t = new DirectoryTransfer('c1', 'A', '/data', '/local/data', 'download-dir',
+      { conn: { end() {} } as any, jumpConns: [], sftp: { stat(_p: string, cb: (e: Error | null, s?: any) => void) { cb(null, { size: 0, isDirectory: () => true }); }, end() {} } as any },
+      { concurrency: 2 });
+    (t as any).listFiles = async () => [
+      { relPath: 'a', size: 1 }, { relPath: 'b', size: 1 }, { relPath: 'c', size: 1 }, { relPath: 'd', size: 1 },
+    ];
+    (t as any).maybeSkip = async () => false;
+    (t as any).transferOne = async () => {
       active += 1;
       maxActive = Math.max(maxActive, active);
       await new Promise((r) => setTimeout(r, 20));
-      (this as any).state = 'completed';
       active -= 1;
+      return 1;
     };
-    try {
-      const t = new DirectoryTransfer('c1', 'A', '/data', '/local/data', 'download-dir',
-        { conn: { end() {} } as any, jumpConns: [], sftp: { end() {} } as any },
-        { concurrency: 2 });
-      (t as any).listFiles = async () => [
-        { relPath: 'a', size: 1 }, { relPath: 'b', size: 1 }, { relPath: 'c', size: 1 }, { relPath: 'd', size: 1 },
-      ];
-      (t as any).maybeSkip = async () => false;
-      await (t as any).start();
-      expect(maxActive).toBeLessThanOrEqual(2);
-    } finally {
-      FileTransfer.prototype.start = origStart;
-    }
+    await (t as any).start();
+    expect(maxActive).toBeLessThanOrEqual(2);
+    expect(maxActive).toBeGreaterThanOrEqual(2); // concurrency genuinely engages
   });
 });
