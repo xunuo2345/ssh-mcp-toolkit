@@ -709,6 +709,60 @@ async function sha256Remote(sftp: SFTPWrapper, remotePath: string): Promise<stri
   });
 }
 
+export type DirEntry = {
+  relPath: string;
+  size: number;
+};
+
+export function dirEntriesToTotal(entries: DirEntry[]): { filesTotal: number; totalBytes: number } {
+  let filesTotal = 0;
+  let totalBytes = 0;
+  for (const e of entries) {
+    filesTotal += 1;
+    totalBytes += e.size;
+  }
+  return { filesTotal, totalBytes };
+}
+
+export function resolveDirSkip(
+  entry: DirEntry,
+  localSize: number | null,
+  localHash: string | null,
+  remoteHash: string | null,
+): boolean {
+  if (localSize === null || localHash === null || remoteHash === null) {
+    return false;
+  }
+  return localSize === entry.size && localHash === remoteHash;
+}
+
+export function chunkSegments(
+  fileSize: number,
+  offset: number,
+  chunkSize: number,
+  threads: number,
+): Array<{ start: number; end: number }> {
+  const remaining = fileSize - offset;
+  if (remaining <= 0) {
+    return [];
+  }
+  const t = Math.max(1, Math.floor(threads));
+  if (chunkSize <= 0 || t <= 1 || remaining < chunkSize) {
+    return [{ start: offset, end: fileSize }];
+  }
+  const segCount = Math.min(t, Math.floor(remaining / chunkSize));
+  const segBytes = Math.ceil(remaining / segCount);
+  const segs: Array<{ start: number; end: number }> = [];
+  for (let i = 0; i < segCount; i++) {
+    const start = offset + i * segBytes;
+    const end = Math.min(fileSize, start + segBytes);
+    if (end > start) {
+      segs.push({ start, end });
+    }
+  }
+  return segs;
+}
+
 export function validateTransferParams(params: {
   sourceHost: string;
   targetHost: string;
