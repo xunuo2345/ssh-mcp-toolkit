@@ -69,6 +69,7 @@ Hosts that are not directly reachable can be tunneled through any number of jump
 | 服务器间直传 | `start-transfer` / `transfer-status` / `transfer-cancel` | 两台已保存主机之间的文件传输：`direct`（源服务器上跑 rsync，本地 0 带宽）/ `stream`（经本地双 SFTP 流转发）/ `hybrid` / `auto` | [Server-to-Server Transfer](#server-to-server-transfer) |
 | 异步命令执行 | `start-exec` / `exec-status` / `exec-logs` / `exec-cancel` | 长命令（跑批/构建/迁移）后台执行、立即返回 `run_id`，可增量读取运行中的输出并可取消；规避同步 `exec` 的 MCP 客户端超时；结果保留 10 分钟 | [Session Management](#session-management) |
 | 交互式输入 | `exec-input` | 向运行中命令的 stdin 发送输入并返回增量输出（`offset` 切片 + `wait_ms` 等待）；典型场景：跳板机资产选择菜单，逐层输入数字跳转到目标服务器 shell；交互式 TUI 命令永不结束，可用 `exec-cancel` 中断 | [Session Management](#session-management) |
+| 会话级交互式输入 | `session-input` / `session-output` | 直接读写会话 shell 的增量输出与 stdin，无需后台 run；典型场景：堡垒机（AIS iFORT、奇治 Umap）登录后立即弹出的 TUI 资产菜单 —— `start-session` 后先 `session-output` 读菜单，再 `session-input` 逐层输入数字进入目标服务器 | [Session Management](#session-management) |
 
 所有新增均向后兼容：原有 `hosts.json` 格式与既有工具调用方式完全不变。
 
@@ -86,6 +87,7 @@ Hosts that are not directly reachable can be tunneled through any number of jump
 - **Server-to-server transfer:** copy files directly between two stored hosts — rsync on the source for large files (zero local bandwidth) or an SFTP pipe through the local machine when hosts can't reach each other (`start-transfer`).
 - **Async command execution:** run long-running commands (batch jobs, builds, migrations) in the background with `start-exec`, then poll incremental output with `exec-logs` and the final result with `exec-status` — no MCP request timeouts on the synchronous `exec` tool.
 - **Interactive command input:** drive interactive programs (jump-host asset menus, setup wizards) by sending stdin to a running background command with `exec-input` and reading the incremental output — the run stays `running` until the program exits, so interrupt it with `exec-cancel` when done.
+- **Session-level interactive input:** drive a bastion host's login-time TUI menu directly on the session shell — read the incremental output with `session-output` and write menu selections with `session-input`, without starting a background run.
 - **Timeout & cleanup safeguards:** sessions and tunnels auto-close after prolonged inactivity; commands are marked and monitored for completion.
 - **Structured listings:** query active sessions and saved hosts directly from the MCP client.
 
@@ -482,6 +484,34 @@ Typical scenario: a **jump-host asset-selection menu**. `start-exec` launches th
 
 A finished run (completed, failed, or cancelled) stays queryable via `exec-status` / `exec-logs` for **10 minutes** after it finishes, then is pruned automatically the next time a run is started. Running runs are never pruned. If the session is closed while a run is still `running`, the run resolves to `failed`.
 
+### Session-level interactive input
+
+`session-output` and `session-input` work directly on a **session's shell** — unlike `exec-input`, which targets a background run created by `start-exec`, these tools drive the login shell itself. They exist for the case where the remote login banner is interactive: bastion hosts (AIS iFORT, 奇治 Umap) often drop you straight into a TUI asset menu as soon as `start-session` completes, before you can run any command.
+
+#### Reading session output
+
+Tool: **`session-output`** with `session_id` and `offset` (character index, default `0`) returns the output the session's shell has produced from that offset onward, plus `nextOffset` for continuing:
+
+```json
+{ "output": "…menu text…", "nextOffset": 412 }
+```
+
+#### Writing input
+
+Tool: **`session-input`** with `session_id`, `text`, `offset` (default `0`), and `wait_ms` (default `400`) writes `text` to the session shell's stdin, waits `wait_ms` for the output it triggers, then returns the incremental output produced after `offset` — the same JSON shape as `session-output`. Pass the returned `nextOffset` as the next `offset` to step through the menu.
+
+Typical bastion login-menu flow — read the menu `start-session` already produced, then send the menu digits one at a time until you land in the target server's shell:
+
+```
+/mcp mcp-remote-ssh session-output {"session_id":"<id>","offset":0}
+/mcp mcp-remote-ssh session-input {"session_id":"<id>","text":"1\n","offset":0}
+/mcp mcp-remote-ssh session-input {"session_id":"<id>","text":"2\n","offset":"<nextOffset>"}
+```
+
+> The session output buffer is capped at **1 MB** — when a session produces more, the oldest output is dropped. A long-lived, chatty session can therefore lose its earliest output; keep up by advancing `offset` as you go.
+>
+> The very first output of a fresh session includes shell bootstrap traces (the `export PS1=""` / `stty -echo` setup echoed back) before any login menu appears — skip past them by advancing `offset` after the first `session-output` call.
+
 ### Closing Sessions
 
 Tool: **`close-session`**
@@ -765,7 +795,7 @@ Tool: **`transfer-status`** with `transfer_id` returns JSON with `state`, `mode`
 
 ## Timeouts & Inactivity Handling
 
-- Each session has a **global inactivity timeout** (default 2 hours). Timer resets whenever a command executes successfully, on incoming command output, and on `exec-input`. Inactivity means no command output and no input activity — a continuously-streaming (`tail -f`-style) or interactive session stays alive. 闲置指既无命令输出也无输入活动：持续流式输出或正在交互的会话不会被回收。
+- Each session has a **global inactivity timeout** (default 2 hours). Timer resets whenever a command executes successfully, on incoming command output, and on `exec-input` / `session-input`. Inactivity means no command output and no input activity — a continuously-streaming (`tail -f`-style) or interactive session stays alive. 闲置指既无命令输出也无输入活动：持续流式输出或正在交互的会话不会被回收。
 - If the timer elapses, the session cleans up the SSH connection, shell, and resolver buffer, and removes itself from `activeSessions`.
 - Command completion uses a UUID marker: `printf '__MCP_DONE__{uuid}%d\n' $?`. Output before the marker is returned; numeric code after the marker becomes the exit status.
 - Each tunnel shares the same **2-hour inactivity timeout**, but only counts while **no connection** is flowing through it. The timer is cleared as soon as a connection opens and restarts after the last one closes. Internet egress tunnels behave the same way.
@@ -933,6 +963,7 @@ Issues and feature requests are welcome via GitHub.
 - **内网出网（Internet Egress）** —— 新增 `open-egress` / `close-egress` / `list-egress` 三个工具：在跳板机 A 上反向监听端口（`ssh -R` 风格），把内网 B/C 的 HTTP 代理流量经 SSH 隧道送回本地，由本地作为出口代理访问外网。无需内网开放任何入站端口，纯 JavaScript 实现。
 - **服务器间直传（Server-to-Server Transfer）** —— 新增 `start-transfer` / `transfer-status` / `transfer-cancel` 三个工具：在两台已保存主机之间传输文件。`direct` 在源服务器上用 rsync 直连目标（本地 0 带宽，适合 200GB 级别备份）；`stream` 经本地双 SFTP 流转发（适合小文件或服务器间不通）；`hybrid` 先直连失败降级流式；`auto` 按大小阈值自动选择。异步三件套便于大文件后台跟踪与取消。
 - **单元测试** —— 覆盖主机 schema、跳板链解析与跳板配置校验。
+- **会话级交互式输入** —— 新增 `session-output` / `session-input` 两个工具：直接读写会话 shell 的增量输出与 stdin，无需后台 run。典型场景是堡垒机（AIS iFORT、奇治 Umap）登录后立即弹出的 TUI 资产菜单：`start-session` 后先 `session-output` 读菜单，再用 `session-input` 逐层输入数字进入目标服务器。与 `exec-input` 的区别在于它作用于 session 本身而非 `start-exec` 的 run；会话输出缓冲上限 1MB（最旧部分被丢弃），初始输出可能混有 shell 引导回显（`export PS1=""` / `stty -echo`）。
 
 以上新增均向后兼容：原有的 `hosts.json` 与原有的工具调用方式行为完全不变。
 
