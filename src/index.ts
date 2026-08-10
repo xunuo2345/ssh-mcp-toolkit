@@ -7,7 +7,7 @@ import SSH2Module from 'ssh2';
 const { Client: SSHClient, utils: sshUtils } = SSH2Module as typeof import('ssh2');
 import { z } from 'zod';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { readFile, writeFile, mkdir, stat, rename, rm, open } from 'fs/promises';
+import { readFile, writeFile, mkdir, stat, rename, rm, open, readdir } from 'fs/promises';
 import { createReadStream, createWriteStream } from 'fs';
 import { posix as posixPath, resolve as resolvePath } from 'path';
 import os from 'os';
@@ -1680,6 +1680,7 @@ server.tool(
     const resolvedLocalDir = resolvePath(local_dir);
     const id = randomUUID();
     const resolved = await resolveHost(host_id);
+    await mkdir(resolvedLocalDir, { recursive: true });
     let conn: { conn: InstanceType<typeof SSHClient>; jumpConns: InstanceType<typeof SSHClient>[]; sftp: SFTPWrapper };
     try {
       conn = await openSftpConnection(resolved);
@@ -1711,13 +1712,14 @@ server.tool(
     const resolvedLocalDir = resolvePath(local_dir);
     const id = randomUUID();
     const resolved = await resolveHost(host_id);
+    await mkdir(resolvedLocalDir, { recursive: true });
     let conn: { conn: InstanceType<typeof SSHClient>; jumpConns: InstanceType<typeof SSHClient>[]; sftp: SFTPWrapper };
     try {
       conn = await openSftpConnection(resolved);
     } catch (error: any) {
       throw new McpError(ErrorCode.InternalError, `Failed to connect to host '${host_id}': ${error instanceof Error ? error.message : String(error)}`);
     }
-    const transfer = new DirectoryTransfer(id, host_id, resolvedLocalDir, remote_dir, 'upload-dir',
+    const transfer = new DirectoryTransfer(id, host_id, remote_dir, resolvedLocalDir, 'upload-dir',
       conn, { concurrency, chunkThreads: chunk_threads, chunkSize: chunk_size_mb * 1024 * 1024 });
     activeTransfers.set(id, transfer);
     transfer.start().catch(() => {});
@@ -3428,7 +3430,9 @@ export class DirectoryTransfer {
     }
     this.state = 'running';
     try {
-      const entries = await this.listFiles(this.direction === 'upload-dir' ? this.targetPath : this.sourcePath);
+      const entries = this.direction === 'upload-dir'
+        ? await this.listLocalFiles(this.targetPath)
+        : await this.listFiles(this.sourcePath);
       const { filesTotal, totalBytes } = dirEntriesToTotal(entries);
       this.filesTotal = filesTotal;
       this.totalBytes = totalBytes;
@@ -3464,6 +3468,7 @@ export class DirectoryTransfer {
           : posixPath.join(this.sourcePath, relPath);
         if (this.direction === 'download-dir') {
           await ensureRemoteParentDirectory(this.conns.sftp, source);
+          await mkdir(posixPath.dirname(target), { recursive: true });
         }
         const skipped = await this.maybeSkip(entry, source, target);
         if (skipped) {
@@ -3492,7 +3497,11 @@ export class DirectoryTransfer {
         let list: any[] = [];
         while (true) {
           const page = await new Promise<any[]>((resolve, reject) => {
-            this.conns.sftp.readdir(handle, (err, l) => err ? reject(err) : resolve(l ?? []));
+            this.conns.sftp.readdir(handle, (err, l) => {
+              if (err && (err as any).code === 1) { resolve([]); return; }
+              if (err) { reject(err); return; }
+              resolve(l ?? []);
+            });
           });
           if (page.length === 0) break;
           list = list.concat(page);
@@ -3509,6 +3518,31 @@ export class DirectoryTransfer {
         }
       } finally {
         await new Promise<void>((resolve) => this.conns.sftp.close(handle, () => resolve()));
+      }
+    };
+    await walk(rootPath, '');
+    return out;
+  }
+
+  private async listLocalFiles(rootPath: string): Promise<DirEntry[]> {
+    const out: DirEntry[] = [];
+    const walk = async (dirPath: string, relDir: string) => {
+      let dirents: import('fs').Dirent[];
+      try {
+        dirents = await readdir(dirPath, { withFileTypes: true });
+      } catch (error: any) {
+        throw new McpError(ErrorCode.InvalidParams, `Local directory '${dirPath}' cannot be read: ${error.message}`);
+      }
+      for (const dirent of dirents) {
+        const name = dirent.name;
+        const relPath = relDir ? `${relDir}/${name}` : name;
+        const fullPath = posixPath.join(dirPath, name);
+        if (dirent.isDirectory()) {
+          await walk(fullPath, relPath);
+        } else if (dirent.isFile()) {
+          const st = await stat(fullPath);
+          out.push({ relPath, size: st.size });
+        }
       }
     };
     await walk(rootPath, '');
@@ -3538,13 +3572,33 @@ export class DirectoryTransfer {
 
   private async transferOne(sourcePath: string, targetPath: string, size: number): Promise<number> {
     const download = this.direction === 'download-dir';
+    // Sub-transfers share the parent's SFTP connection; the parent owns the
+    // lifecycle (error/end/close handling, final dispose). Shadow listener
+    // registration and end() so each FileTransfer neither closes the shared
+    // connection nor accumulates redundant listeners on it.
+    const subProxy = (target: any) => new Proxy(target, {
+      get(t, prop) {
+        if (prop === 'end') return () => {};
+        if (prop === 'once' || prop === 'on' || prop === 'addListener'
+            || prop === 'prependListener' || prop === 'removeListener'
+            || prop === 'removeAllListeners') {
+          return () => {};
+        }
+        const v = Reflect.get(t, prop);
+        return typeof v === 'function' ? v.bind(t) : v;
+      },
+    });
     const ft = new FileTransfer(
       `sub-${this.id}`,
       this.hostId,
       download ? targetPath : sourcePath,
       download ? sourcePath : targetPath,
       download ? 'download' : 'upload',
-      this.conns as any,
+      {
+        conn: subProxy(this.conns.conn),
+        jumpConns: [],
+        sftp: subProxy(this.conns.sftp),
+      } as any,
       { chunkThreads: this.chunkThreads, chunkSize: this.chunkSize },
     );
     await ft.start();

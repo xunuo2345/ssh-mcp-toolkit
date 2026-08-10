@@ -72,7 +72,7 @@ describe('DirectoryTransfer listing', () => {
       opendir(path: string, cb: (err: Error | null, handle?: Buffer) => void) { cb(null, Buffer.from(path)); },
       readdir(handle: Buffer, cb: (err: Error | null, list?: any[]) => void) {
         const key = handle.toString();
-        if (consumed[key]) { cb(null, []); return; }
+        if (consumed[key]) { cb({ code: 1, message: 'End of file' } as any); return; }
         consumed[key] = true;
         cb(null, entries[key] ?? []);
       },
@@ -108,30 +108,98 @@ describe('DirectoryTransfer listing', () => {
 
   it('lists the local tree for upload-dir', async () => {
     const { DirectoryTransfer } = await import('../src/index.js');
-    const tree = {
-      '/local/data': { size: 0, dir: true },
-      '/local/data/file.txt': { size: 42 },
-      '/local/data/nested': { size: 0, dir: true },
-      '/local/data/nested/deep.bin': { size: 7 },
-    };
-    const sftp = makeDirSftp(tree);
-    const t = new DirectoryTransfer('d2', 'A', '/remote/data', '/local/data', 'upload-dir',
+    const { mkdtemp, mkdir, writeFile, rm } = await import('fs/promises');
+    const { join } = await import('path');
+    const { tmpdir } = await import('os');
+    const localRoot = await mkdtemp(join(tmpdir(), 'dirup-'));
+    await mkdir(join(localRoot, 'nested'), { recursive: true });
+    await writeFile(join(localRoot, 'file.txt'), Buffer.alloc(42));
+    await writeFile(join(localRoot, 'nested', 'deep.bin'), Buffer.alloc(7));
+    const sftp = { stat(_p: string, cb: (e: Error | null, s?: any) => void) { cb(null, { size: 0, isDirectory: () => true }); }, end() {} };
+    const t = new DirectoryTransfer('d2', 'A', '/remote/data', localRoot, 'upload-dir',
       { conn: { end() {} } as any, jumpConns: [], sftp: sftp as any });
     (t as any).conns = { conn: { end() {} }, jumpConns: [], sftp };
-    const listing = await (t as any).listFiles('/local/data');
+    const listing = await (t as any).listLocalFiles(localRoot);
     expect(listing).toEqual([
       { relPath: 'file.txt', size: 42 },
       { relPath: 'nested/deep.bin', size: 7 },
     ]);
+    await rm(localRoot, { recursive: true, force: true });
+  });
+
+  it('download-dir creates missing nested local directories', async () => {
+    const { DirectoryTransfer } = await import('../src/index.js');
+    const { mkdtemp, rm, readFile, access } = await import('fs/promises');
+    const { join } = await import('path');
+    const { tmpdir } = await import('os');
+    const localRoot = await mkdtemp(join(tmpdir(), 'dirdl-'));
+    const tree = {
+      '/data': { size: 0, dir: true },
+      '/data/a.bin': { size: 4 },
+      '/data/sub': { size: 0, dir: true },
+      '/data/sub/b.bin': { size: 4 },
+    };
+    const contents = new Map([
+      ['/data/a.bin', Buffer.from([1, 2, 3, 4])],
+      ['/data/sub/b.bin', Buffer.from([5, 6, 7, 8])],
+    ]);
+    const consumed: Record<string, boolean> = {};
+    const sftp = {
+      opendir(path: string, cb: (err: Error | null, handle?: Buffer) => void) { cb(null, Buffer.from(path)); },
+      readdir(handle: Buffer, cb: (err: Error | null, list?: any[]) => void) {
+        const key = handle.toString();
+        const items: Array<{ filename: string; attrs: { size: number; isDirectory: () => boolean } }> = [];
+        for (const [p, info] of Object.entries(tree)) {
+          if (p.slice(0, p.lastIndexOf('/')) === key) {
+            const name = p.slice(p.lastIndexOf('/') + 1);
+            items.push({ filename: name, attrs: { size: info.size, isDirectory: () => !!info.dir } });
+          }
+        }
+        if (consumed[key]) { cb({ code: 1, message: 'End of file' } as any); return; }
+        consumed[key] = true;
+        cb(null, items);
+      },
+      stat(path: string, cb: (err: Error | null, stats?: any) => void) {
+        const info = tree[path];
+        if (info) cb(null, { size: info.size, isDirectory: () => !!info.dir });
+        else cb(new Error('ENOENT') as any);
+      },
+      createReadStream(path: string) {
+        const { Readable } = require('stream');
+        const r = new Readable();
+        r._read = () => {};
+        r.push(contents.get(path) ?? Buffer.alloc(0));
+        r.push(null);
+        return r;
+      },
+      close(_handle: Buffer, cb: (err: Error | null) => void) { cb(null); },
+      end() {},
+    };
+    const t = new DirectoryTransfer('dl1', 'A', '/data', localRoot, 'download-dir',
+      { conn: { end() {} } as any, jumpConns: [], sftp: sftp as any },
+      { concurrency: 2 });
+    await t.start();
+    expect(t.getInfo().state).toBe('completed');
+    expect(t.getInfo().filesDone).toBe(2);
+    const rootFile = await readFile(join(localRoot, 'a.bin'));
+    expect([...rootFile]).toEqual([1, 2, 3, 4]);
+    await access(join(localRoot, 'sub', 'b.bin'));
+    const nestedFile = await readFile(join(localRoot, 'sub', 'b.bin'));
+    expect([...nestedFile]).toEqual([5, 6, 7, 8]);
+    await rm(localRoot, { recursive: true, force: true });
   });
 });
 
 describe('DirectoryTransfer concurrency', () => {
   it('runs at most N file transfers concurrently', async () => {
     const { DirectoryTransfer } = await import('../src/index.js');
+    const { mkdtemp, rm } = await import('fs/promises');
+    const { join } = await import('path');
+    const { tmpdir } = await import('os');
+    const localRoot = await mkdtemp(join(tmpdir(), 'dirconc-'));
     let maxActive = 0;
     let active = 0;
-    const t = new DirectoryTransfer('c1', 'A', '/data', '/local/data', 'download-dir',
+    const t = new DirectoryTransfer('c1', 'A', '/data', localRoot, 'download-dir',
       { conn: { end() {} } as any, jumpConns: [], sftp: { stat(_p: string, cb: (e: Error | null, s?: any) => void) { cb(null, { size: 0, isDirectory: () => true }); }, end() {} } as any },
       { concurrency: 2 });
     (t as any).listFiles = async () => [
@@ -148,6 +216,7 @@ describe('DirectoryTransfer concurrency', () => {
     await (t as any).start();
     expect(maxActive).toBeLessThanOrEqual(2);
     expect(maxActive).toBeGreaterThanOrEqual(2); // concurrency genuinely engages
+    await rm(localRoot, { recursive: true, force: true });
   });
 });
 
