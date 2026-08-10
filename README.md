@@ -697,7 +697,7 @@ Because rsync runs with `--size-only`, a destination file already the same size 
 
 ### Checking status / cancelling
 
-Tool: **`transfer-status`** with `transfer_id` returns JSON with `state`, `kind`, `mode`, `transferredBytes`, `totalBytes`, `percent`, and `error`. Server-to-server transfers report `kind: 'server'`; transfers started by `start-download` / `start-upload` report `kind: 'download'` / `'upload'`. Tool: **`transfer-cancel`** with `transfer_id` stops a running transfer.
+Tool: **`transfer-status`** with `transfer_id` returns JSON with `state`, `kind`, `mode`, `sourceHost`, `sourcePath`, `targetHost`, `targetPath`, `transferredBytes`, `totalBytes`, `percent`, `error`, `createdAt`, and `finishedAt`. Server-to-server transfers report `kind: 'server'`; transfers started by `start-download` / `start-upload` report `kind: 'download'` / `'upload'`, and for those one side of `sourceHost` / `targetHost` is `'local'` (`start-download`: `targetHost` is `'local'`; `start-upload`: `sourceHost` is `'local'`). Tool: **`transfer-cancel`** with `transfer_id` stops a running transfer.
 
 ### Lifecycle & limitations
 

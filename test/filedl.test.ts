@@ -92,7 +92,7 @@ describe('FileTransfer', () => {
     expect(info.targetHost).toBe('local');
     expect(info.sourcePath).toBe('/data/big.bin');
     expect(info.targetPath).toBe(local);
-    expect(info.mode).toBe('stream');
+    expect(info.mode).toBe('single');
     expect(info.transferredBytes).toBe(5);
     expect(info.totalBytes).toBe(10);
     expect(info.percent).toBe(50);

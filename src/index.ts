@@ -643,8 +643,8 @@ export type TransferState = 'pending' | 'running' | 'completed' | 'failed' | 'ca
 
 export type TransferInfo = {
   id: string;
-  mode: 'direct' | 'stream' | 'hybrid';
-  kind?: 'server' | 'download' | 'upload';
+  mode: 'direct' | 'stream' | 'hybrid' | 'single';
+  kind: 'server' | 'download' | 'upload';
   state: TransferState;
   sourceHost: string;
   sourcePath: string;
@@ -1340,14 +1340,11 @@ server.tool(
   {
     host_id: z.string().describe("Identifier of the source host"),
     remote_path: z.string().min(1).describe("Path to the source file on the remote host"),
-    local_path: z.string().describe("Destination path on the MCP server machine (absolute or relative to its working directory)"),
+    local_path: z.string().min(1).describe("Destination path on the MCP server machine (absolute or relative to its working directory)"),
   },
   async ({ host_id, remote_path, local_path }) => {
     const resolvedLocalPath = resolvePath(local_path);
     const id = randomUUID();
-    if (activeTransfers.has(id)) {
-      throw new McpError(ErrorCode.InvalidParams, `Transfer '${id}' already exists`);
-    }
     const resolved = await resolveHost(host_id);
     let conn: { conn: InstanceType<typeof SSHClient>; jumpConns: InstanceType<typeof SSHClient>[]; sftp: SFTPWrapper };
     try {
@@ -1356,10 +1353,6 @@ server.tool(
       throw new McpError(ErrorCode.InternalError, `Failed to connect to host '${host_id}': ${error instanceof Error ? error.message : String(error)}`);
     }
     const transfer = new FileTransfer(id, host_id, resolvedLocalPath, remote_path, 'download', conn);
-    if (activeTransfers.has(id)) {
-      transfer.dispose();
-      throw new McpError(ErrorCode.InvalidParams, `Transfer '${id}' already exists`);
-    }
     activeTransfers.set(id, transfer);
     transfer.start().catch(() => {
       // start() records failures internally; nothing further to do.
@@ -1390,12 +1383,12 @@ server.tool(
       }
     } catch (error: any) {
       if (error instanceof McpError) throw error;
+      if (error?.code === 'EACCES' || error?.code === 'EPERM') {
+        throw new McpError(ErrorCode.InternalError, `Local file '${resolvedLocalPath}' cannot be read (permission denied)`);
+      }
       throw new McpError(ErrorCode.InvalidParams, `Local file '${resolvedLocalPath}' cannot be read: ${error.message}`);
     }
     const id = randomUUID();
-    if (activeTransfers.has(id)) {
-      throw new McpError(ErrorCode.InvalidParams, `Transfer '${id}' already exists`);
-    }
     const resolved = await resolveHost(host_id);
     let conn: { conn: InstanceType<typeof SSHClient>; jumpConns: InstanceType<typeof SSHClient>[]; sftp: SFTPWrapper };
     try {
@@ -1404,10 +1397,6 @@ server.tool(
       throw new McpError(ErrorCode.InternalError, `Failed to connect to host '${host_id}': ${error instanceof Error ? error.message : String(error)}`);
     }
     const transfer = new FileTransfer(id, host_id, resolvedLocalPath, remote_path, 'upload', conn);
-    if (activeTransfers.has(id)) {
-      transfer.dispose();
-      throw new McpError(ErrorCode.InvalidParams, `Transfer '${id}' already exists`);
-    }
     activeTransfers.set(id, transfer);
     transfer.start().catch(() => {
       // start() records failures internally; nothing further to do.
@@ -2367,7 +2356,7 @@ export class FileTransfer {
     const download = this.direction === 'download';
     return {
       id: this.id,
-      mode: 'stream',
+      mode: 'single',
       kind: this.direction,
       state: this.state,
       sourceHost: download ? this.hostId : 'local',
