@@ -106,10 +106,27 @@ describe('FileTransfer download resume', () => {
     const transfer = new FileTransfer('r2', 'A', local, '/remote/file.bin', 'download',
       { conn: { end() {} } as any, jumpConns: [], sftp: source.sftp as any });
     await transfer.start();
-    expect(source.calls.read).toEqual([]); // no read stream (skipped)
+    expect(source.calls.read.length).toBe(1); // only the sha256 verification stream
+    expect(source.calls.read[0].start).toBeUndefined(); // no offset-resume transfer read
     expect(await readFile(local)).toEqual(full); // renamed into place
     await expect(stat(part)).rejects.toThrow();
     expect(transfer.getInfo().state).toBe('completed');
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('download of an empty remote file completes', async () => {
+    const { FileTransfer, partPathFor } = await import('../src/index.js');
+    const dir = await mkdtemp(join(tmpdir(), 'resume-dl4-'));
+    const local = join(dir, 'file.bin');
+    const part = partPathFor(local);
+    const source = makeFakeSftpForResume(0, Buffer.alloc(0)); // 0-byte remote, no .part
+    const transfer = new FileTransfer('r4', 'A', local, '/remote/empty.bin', 'download',
+      { conn: { end() {} } as any, jumpConns: [], sftp: source.sftp as any });
+    await transfer.start();
+    const info = transfer.getInfo();
+    expect(info.state).toBe('completed');
+    expect((await stat(local)).size).toBe(0);
+    await expect(stat(part)).rejects.toThrow();
     await rm(dir, { recursive: true, force: true });
   });
 

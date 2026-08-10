@@ -2490,6 +2490,9 @@ export class FileTransfer {
     if (partSize !== null && partSize > stats.size) {
       await rm(this.partPath, { force: true });
     }
+    if (offset === stats.size && partSize === null && stats.size === 0) {
+      await writeFile(this.partPath, '');
+    }
     this.transferredBytes = offset;
     if (offset < stats.size) {
       const read = this.conns.sftp.createReadStream(this.remotePath, { start: offset });
@@ -2512,22 +2515,18 @@ export class FileTransfer {
         read.on('error', once((error: Error) => reject(error)));
         write.on('error', once((error: Error) => reject(error)));
       });
-      if (this.disposed || this.cancelled) {
-        throw new Error('transfer cancelled');
-      }
-      const partStats = await stat(this.partPath);
-      if (partStats.size !== stats.size) {
-        throw new Error(`size mismatch: expected ${stats.size}, got ${partStats.size}`);
-      }
-      const partHash = await sha256File(this.partPath);
-      const remoteHash = await sha256Remote(this.conns.sftp, this.remotePath);
-      if (partHash !== remoteHash) {
-        throw new Error(`sha256 mismatch: expected ${remoteHash}, got ${partHash}`);
-      }
+    }
+    if (this.disposed || this.cancelled) {
+      throw new Error('transfer cancelled');
     }
     const partStats = await stat(this.partPath);
     if (partStats.size !== stats.size) {
       throw new Error(`size mismatch: expected ${stats.size}, got ${partStats.size}`);
+    }
+    const partHash = await sha256File(this.partPath);
+    const remoteHash = await sha256Remote(this.conns.sftp, this.remotePath);
+    if (partHash !== remoteHash) {
+      throw new Error(`sha256 mismatch: expected ${remoteHash}, got ${partHash}`);
     }
     await rename(this.partPath, this.localPath);
     this.complete();

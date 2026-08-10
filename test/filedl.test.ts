@@ -38,10 +38,6 @@ function makeFakeSftp(size: number, isDir = false) {
         },
       });
     },
-    rename(from: string, to: string, cb: (error: Error | null) => void) {
-      calls.rename.push([from, to]);
-      cb(null);
-    },
     mkdir(path: string, _opts: any, cb: (error: Error | null) => void) {
       calls.mkdir.push(path);
       cb(null);
