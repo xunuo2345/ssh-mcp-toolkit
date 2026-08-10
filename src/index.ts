@@ -3185,7 +3185,9 @@ export class DirectoryTransfer {
     private readonly targetPath: string,
     private readonly direction: 'download-dir' | 'upload-dir',
     private conns: { conn: InstanceType<typeof SSHClient>; jumpConns: InstanceType<typeof SSHClient>[]; sftp: SFTPWrapper },
+    options?: { concurrency?: number },
   ) {
+    this.concurrency = Math.max(1, options?.concurrency ?? 4);
     conns.conn.once?.('error', (error: Error) => this.markFailed(error.message));
     conns.conn.once?.('end', () => this.markFailed('SSH connection ended'));
     conns.conn.once?.('close', () => this.markFailed('SSH connection closed'));
@@ -3194,6 +3196,8 @@ export class DirectoryTransfer {
       jumpConn.once?.('end', () => this.markFailed('Jump connection ended'));
     }
   }
+
+  private readonly concurrency: number;
 
   async start(): Promise<void> {
     if (this.disposed) {
@@ -3205,11 +3209,29 @@ export class DirectoryTransfer {
       const { filesTotal, totalBytes } = dirEntriesToTotal(entries);
       this.filesTotal = filesTotal;
       this.totalBytes = totalBytes;
-      let doneBytes = 0;
-      for (const entry of entries) {
+      await this.runConcurrent(entries);
+      if (this.disposed || this.cancelled) {
+        throw new Error('transfer cancelled');
+      }
+      this.complete();
+    } catch (error: any) {
+      if (!this.cancelled) this.finish('failed', errorMessage(error));
+    }
+  }
+
+  private async runConcurrent(entries: DirEntry[]): Promise<void> {
+    const workers = Math.min(Math.max(1, this.concurrency), Math.max(1, entries.length));
+    let index = 0;
+    let doneBytes = 0;
+    const worker = async () => {
+      while (true) {
         if (this.disposed || this.cancelled) {
           throw new Error('transfer cancelled');
         }
+        const i = index;
+        index += 1;
+        if (i >= entries.length) break;
+        const entry = entries[i];
         const relPath = entry.relPath;
         const source = this.direction === 'download-dir'
           ? posixPath.join(this.sourcePath, relPath)
@@ -3232,13 +3254,9 @@ export class DirectoryTransfer {
         this.filesDone += 1;
         this.transferredBytes = doneBytes;
       }
-      if (this.disposed || this.cancelled) {
-        throw new Error('transfer cancelled');
-      }
-      this.complete();
-    } catch (error: any) {
-      if (!this.cancelled) this.finish('failed', errorMessage(error));
-    }
+    };
+    const pool = Array.from({ length: workers }, () => worker());
+    await Promise.all(pool);
   }
 
   private async listFiles(rootPath: string): Promise<DirEntry[]> {
