@@ -216,6 +216,7 @@ describe('ServerTransfer', () => {
     await p;
     const info = transfer.getInfo();
     expect(info.state).toBe('completed');
+    expect(info.kind).toBe('server');
     expect(info.transferredBytes).toBe(5);
     expect(info.totalBytes).toBe(10);
     expect(info.percent).toBe(50);

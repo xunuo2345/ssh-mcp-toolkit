@@ -7,10 +7,11 @@ import SSH2Module from 'ssh2';
 const { Client: SSHClient, utils: sshUtils } = SSH2Module as typeof import('ssh2');
 import { z } from 'zod';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { readFile, writeFile, mkdir, stat } from 'fs/promises';
+import { readFile, writeFile, mkdir, stat, rename, rm } from 'fs/promises';
+import { createReadStream, createWriteStream } from 'fs';
 import { posix as posixPath, resolve as resolvePath } from 'path';
 import os from 'os';
-import { randomUUID } from 'crypto';
+import { randomUUID, createHash } from 'crypto';
 import net from 'net';
 import type { Duplex } from 'stream';
 
@@ -292,6 +293,12 @@ function fastGet(sftp: SFTPWrapper, remotePath: string, localPath: string): Prom
 function sftpStat(sftp: SFTPWrapper, remotePath: string): Promise<Stats> {
   return new Promise((resolve, reject) => {
     sftp.stat(remotePath, (error, stats) => error ? reject(error) : resolve(stats));
+  });
+}
+
+function sftpRename(sftp: SFTPWrapper, from: string, to: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    sftp.rename(from, to, (err) => err ? reject(err) : resolve());
   });
 }
 
@@ -642,7 +649,8 @@ export type TransferState = 'pending' | 'running' | 'completed' | 'failed' | 'ca
 
 export type TransferInfo = {
   id: string;
-  mode: 'direct' | 'stream' | 'hybrid';
+  mode: 'direct' | 'stream' | 'hybrid' | 'single';
+  kind: 'server' | 'download' | 'upload';
   state: TransferState;
   sourceHost: string;
   sourcePath: string;
@@ -670,6 +678,37 @@ export type ExecRun = {
   interactive: boolean;
 };
 
+export function partPathFor(targetPath: string): string {
+  return `${targetPath}.part`;
+}
+
+export function resolveResumeOffset(partSize: number | null, sourceSize: number): number {
+  if (partSize === null || partSize > sourceSize) {
+    return 0;
+  }
+  return partSize;
+}
+
+export function sha256File(path: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = createHash('sha256');
+    const stream = createReadStream(path);
+    stream.on('data', (chunk: Buffer | string) => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+    stream.on('error', reject);
+  });
+}
+
+async function sha256Remote(sftp: SFTPWrapper, remotePath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = createHash('sha256');
+    const stream = sftp.createReadStream(remotePath);
+    stream.on('data', (chunk: Buffer | string) => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+    stream.on('error', reject);
+  });
+}
+
 export function validateTransferParams(params: {
   sourceHost: string;
   targetHost: string;
@@ -693,6 +732,28 @@ export function validateTransferParams(params: {
   }
   if (sourceHost === targetHost) {
     throw new McpError(ErrorCode.InvalidParams, 'source_host and target_host must differ');
+  }
+}
+
+export function resolveLocalStatError(error: any, localPath: string): McpError {
+  if (error instanceof McpError) {
+    return error;
+  }
+  if (error?.code === 'EACCES' || error?.code === 'EPERM') {
+    return new McpError(ErrorCode.InternalError, `Local file '${localPath}' cannot be read (permission denied)`);
+  }
+  return new McpError(ErrorCode.InvalidParams, `Local file '${localPath}' cannot be read: ${error.message}`);
+}
+
+export async function assertLocalDestinationParent(parent: string): Promise<void> {
+  let parentStats;
+  try {
+    parentStats = await stat(parent);
+  } catch (error: any) {
+    throw new McpError(ErrorCode.InvalidParams, `Local destination directory '${parent}' does not exist`);
+  }
+  if (!parentStats.isDirectory()) {
+    throw new McpError(ErrorCode.InvalidParams, `Local destination parent '${parent}' is not a directory`);
   }
 }
 
@@ -758,10 +819,15 @@ export function formatRsyncFailureMessage(message: string, stderr: string): stri
   return message;
 }
 
+export interface ActiveTransfer {
+  getInfo(): TransferInfo;
+  cancel(): Promise<void>;
+}
+
 const activeSessions = new Map<string, PersistentSession>();
 const activeTunnels = new Map<string, PortForward>();
 const activeEgress = new Map<string, InternetEgress>();
-const activeTransfers = new Map<string, ServerTransfer>();
+const activeTransfers = new Map<string, ActiveTransfer>();
 const activeExecRuns = new Map<string, ExecRun>();
 const DEFAULT_SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
 
@@ -1512,7 +1578,7 @@ server.tool(
 
 server.tool(
   "transfer-status",
-  "Query the status and progress of a server-to-server transfer.",
+  "Query the status and progress of an active transfer (server-to-server, download, or upload).",
   {
     transfer_id: z.string().describe("Identifier of the transfer"),
   },
@@ -1529,7 +1595,7 @@ server.tool(
 
 server.tool(
   "transfer-cancel",
-  "Cancel a running server-to-server transfer.",
+  "Cancel a running transfer (server-to-server, download, or upload).",
   {
     transfer_id: z.string().describe("Identifier of the transfer to cancel"),
   },
@@ -1540,6 +1606,79 @@ server.tool(
     }
     await transfer.cancel();
     return { content: [{ type: 'text', text: `Transfer '${transfer_id}' cancelled` }] };
+  }
+);
+
+server.tool(
+  "start-download",
+  "Download a file from a stored SSH host over SFTP in the background. Returns immediately with a transfer id; poll transfer-status for progress and cancel with transfer-cancel. Use this for large files that would time out the synchronous download-file tool.",
+  {
+    host_id: z.string().describe("Identifier of the source host"),
+    remote_path: z.string().min(1).describe("Path to the source file on the remote host"),
+    local_path: z.string().min(1).describe("Destination path on the MCP server machine (absolute or relative to its working directory)"),
+  },
+  async ({ host_id, remote_path, local_path }) => {
+    const resolvedLocalPath = resolvePath(local_path);
+    await assertLocalDestinationParent(posixPath.dirname(resolvedLocalPath));
+    const id = randomUUID();
+    const resolved = await resolveHost(host_id);
+    let conn: { conn: InstanceType<typeof SSHClient>; jumpConns: InstanceType<typeof SSHClient>[]; sftp: SFTPWrapper };
+    try {
+      conn = await openSftpConnection(resolved);
+    } catch (error: any) {
+      throw new McpError(ErrorCode.InternalError, `Failed to connect to host '${host_id}': ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const transfer = new FileTransfer(id, host_id, resolvedLocalPath, remote_path, 'download', conn);
+    activeTransfers.set(id, transfer);
+    transfer.start().catch(() => {
+      // start() records failures internally; nothing further to do.
+    });
+    return {
+      content: [{
+        type: 'text',
+        text: `Download '${id}' started: ${host_id}:${remote_path} -> '${resolvedLocalPath}'`,
+      }],
+    };
+  }
+);
+
+server.tool(
+  "start-upload",
+  "Upload a local file to a stored SSH host over SFTP in the background. Returns immediately with a transfer id; poll transfer-status for progress and cancel with transfer-cancel. Use this for large files that would time out the synchronous upload-file tool.",
+  {
+    host_id: z.string().describe("Identifier of the destination host"),
+    local_path: z.string().describe("Path to the local source file (absolute or relative to the MCP server process)"),
+    remote_path: z.string().min(1).describe("Destination path on the remote host"),
+  },
+  async ({ host_id, local_path, remote_path }) => {
+    const resolvedLocalPath = resolvePath(local_path);
+    try {
+      const localStats = await stat(resolvedLocalPath);
+      if (!localStats.isFile()) {
+        throw new McpError(ErrorCode.InvalidParams, `Local path '${resolvedLocalPath}' is not a file`);
+      }
+    } catch (error: any) {
+      throw resolveLocalStatError(error, resolvedLocalPath);
+    }
+    const id = randomUUID();
+    const resolved = await resolveHost(host_id);
+    let conn: { conn: InstanceType<typeof SSHClient>; jumpConns: InstanceType<typeof SSHClient>[]; sftp: SFTPWrapper };
+    try {
+      conn = await openSftpConnection(resolved);
+    } catch (error: any) {
+      throw new McpError(ErrorCode.InternalError, `Failed to connect to host '${host_id}': ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const transfer = new FileTransfer(id, host_id, resolvedLocalPath, remote_path, 'upload', conn);
+    activeTransfers.set(id, transfer);
+    transfer.start().catch(() => {
+      // start() records failures internally; nothing further to do.
+    });
+    return {
+      content: [{
+        type: 'text',
+        text: `Upload '${id}' started: '${resolvedLocalPath}' -> ${host_id}:${remote_path}`,
+      }],
+    };
   }
 );
 
@@ -2506,6 +2645,7 @@ export class ServerTransfer {
     return {
       id: this.id,
       mode: this.mode,
+      kind: 'server',
       state: this.state,
       sourceHost: this.sourceHostId,
       sourcePath: this.sourcePath,
@@ -2674,6 +2814,299 @@ export class ServerTransfer {
       );
     }
     this.complete();
+  }
+}
+
+export class FileTransfer {
+  private state: TransferState = 'pending';
+  private transferredBytes = 0;
+  private totalBytes: number | null = null;
+  private error: string | null = null;
+  private readonly createdAt = Date.now();
+  private finishedAt: number | null = null;
+  private cancelled = false;
+  private disposed = false;
+  private streams: Array<NodeJS.ReadableStream | NodeJS.WritableStream> = [];
+  private partPath: string;
+
+  constructor(
+    private readonly id: string,
+    private readonly hostId: string,
+    private readonly localPath: string,
+    private readonly remotePath: string,
+    private readonly direction: 'download' | 'upload',
+    private conns: { conn: InstanceType<typeof SSHClient>; jumpConns: InstanceType<typeof SSHClient>[]; sftp: SFTPWrapper },
+  ) {
+    this.partPath = direction === 'download'
+      ? partPathFor(localPath)
+      : partPathFor(remotePath);
+    conns.conn.once?.('error', (error: Error) => this.markFailed(error.message));
+    conns.conn.once?.('end', () => this.markFailed('SSH connection ended'));
+    conns.conn.once?.('close', () => this.markFailed('SSH connection closed'));
+    for (const jumpConn of conns.jumpConns) {
+      jumpConn.once?.('error', (error: Error) => this.markFailed(error.message));
+      jumpConn.once?.('end', () => this.markFailed('Jump connection ended'));
+    }
+  }
+
+  async start(): Promise<void> {
+    if (this.disposed) {
+      throw new McpError(ErrorCode.InternalError, `Transfer ${this.id} has been disposed`);
+    }
+    this.state = 'running';
+    try {
+      if (this.direction === 'download') {
+        await this.runDownload();
+      } else {
+        await this.runUpload();
+      }
+    } catch (error: any) {
+      if (!this.cancelled) this.finish('failed', errorMessage(error));
+    }
+  }
+
+  getInfo(): TransferInfo {
+    const percent = this.totalBytes && this.totalBytes > 0
+      ? Math.min(100, Math.round((this.transferredBytes / this.totalBytes) * 100))
+      : null;
+    const download = this.direction === 'download';
+    return {
+      id: this.id,
+      mode: 'single',
+      kind: this.direction,
+      state: this.state,
+      sourceHost: download ? this.hostId : 'local',
+      sourcePath: download ? this.remotePath : this.localPath,
+      targetHost: download ? 'local' : this.hostId,
+      targetPath: download ? this.localPath : this.remotePath,
+      totalBytes: this.totalBytes,
+      transferredBytes: this.transferredBytes,
+      percent,
+      error: this.error,
+      createdAt: this.createdAt,
+      finishedAt: this.finishedAt,
+    };
+  }
+
+  async cancel(): Promise<void> {
+    if (this.state === 'completed' || this.state === 'failed' || this.state === 'cancelled') {
+      throw new McpError(ErrorCode.InvalidParams, `Transfer ${this.id} is already ${this.state}`);
+    }
+    this.cancelled = true;
+    for (const stream of this.streams) (stream as any).destroy();
+    this.finish('cancelled', null);
+  }
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    for (const stream of this.streams) (stream as any).destroy();
+    this.conns.sftp.end();
+    this.conns.conn.end();
+    for (const jumpConn of this.conns.jumpConns) jumpConn.end();
+    this.streams = [];
+    this.conns = null as any;
+  }
+
+  private complete(): void {
+    if (this.cancelled) return;
+    this.finish('completed', null);
+  }
+
+  private markFailed(message: string): void {
+    if (this.state === 'completed' || this.state === 'failed' || this.state === 'cancelled') {
+      return;
+    }
+    this.finish('failed', message);
+  }
+
+  private finish(state: TransferState, error: string | null): void {
+    if (this.state === 'completed' || this.state === 'failed' || this.state === 'cancelled') {
+      return;
+    }
+    this.state = state;
+    this.error = error;
+    this.finishedAt = Date.now();
+    this.dispose();
+  }
+
+  private async runDownload(): Promise<void> {
+    this.transferredBytes = 0;
+    this.totalBytes = null;
+    const stats = await sftpStat(this.conns.sftp, this.remotePath);
+    if (this.disposed || this.cancelled) {
+      throw new Error('transfer cancelled');
+    }
+    if (stats.isDirectory()) {
+      throw new Error('download supports single files only; remote source is a directory');
+    }
+    this.totalBytes = stats.size;
+    let partSize: number | null = null;
+    try {
+      const partStats = await stat(this.partPath);
+      partSize = partStats.size;
+    } catch {
+      partSize = null;
+    }
+    const offset = resolveResumeOffset(partSize, stats.size);
+    if (partSize !== null && partSize > stats.size) {
+      await rm(this.partPath, { force: true });
+      partSize = null;
+    }
+    if (offset === stats.size && partSize === null && stats.size === 0) {
+      await writeFile(this.partPath, '');
+    }
+    this.transferredBytes = offset;
+    if (offset < stats.size) {
+      const read = this.conns.sftp.createReadStream(this.remotePath, { start: offset });
+      const write = createWriteStream(this.partPath, { flags: offset > 0 ? 'a' : 'w' });
+      this.streams = [read, write];
+      if (this.cancelled || this.disposed) {
+        read.destroy();
+        write.destroy();
+        throw new Error('transfer cancelled');
+      }
+      read.on('data', (chunk: Buffer) => {
+        this.transferredBytes += chunk.length;
+      });
+      read.pipe(write);
+      await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const once = (fn: (...args: any[]) => void) => (...args: any[]) => { if (!settled) { settled = true; fn(...args); } };
+        write.on('finish', once(resolve));
+        write.on('close', once(resolve));
+        read.on('error', once((error: Error) => reject(error)));
+        write.on('error', once((error: Error) => reject(error)));
+      });
+    }
+    if (this.disposed || this.cancelled) {
+      throw new Error('transfer cancelled');
+    }
+    const partStats = await stat(this.partPath);
+    if (partStats.size !== stats.size) {
+      throw new Error(`size mismatch: expected ${stats.size}, got ${partStats.size}`);
+    }
+    const partHash = await sha256File(this.partPath);
+    const remoteHash = await sha256Remote(this.conns.sftp, this.remotePath);
+    if (partHash !== remoteHash) {
+      throw new Error(`sha256 mismatch: expected ${remoteHash}, got ${partHash}`);
+    }
+    await rename(this.partPath, this.localPath);
+    this.complete();
+  }
+
+  private async runUpload(): Promise<void> {
+    this.transferredBytes = 0;
+    this.totalBytes = null;
+    const localStats = await stat(this.localPath);
+    if (this.disposed || this.cancelled) {
+      throw new Error('transfer cancelled');
+    }
+    if (!localStats.isFile()) {
+      throw new Error('upload source is not a file');
+    }
+    this.totalBytes = localStats.size;
+    await ensureRemoteParentDirectory(this.conns.sftp, this.remotePath);
+    if (this.disposed || this.cancelled) {
+      throw new Error('transfer cancelled');
+    }
+    let partSize: number | null = null;
+    try {
+      const partStats = await sftpStat(this.conns.sftp, this.partPath);
+      partSize = partStats.size;
+    } catch {
+      partSize = null;
+    }
+    const offset = resolveResumeOffset(partSize, localStats.size);
+    if (partSize !== null && partSize > localStats.size) {
+      await this.removeRemotePart();
+    }
+    this.transferredBytes = offset;
+    await this.uploadWithOffset(this.localPath, this.partPath, offset);
+    if (this.disposed || this.cancelled) {
+      throw new Error('transfer cancelled');
+    }
+    const remoteStats = await sftpStat(this.conns.sftp, this.partPath);
+    if (remoteStats.size !== localStats.size) {
+      throw new Error(`size mismatch: expected ${localStats.size}, got ${remoteStats.size}`);
+    }
+    const localHash = await sha256File(this.localPath);
+    const remoteHash = await sha256Remote(this.conns.sftp, this.partPath);
+    if (localHash !== remoteHash) {
+      throw new Error(`sha256 mismatch: expected ${localHash}, got ${remoteHash}`);
+    }
+    await sftpRename(this.conns.sftp, this.partPath, this.remotePath);
+    this.complete();
+  }
+
+  private async uploadWithOffset(localPath: string, remotePartPath: string, offset: number): Promise<void> {
+    const handle = await new Promise<Buffer>((resolve, reject) => {
+      this.conns.sftp.open(remotePartPath, offset > 0 ? 'a' : 'w', (err, h) => err ? reject(err) : resolve(h));
+    });
+    try {
+      const localRead = createReadStream(localPath, { start: offset });
+      this.streams = [localRead];
+      localRead.on('data', (chunk: string | Buffer) => {
+        this.transferredBytes += chunk.length;
+      });
+      let position = offset;
+      let streamEnded = false;
+      let pendingWrites = 0;
+      let writeError: Error | null = null;
+      await new Promise<void>((resolve, reject) => {
+        const maybeResolve = () => {
+          if (streamEnded && pendingWrites === 0 && !writeError) {
+            resolve();
+          }
+        };
+        localRead.on('error', (err: Error) => {
+          writeError = err;
+          reject(err);
+        });
+        localRead.on('close', () => {
+          streamEnded = true;
+          if (writeError) return;
+          maybeResolve();
+        });
+        localRead.on('end', () => {
+          streamEnded = true;
+          if (writeError) return;
+          maybeResolve();
+        });
+        const MAX_INFLIGHT = 64;
+        localRead.on('data', (chunk: string | Buffer) => {
+          const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          pendingWrites += 1;
+          this.conns.sftp.write(handle, buf, 0, buf.length, position, (err) => {
+            pendingWrites -= 1;
+            if (err) {
+              writeError = err;
+              localRead.destroy();
+              reject(err);
+              return;
+            }
+            if (pendingWrites < MAX_INFLIGHT) {
+              localRead.resume();
+            }
+            maybeResolve();
+          });
+          position += buf.length;
+          if (pendingWrites >= MAX_INFLIGHT) {
+            localRead.pause();
+          }
+        });
+      });
+    } finally {
+      if (this.conns) {
+        await new Promise<void>((resolve) => this.conns.sftp.close(handle, () => resolve()));
+      }
+    }
+  }
+
+  private async removeRemotePart(): Promise<void> {
+    await new Promise<void>((resolve) => {
+      this.conns.sftp.unlink(this.partPath, () => resolve());
+    });
   }
 }
 
