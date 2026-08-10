@@ -11,7 +11,7 @@ import { readFile, writeFile, mkdir, stat } from 'fs/promises';
 import { createReadStream, createWriteStream } from 'fs';
 import { posix as posixPath, resolve as resolvePath } from 'path';
 import os from 'os';
-import { randomUUID } from 'crypto';
+import { randomUUID, createHash } from 'crypto';
 import net from 'net';
 import type { Duplex } from 'stream';
 
@@ -657,6 +657,27 @@ export type TransferInfo = {
   createdAt: number;
   finishedAt: number | null;
 };
+
+export function partPathFor(targetPath: string): string {
+  return `${targetPath}.part`;
+}
+
+export function resolveResumeOffset(partSize: number | null, sourceSize: number): number {
+  if (partSize === null || partSize > sourceSize) {
+    return 0;
+  }
+  return partSize;
+}
+
+export function sha256File(path: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = createHash('sha256');
+    const stream = createReadStream(path);
+    stream.on('data', (chunk: Buffer | string) => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+    stream.on('error', reject);
+  });
+}
 
 export function validateTransferParams(params: {
   sourceHost: string;
