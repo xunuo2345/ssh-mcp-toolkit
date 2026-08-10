@@ -2593,22 +2593,49 @@ export class FileTransfer {
         this.transferredBytes += chunk.length;
       });
       let position = offset;
+      let streamEnded = false;
+      let pendingWrites = 0;
+      let writeError: Error | null = null;
       await new Promise<void>((resolve, reject) => {
-        localRead.on('error', reject);
-        localRead.on('end', resolve);
+        const maybeResolve = () => {
+          if (streamEnded && pendingWrites === 0 && !writeError) {
+            resolve();
+          }
+        };
+        localRead.on('error', (err: Error) => {
+          writeError = err;
+          reject(err);
+        });
+        localRead.on('close', () => {
+          streamEnded = true;
+          if (writeError) return;
+          maybeResolve();
+        });
+        localRead.on('end', () => {
+          streamEnded = true;
+          if (writeError) return;
+          maybeResolve();
+        });
         localRead.on('data', (chunk: string | Buffer) => {
           const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          pendingWrites += 1;
           this.conns.sftp.write(handle, buf, 0, buf.length, position, (err) => {
+            pendingWrites -= 1;
             if (err) {
+              writeError = err;
               localRead.destroy();
               reject(err);
+              return;
             }
+            maybeResolve();
           });
           position += buf.length;
         });
       });
     } finally {
-      await new Promise<void>((resolve) => this.conns.sftp.close(handle, () => resolve()));
+      if (this.conns) {
+        await new Promise<void>((resolve) => this.conns.sftp.close(handle, () => resolve()));
+      }
     }
   }
 

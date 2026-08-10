@@ -150,7 +150,7 @@ describe('FileTransfer download resume', () => {
 });
 
 describe('FileTransfer upload resume', () => {
-  function makeRemoteSftpForResume(initial?: Buffer, corruptRead = false) {
+  function makeRemoteSftpForResume(initial?: Buffer, corruptRead = false, writeError?: string) {
     const calls = {
       open: [] as Array<{ path: string; flags: string }>,
       write: [] as Array<{ position: number; len: number }>,
@@ -171,6 +171,10 @@ describe('FileTransfer upload resume', () => {
       },
       write(handle: Buffer, buf: Buffer, offset: number, length: number, position: number, cb: (error: Error | null) => void) {
         calls.write.push({ position, len: length });
+        if (writeError) {
+          setTimeout(() => cb(new Error(writeError)), 5);
+          return;
+        }
         const endPos = position + length;
         if (endPos > remoteContent.length) {
           const grown = Buffer.alloc(endPos);
@@ -236,6 +240,39 @@ describe('FileTransfer upload resume', () => {
     await transfer.start();
     expect(transfer.getInfo().state).toBe('failed');
     expect(remote.calls.rename).toEqual([]);
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('upload cancelled mid-transfer settles start() without hanging', async () => {
+    const { FileTransfer } = await import('../src/index.js');
+    const dir = await mkdtemp(join(tmpdir(), 'resume-up3-'));
+    const local = join(dir, 'big.bin');
+    await writeFile(local, Buffer.alloc(32 * 1024 * 1024, 0x61));
+    const remote = makeRemoteSftpForResume();
+    const transfer = new FileTransfer('u3', 'A', local, '/remote/dst.bin', 'upload',
+      { conn: { end() {} } as any, jumpConns: [], sftp: remote.sftp as any });
+    const startPromise = transfer.start();
+    await new Promise((r) => setTimeout(r, 5));
+    await transfer.cancel();
+    await Promise.race([
+      startPromise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('start() hung after cancel')), 2000)),
+    ]);
+    expect(transfer.getInfo().state).toBe('cancelled');
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('upload surfaces a last-chunk write error as failed instead of size mismatch', async () => {
+    const { FileTransfer } = await import('../src/index.js');
+    const dir = await mkdtemp(join(tmpdir(), 'resume-up4-'));
+    const local = join(dir, 'src.bin');
+    await writeFile(local, Buffer.from('tiny single-chunk source'));
+    const remote = makeRemoteSftpForResume(undefined, false, 'injected write failure');
+    const transfer = new FileTransfer('u4', 'A', local, '/remote/dst.bin', 'upload',
+      { conn: { end() {} } as any, jumpConns: [], sftp: remote.sftp as any });
+    await transfer.start();
+    expect(transfer.getInfo().state).toBe('failed');
+    expect(transfer.getInfo().error).toContain('injected write failure');
     await rm(dir, { recursive: true, force: true });
   });
 });
