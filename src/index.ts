@@ -1154,6 +1154,48 @@ server.tool(
 );
 
 server.tool(
+  "session-output",
+  "Read incremental output from an SSH session's shell (e.g. a bastion host's interactive login menu). Returns the output from the given character offset plus the next offset to continue from. Unlike exec-logs, this works on the session itself, not a background run — use it to read a login-time menu that start-session already produced.",
+  {
+    session_id: z.string().describe("Identifier of the session"),
+    offset: z.number().int().min(0).default(0).describe("Character offset into the session output to read from (default 0)"),
+  },
+  async ({ session_id, offset }) => {
+    const session = activeSessions.get(session_id);
+    if (!session) {
+      throw new McpError(ErrorCode.InvalidParams, `Session '${session_id}' does not exist`);
+    }
+    return {
+      content: [{ type: 'text', text: JSON.stringify(formatSessionOutput(session.readSessionOutput(offset), offset), null, 2) }],
+    };
+  }
+);
+
+server.tool(
+  "session-input",
+  "Write input to an SSH session's shell (e.g. selecting an option in a bastion host's login menu) and return the incremental output it triggers. Unlike exec-input, this works on the session itself — use it to drive a login-time menu without starting a background run. Pass the returned nextOffset as the next offset to step through the menu.",
+  {
+    session_id: z.string().describe("Identifier of the session"),
+    text: z.string().describe("Input to write to the session's shell stdin (include a newline/return as needed, e.g. '1\\n')"),
+    offset: z.number().int().min(0).default(0).describe("Character offset into the session output to return from (default 0)"),
+    wait_ms: z.number().int().min(0).max(30000).default(400).describe("Milliseconds to wait for output produced by this input (default 400)"),
+  },
+  async ({ session_id, text, offset, wait_ms }) => {
+    const session = activeSessions.get(session_id);
+    if (!session) {
+      throw new McpError(ErrorCode.InvalidParams, `Session '${session_id}' does not exist`);
+    }
+    session.writeInput(text);
+    if (wait_ms > 0) {
+      await new Promise((resolve) => setTimeout(resolve, wait_ms));
+    }
+    return {
+      content: [{ type: 'text', text: JSON.stringify(formatSessionOutput(session.readSessionOutput(offset), offset), null, 2) }],
+    };
+  }
+);
+
+server.tool(
   "list-sessions",
   "List all active SSH sessions with metadata.",
   {},
@@ -1729,6 +1771,14 @@ export function formatExecLogs(run: ExecRun, offset: number): Record<string, unk
 
 export function formatExecInputResult(run: ExecRun, offset: number): Record<string, unknown> {
   return formatExecLogs(run, offset);
+}
+
+export function formatSessionOutput(output: string, offset: number): Record<string, unknown> {
+  const safeOffset = Number.isFinite(offset) && offset > 0 ? Math.floor(offset) : 0;
+  return {
+    output: output.slice(safeOffset),
+    nextOffset: output.length,
+  };
 }
 
 /**

@@ -51,3 +51,19 @@ describe('PersistentSession session-level output buffer', () => {
     expect(session.sessionOutputLength).toBeGreaterThan(1024 * 1024 - 64 * 1024);
   });
 });
+
+describe('session output formatting', () => {
+  it('formats output slice and nextOffset', async () => {
+    const { formatSessionOutput } = await import('../src/index.js');
+    const r = formatSessionOutput('MENU> [1] asset\n', 6);
+    expect(r.output).toBe('[1] asset\n');
+    expect(r.nextOffset).toBe(16);
+  });
+
+  it('clamps a negative offset to zero', async () => {
+    const { formatSessionOutput } = await import('../src/index.js');
+    const r = formatSessionOutput('abc', -5);
+    expect(r.output).toBe('abc');
+    expect(r.nextOffset).toBe(3);
+  });
+});
