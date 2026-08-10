@@ -39,6 +39,35 @@ describe('PersistentSession session-level output buffer', () => {
     expect(() => session.writeInput('x')).toThrow(/SSH shell not ready/);
   });
 
+  it('onSessionData still routes to commandQueue.handleData in order', async () => {
+    const session = await makeSession();
+    const handled: string[] = [];
+    (session as any).shell = { write: () => {}, end: () => {}, removeAllListeners: () => {} };
+    (session as any).commandQueue = { handleData: (d: string) => handled.push(d), handleClose: () => {}, launch: () => {}, sendInput: () => {}, interrupt: () => {}, hasPending: false };
+    (session as any).onSessionData('chunk1');
+    (session as any).onSessionData('chunk2');
+    expect(handled).toEqual(['chunk1', 'chunk2']);
+  });
+
+  it('cleanup empties the session output buffer', async () => {
+    const session = await makeSession();
+    (session as any).shell = { write: () => {}, end: () => {}, removeAllListeners: () => {} };
+    (session as any).commandQueue = null;
+    (session as any).onSessionData('MENU> [1] asset\n');
+    expect(session.sessionOutputLength).toBeGreaterThan(0);
+    (session as any).cleanup();
+    expect(session.sessionOutputLength).toBe(0);
+  });
+
+  it('writeInput rejects when a command is pending in the queue', async () => {
+    const session = await makeSession();
+    const writes: string[] = [];
+    (session as any).shell = { write: (t: string) => writes.push(t), end: () => {} };
+    (session as any).commandQueue = { handleData: () => {}, handleClose: () => {}, launch: () => {}, sendInput: () => {}, interrupt: () => {}, hasPending: true };
+    expect(() => session.writeInput('1\n')).toThrow(/Another command is still running in this session/);
+    expect(writes).toEqual([]);
+  });
+
   it('bounds the session output buffer at 1MB, dropping the oldest part', async () => {
     const session = await makeSession();
     (session as any).shell = { write: () => {}, end: () => {} };

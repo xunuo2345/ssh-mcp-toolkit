@@ -1173,7 +1173,7 @@ server.tool(
 
 server.tool(
   "session-input",
-  "Write input to an SSH session's shell (e.g. selecting an option in a bastion host's login menu) and return the incremental output it triggers. Unlike exec-input, this works on the session itself — use it to drive a login-time menu without starting a background run. Pass the returned nextOffset as the next offset to step through the menu.",
+  "Write input to an SSH session's shell to drive a login-time menu (e.g. selecting an option in a bastion host's login menu) and return the incremental output it triggers. Unlike exec-input, this works on the session itself — use it only at the idle shell prompt. Do not use it while a background command (start-exec/exec) is running in this session: the session-input tool rejects that, because the text would be delivered to the running program or executed at the prompt. Pass the returned nextOffset as the next offset to step through the menu.",
   {
     session_id: z.string().describe("Identifier of the session"),
     text: z.string().describe("Input to write to the session's shell stdin (include a newline/return as needed, e.g. '1\\n')"),
@@ -1866,6 +1866,9 @@ export class PersistentSession {
   writeInput(text: string): void {
     if (!this.shell) {
       throw new McpError(ErrorCode.InternalError, 'SSH shell not ready');
+    }
+    if (this.commandQueue?.hasPending) {
+      throw new McpError(ErrorCode.InternalError, 'Another command is still running in this session');
     }
     this.shell.write(text);
     this.resetInactivityTimer();
