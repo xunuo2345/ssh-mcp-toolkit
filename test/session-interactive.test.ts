@@ -1,11 +1,11 @@
 import { describe, it, expect } from 'vitest';
 
-describe('PersistentSession session-level output buffer', () => {
-  async function makeSession() {
-    const { PersistentSession } = await import('../src/index.js');
-    return new PersistentSession('s1', { config: { host: 'h' } } as any);
-  }
+async function makeSession() {
+  const { PersistentSession } = await import('../src/index.js');
+  return new PersistentSession('s1', { config: { host: 'h' } } as any);
+}
 
+describe('PersistentSession session-level output buffer', () => {
   it('captures shell output even without a pending command', async () => {
     const session = await makeSession();
     (session as any).shell = { write: () => {}, end: () => {} };
@@ -53,17 +53,28 @@ describe('PersistentSession session-level output buffer', () => {
 });
 
 describe('session output formatting', () => {
-  it('formats output slice and absolute nextOffset', async () => {
+  it('slices raw output once and reports absolute nextOffset', async () => {
     const { formatSessionOutput } = await import('../src/index.js');
-    const r = formatSessionOutput('MENU> [1] asset\n', 6, 100);
-    expect(r.output).toBe('[1] asset\n');
-    expect(r.nextOffset).toBe(100); // absolute buffer length, not slice length
+    const r = formatSessionOutput('0123456789', 4);
+    expect(r.output).toBe('456789');
+    expect(r.nextOffset).toBe(10);
   });
 
   it('clamps a negative offset to zero', async () => {
     const { formatSessionOutput } = await import('../src/index.js');
-    const r = formatSessionOutput('abc', -5, 42);
+    const r = formatSessionOutput('abc', -5);
     expect(r.output).toBe('abc');
-    expect(r.nextOffset).toBe(42);
+    expect(r.nextOffset).toBe(3);
+  });
+
+  it('tool-level flow slices once: a large offset returns the trailing part, not empty', async () => {
+    const session = await makeSession();
+    (session as any).shell = { write: () => {}, end: () => {} };
+    (session as any).commandQueue = null;
+    (session as any).onSessionData('a'.repeat(150));
+    const { formatSessionOutput } = await import('../src/index.js');
+    const r = formatSessionOutput(session.getSessionOutput(), 100);
+    expect(r.output).toBe('a'.repeat(50));
+    expect(r.nextOffset).toBe(150);
   });
 });

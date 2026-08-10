@@ -1166,7 +1166,7 @@ server.tool(
       throw new McpError(ErrorCode.InvalidParams, `Session '${session_id}' does not exist`);
     }
     return {
-      content: [{ type: 'text', text: JSON.stringify(formatSessionOutput(session.readSessionOutput(offset), offset, session.sessionOutputLength), null, 2) }],
+      content: [{ type: 'text', text: JSON.stringify(formatSessionOutput(session.getSessionOutput(), offset), null, 2) }],
     };
   }
 );
@@ -1190,7 +1190,7 @@ server.tool(
       await new Promise((resolve) => setTimeout(resolve, wait_ms));
     }
     return {
-      content: [{ type: 'text', text: JSON.stringify(formatSessionOutput(session.readSessionOutput(offset), offset, session.sessionOutputLength), null, 2) }],
+      content: [{ type: 'text', text: JSON.stringify(formatSessionOutput(session.getSessionOutput(), offset), null, 2) }],
     };
   }
 );
@@ -1773,11 +1773,11 @@ export function formatExecInputResult(run: ExecRun, offset: number): Record<stri
   return formatExecLogs(run, offset);
 }
 
-export function formatSessionOutput(output: string, offset: number, absoluteLength: number): Record<string, unknown> {
+export function formatSessionOutput(rawOutput: string, offset: number): Record<string, unknown> {
   const safeOffset = Number.isFinite(offset) && offset > 0 ? Math.floor(offset) : 0;
   return {
-    output: output.slice(safeOffset),
-    nextOffset: absoluteLength,
+    output: rawOutput.slice(safeOffset),
+    nextOffset: rawOutput.length,
   };
 }
 
@@ -1853,6 +1853,10 @@ export class PersistentSession {
 
   get sessionOutputLength(): number {
     return this.sessionOutput.length;
+  }
+
+  getSessionOutput(): string {
+    return this.sessionOutput;
   }
 
   readSessionOutput(offset: number): string {
