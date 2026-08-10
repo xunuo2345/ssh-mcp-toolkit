@@ -7,7 +7,7 @@ import SSH2Module from 'ssh2';
 const { Client: SSHClient, utils: sshUtils } = SSH2Module as typeof import('ssh2');
 import { z } from 'zod';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { readFile, writeFile, mkdir, stat, rename, rm } from 'fs/promises';
+import { readFile, writeFile, mkdir, stat, rename, rm, open } from 'fs/promises';
 import { createReadStream, createWriteStream } from 'fs';
 import { posix as posixPath, resolve as resolvePath } from 'path';
 import os from 'os';
@@ -2884,6 +2884,8 @@ export class FileTransfer {
   private disposed = false;
   private streams: Array<NodeJS.ReadableStream | NodeJS.WritableStream> = [];
   private partPath: string;
+  private readonly chunkThreads: number;
+  private readonly chunkSize: number;
 
   constructor(
     private readonly id: string,
@@ -2892,7 +2894,10 @@ export class FileTransfer {
     private readonly remotePath: string,
     private readonly direction: 'download' | 'upload',
     private conns: { conn: InstanceType<typeof SSHClient>; jumpConns: InstanceType<typeof SSHClient>[]; sftp: SFTPWrapper },
+    options?: { chunkThreads?: number; chunkSize?: number },
   ) {
+    this.chunkThreads = Math.max(1, Math.floor(options?.chunkThreads ?? 4));
+    this.chunkSize = options?.chunkSize ?? 8 * 1024 * 1024;
     this.partPath = direction === 'download'
       ? partPathFor(localPath)
       : partPathFor(remotePath);
@@ -3014,26 +3019,24 @@ export class FileTransfer {
     }
     this.transferredBytes = offset;
     if (offset < stats.size) {
-      const read = this.conns.sftp.createReadStream(this.remotePath, { start: offset });
-      const write = createWriteStream(this.partPath, { flags: offset > 0 ? 'a' : 'w' });
-      this.streams = [read, write];
-      if (this.cancelled || this.disposed) {
-        read.destroy();
-        write.destroy();
-        throw new Error('transfer cancelled');
+      const segs = chunkSegments(stats.size, offset, this.chunkSize, this.chunkThreads);
+      if (offset === 0 && segs.length > 1) {
+        await this.downloadChunks(segs);
+      } else {
+        const read = this.conns.sftp.createReadStream(this.remotePath, { start: offset });
+        const write = createWriteStream(this.partPath, { flags: offset > 0 ? 'a' : 'w' });
+        this.streams = [read, write];
+        if (this.cancelled || this.disposed) {
+          read.destroy();
+          write.destroy();
+          throw new Error('transfer cancelled');
+        }
+        read.on('data', (chunk: Buffer) => {
+          this.transferredBytes += chunk.length;
+        });
+        read.pipe(write);
+        await this.awaitStreams(read, write);
       }
-      read.on('data', (chunk: Buffer) => {
-        this.transferredBytes += chunk.length;
-      });
-      read.pipe(write);
-      await new Promise<void>((resolve, reject) => {
-        let settled = false;
-        const once = (fn: (...args: any[]) => void) => (...args: any[]) => { if (!settled) { settled = true; fn(...args); } };
-        write.on('finish', once(resolve));
-        write.on('close', once(resolve));
-        read.on('error', once((error: Error) => reject(error)));
-        write.on('error', once((error: Error) => reject(error)));
-      });
     }
     if (this.disposed || this.cancelled) {
       throw new Error('transfer cancelled');
@@ -3078,7 +3081,12 @@ export class FileTransfer {
       await this.removeRemotePart();
     }
     this.transferredBytes = offset;
-    await this.uploadWithOffset(this.localPath, this.partPath, offset);
+    const segs = chunkSegments(localStats.size, offset, this.chunkSize, this.chunkThreads);
+    if (offset === 0 && segs.length > 1) {
+      await this.uploadChunks(segs);
+    } else {
+      await this.uploadWithOffset(this.localPath, this.partPath, offset);
+    }
     if (this.disposed || this.cancelled) {
       throw new Error('transfer cancelled');
     }
@@ -3152,6 +3160,145 @@ export class FileTransfer {
           }
         });
       });
+    } finally {
+      if (this.conns) {
+        await new Promise<void>((resolve) => this.conns.sftp.close(handle, () => resolve()));
+      }
+    }
+  }
+
+  private awaitStreams(read: NodeJS.ReadableStream, write: NodeJS.WritableStream): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const once = (fn: (...args: any[]) => void) => (...args: any[]) => { if (!settled) { settled = true; fn(...args); } };
+      (write as any).on('finish', once(resolve));
+      (write as any).on('close', once(resolve));
+      (read as any).on('error', once((error: Error) => reject(error)));
+      (write as any).on('error', once((error: Error) => reject(error)));
+    });
+  }
+
+  private async downloadChunks(segs: Array<{ start: number; end: number }>): Promise<void> {
+    const fd = await open(this.partPath, 'w');
+    try {
+      await Promise.all(segs.map(async (seg) => {
+        const read = this.conns.sftp.createReadStream(this.remotePath, { start: seg.start, end: seg.end });
+        this.streams.push(read);
+        let position = seg.start;
+        let streamEnded = false;
+        let pendingWrites = 0;
+        let writeError: Error | null = null;
+        const MAX_INFLIGHT = 64;
+        await new Promise<void>((resolve, reject) => {
+          const maybeResolve = () => {
+            if (streamEnded && pendingWrites === 0 && !writeError) {
+              resolve();
+            }
+          };
+          read.on('error', (err: Error) => {
+            writeError = err;
+            reject(err);
+          });
+          read.on('close', () => {
+            streamEnded = true;
+            if (writeError) return;
+            maybeResolve();
+          });
+          read.on('end', () => {
+            streamEnded = true;
+            if (writeError) return;
+            maybeResolve();
+          });
+          read.on('data', (chunk: string | Buffer) => {
+            const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+            pendingWrites += 1;
+            this.transferredBytes += buf.length;
+            const pos = position;
+            position += buf.length;
+            void fd.write(buf, 0, buf.length, pos).then(
+              () => {
+                pendingWrites -= 1;
+                if (pendingWrites < MAX_INFLIGHT) {
+                  read.resume();
+                }
+                maybeResolve();
+              },
+              (err: Error) => {
+                pendingWrites -= 1;
+                writeError = err;
+                read.destroy();
+                reject(err);
+              },
+            );
+            if (pendingWrites >= MAX_INFLIGHT) {
+              read.pause();
+            }
+          });
+        });
+      }));
+    } finally {
+      await fd.close();
+    }
+  }
+
+  private async uploadChunks(segs: Array<{ start: number; end: number }>): Promise<void> {
+    const handle = await new Promise<Buffer>((resolve, reject) => {
+      this.conns.sftp.open(this.partPath, 'w', (err, h) => err ? reject(err) : resolve(h));
+    });
+    try {
+      await Promise.all(segs.map(async (seg) => {
+        const localRead = createReadStream(this.localPath, { start: seg.start, end: seg.end });
+        this.streams.push(localRead);
+        let position = seg.start;
+        let streamEnded = false;
+        let pendingWrites = 0;
+        let writeError: Error | null = null;
+        const MAX_INFLIGHT = 64;
+        await new Promise<void>((resolve, reject) => {
+          const maybeResolve = () => {
+            if (streamEnded && pendingWrites === 0 && !writeError) {
+              resolve();
+            }
+          };
+          localRead.on('error', (err: Error) => {
+            writeError = err;
+            reject(err);
+          });
+          localRead.on('close', () => {
+            streamEnded = true;
+            if (writeError) return;
+            maybeResolve();
+          });
+          localRead.on('end', () => {
+            streamEnded = true;
+            if (writeError) return;
+            maybeResolve();
+          });
+          localRead.on('data', (chunk: string | Buffer) => {
+            const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+            pendingWrites += 1;
+            this.transferredBytes += buf.length;
+            const pos = position;
+            position += buf.length;
+            this.conns.sftp.write(handle, buf, 0, buf.length, pos, (err) => {
+              pendingWrites -= 1;
+              if (err) {
+                writeError = err;
+                localRead.destroy();
+                reject(err);
+                return;
+              }
+              if (pendingWrites < MAX_INFLIGHT) {
+                localRead.resume();
+              }
+              maybeResolve();
+            });
+            if (pendingWrites >= MAX_INFLIGHT) {
+              localRead.pause();
+            }
+          });
+        });
+      }));
     } finally {
       if (this.conns) {
         await new Promise<void>((resolve) => this.conns.sftp.close(handle, () => resolve()));

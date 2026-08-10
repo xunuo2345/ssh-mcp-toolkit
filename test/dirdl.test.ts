@@ -150,3 +150,39 @@ describe('DirectoryTransfer concurrency', () => {
     expect(maxActive).toBeGreaterThanOrEqual(2); // concurrency genuinely engages
   });
 });
+
+describe('FileTransfer chunked download', () => {
+  it('chunks a large file into range reads', async () => {
+    const { FileTransfer, partPathFor } = await import('../src/index.js');
+    const { mkdtemp, writeFile, readFile, rm } = await import('fs/promises');
+    const { join } = await import('path');
+    const { tmpdir } = await import('os');
+    const dir = await mkdtemp(join(tmpdir(), 'chunk-dl-'));
+    const local = join(dir, 'big.bin');
+    const full = Buffer.alloc(100, 0x42);
+    const starts: number[] = [];
+    const sftp = {
+      stat(p: string, cb: (e: Error | null, s?: any) => void) { cb(null, { size: full.length, isDirectory: () => false }); },
+      createReadStream(p: string, opts?: any) {
+        starts.push(opts?.start ?? 0);
+        const { Readable } = require('stream');
+        const r = new Readable();
+        r._read = () => {};
+        r.push(full.subarray(opts?.start ?? 0, opts?.end ?? full.length));
+        r.push(null);
+        return r;
+      },
+      rename(f: string, t: string, cb: (e: Error | null) => void) { cb(null); },
+      end() {},
+    };
+    const ft = new FileTransfer('x1', 'A', local, '/remote/big.bin', 'download',
+      { conn: { end() {} } as any, jumpConns: [], sftp: sftp as any },
+      { chunkThreads: 4, chunkSize: 50 });
+    await ft.start();
+    expect(starts.length).toBeGreaterThan(1); // chunked into multiple range reads
+    expect(new Set(starts).size).toBeGreaterThan(1); // distinct range starts prove parallel segments
+    const finalContent = await readFile(local);
+    expect(finalContent.length).toBe(100);
+    await rm(dir, { recursive: true, force: true });
+  });
+});
