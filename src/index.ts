@@ -1779,6 +1779,7 @@ export class PersistentSession {
   private disposed = false;
   private readonly createdAt = Date.now();
   private lastCommand: string | null = null;
+  private sessionOutput = '';
 
   constructor(
     private readonly id: string,
@@ -1798,6 +1799,30 @@ export class PersistentSession {
       lastCommand: this.lastCommand,
       disposed: this.disposed,
     };
+  }
+
+  get sessionOutputLength(): number {
+    return this.sessionOutput.length;
+  }
+
+  readSessionOutput(offset: number): string {
+    return this.sessionOutput.slice(offset);
+  }
+
+  writeInput(text: string): void {
+    if (!this.shell) {
+      throw new McpError(ErrorCode.InternalError, 'SSH shell not ready');
+    }
+    this.shell.write(text);
+    this.resetInactivityTimer();
+  }
+
+  private onSessionData(data: string): void {
+    this.sessionOutput += data;
+    if (this.sessionOutput.length > 1024 * 1024) {
+      this.sessionOutput = this.sessionOutput.slice(this.sessionOutput.length - 1024 * 1024);
+    }
+    this.commandQueue?.handleData(data);
   }
 
   async ensureConnected(): Promise<void> {
@@ -1841,14 +1866,14 @@ export class PersistentSession {
         stream.setEncoding('utf8');
         this.commandQueue = new ShellCommandQueue(stream);
         stream.on('data', (data: string) => {
-          this.commandQueue?.handleData(data);
+          this.onSessionData(data);
         });
         stream.on('close', () => {
           this.commandQueue?.handleClose();
           this.cleanup();
         });
         stream.stderr?.on('data', (data: string) => {
-          this.commandQueue?.handleData(data);
+          this.onSessionData(data);
         });
 
         stream.write('export PS1=""\n');
@@ -1942,6 +1967,7 @@ export class PersistentSession {
       this.shell = null;
     }
     this.commandQueue = null;
+    this.sessionOutput = '';
 
     if (this.conn) {
       this.conn.removeAllListeners();
