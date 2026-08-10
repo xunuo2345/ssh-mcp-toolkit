@@ -54,3 +54,53 @@ describe('dir helpers', () => {
     expect(segs[segs.length - 1].end).toBe(31);
   });
 });
+
+describe('DirectoryTransfer listing', () => {
+  function makeDirSftp(tree: Record<string, { size: number; dir?: boolean }>) {
+    const entries: Record<string, Array<{ filename: string; attrs: { size: number; isDirectory: () => boolean } }>> = {};
+    for (const [path, info] of Object.entries(tree)) {
+      const parent = path.slice(0, path.lastIndexOf('/'));
+      const name = path.slice(path.lastIndexOf('/') + 1);
+      if (info.dir) {
+        (entries[parent] ??= []).push({ filename: name, attrs: { size: 0, isDirectory: () => true } });
+      } else {
+        (entries[parent] ??= []).push({ filename: name, attrs: { size: info.size, isDirectory: () => false } });
+      }
+    }
+    const sftp = {
+      opendir(path: string, cb: (err: Error | null, handle?: Buffer) => void) { cb(null, Buffer.from(path)); },
+      readdir(handle: Buffer, cb: (err: Error | null, list?: any[]) => void) {
+        const key = handle.toString();
+        const list = entries[key] ?? [];
+        if (list.length === 0) { cb(null, []); }
+        else { cb(null, list); }
+      },
+      stat(path: string, cb: (err: Error | null, stats?: any) => void) {
+        const info = tree[path];
+        if (info) cb(null, { size: info.size, isDirectory: () => !!info.dir });
+        else cb(new Error('ENOENT') as any);
+      },
+      end() {},
+    };
+    return sftp;
+  }
+
+  it('lists all files recursively with relative paths', async () => {
+    const { DirectoryTransfer } = await import('../src/index.js');
+    const tree = {
+      '/data': { size: 0, dir: true },
+      '/data/a.bin': { size: 100 },
+      '/data/sub': { size: 0, dir: true },
+      '/data/sub/b.bin': { size: 200 },
+    };
+    const sftp = makeDirSftp(tree);
+    const t = new DirectoryTransfer('d1', 'A', '/data', '/local/data', 'download-dir',
+      { conn: { end() {} } as any, jumpConns: [], sftp: sftp as any });
+    (t as any).conns = { conn: { end() {} }, jumpConns: [], sftp };
+    const listing = await (t as any).listFiles('/data');
+    expect(listing).toEqual([
+      { relPath: 'a.bin', size: 100 },
+      { relPath: 'sub/b.bin', size: 200 },
+    ]);
+  });
+});

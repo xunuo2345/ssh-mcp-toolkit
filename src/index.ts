@@ -650,7 +650,7 @@ export type TransferState = 'pending' | 'running' | 'completed' | 'failed' | 'ca
 export type TransferInfo = {
   id: string;
   mode: 'direct' | 'stream' | 'hybrid' | 'single';
-  kind: 'server' | 'download' | 'upload';
+  kind: 'server' | 'download' | 'upload' | 'download-dir' | 'upload-dir';
   state: TransferState;
   sourceHost: string;
   sourcePath: string;
@@ -662,6 +662,8 @@ export type TransferInfo = {
   error: string | null;
   createdAt: number;
   finishedAt: number | null;
+  filesDone?: number;
+  filesTotal?: number;
 };
 
 export type ExecRun = {
@@ -3161,6 +3163,211 @@ export class FileTransfer {
     await new Promise<void>((resolve) => {
       this.conns.sftp.unlink(this.partPath, () => resolve());
     });
+  }
+}
+
+export class DirectoryTransfer {
+  private state: TransferState = 'pending';
+  private transferredBytes = 0;
+  private totalBytes: number | null = null;
+  private filesDone = 0;
+  private filesTotal = 0;
+  private error: string | null = null;
+  private readonly createdAt = Date.now();
+  private finishedAt: number | null = null;
+  private cancelled = false;
+  private disposed = false;
+
+  constructor(
+    private readonly id: string,
+    private readonly hostId: string,
+    private readonly sourcePath: string,
+    private readonly targetPath: string,
+    private readonly direction: 'download-dir' | 'upload-dir',
+    private conns: { conn: InstanceType<typeof SSHClient>; jumpConns: InstanceType<typeof SSHClient>[]; sftp: SFTPWrapper },
+  ) {
+    conns.conn.once?.('error', (error: Error) => this.markFailed(error.message));
+    conns.conn.once?.('end', () => this.markFailed('SSH connection ended'));
+    conns.conn.once?.('close', () => this.markFailed('SSH connection closed'));
+    for (const jumpConn of conns.jumpConns) {
+      jumpConn.once?.('error', (error: Error) => this.markFailed(error.message));
+      jumpConn.once?.('end', () => this.markFailed('Jump connection ended'));
+    }
+  }
+
+  async start(): Promise<void> {
+    if (this.disposed) {
+      throw new McpError(ErrorCode.InternalError, `Transfer ${this.id} has been disposed`);
+    }
+    this.state = 'running';
+    try {
+      const entries = await this.listFiles(this.sourcePath);
+      const { filesTotal, totalBytes } = dirEntriesToTotal(entries);
+      this.filesTotal = filesTotal;
+      this.totalBytes = totalBytes;
+      let doneBytes = 0;
+      for (const entry of entries) {
+        if (this.disposed || this.cancelled) {
+          throw new Error('transfer cancelled');
+        }
+        const relPath = entry.relPath;
+        const source = this.direction === 'download-dir'
+          ? posixPath.join(this.sourcePath, relPath)
+          : posixPath.join(this.targetPath, relPath);
+        const target = this.direction === 'download-dir'
+          ? posixPath.join(this.targetPath, relPath)
+          : posixPath.join(this.sourcePath, relPath);
+        if (this.direction === 'download-dir') {
+          await ensureRemoteParentDirectory(this.conns.sftp, source);
+        }
+        const skipped = await this.maybeSkip(entry, source, target);
+        if (skipped) {
+          doneBytes += entry.size;
+          this.filesDone += 1;
+          this.transferredBytes = doneBytes;
+          continue;
+        }
+        const transferred = await this.transferOne(source, target, entry.size);
+        doneBytes += transferred;
+        this.filesDone += 1;
+        this.transferredBytes = doneBytes;
+      }
+      if (this.disposed || this.cancelled) {
+        throw new Error('transfer cancelled');
+      }
+      this.complete();
+    } catch (error: any) {
+      if (!this.cancelled) this.finish('failed', errorMessage(error));
+    }
+  }
+
+  private async listFiles(rootPath: string): Promise<DirEntry[]> {
+    const out: DirEntry[] = [];
+    const walk = async (dirPath: string, relDir: string) => {
+      const handle = await new Promise<Buffer>((resolve, reject) => {
+        this.conns.sftp.opendir(dirPath, (err, h) => err ? reject(err) : resolve(h));
+      });
+      let list: any[] = [];
+      while (true) {
+        const page = await new Promise<any[]>((resolve, reject) => {
+          this.conns.sftp.readdir(handle, (err, l) => err ? reject(err) : resolve(l ?? []));
+        });
+        if (page.length === 0) break;
+        list = list.concat(page);
+        if (page.length < 100) break;
+      }
+      for (const item of list) {
+        const name = item.filename;
+        if (name === '.' || name === '..') continue;
+        const relPath = relDir ? `${relDir}/${name}` : name;
+        if (item.attrs.isDirectory()) {
+          await walk(`${dirPath}/${name}`, relPath);
+        } else {
+          out.push({ relPath, size: item.attrs.size ?? 0 });
+        }
+      }
+    };
+    await walk(rootPath, '');
+    return out;
+  }
+
+  private async maybeSkip(entry: DirEntry, sourcePath: string, targetPath: string): Promise<boolean> {
+    if (this.direction === 'download-dir') {
+      try {
+        const localStats = await stat(targetPath);
+        const localHash = await sha256File(targetPath);
+        const remoteHash = await sha256Remote(this.conns.sftp, sourcePath);
+        return resolveDirSkip(entry, localStats.size, localHash, remoteHash);
+      } catch {
+        return false;
+      }
+    }
+    try {
+      const remoteStats = await sftpStat(this.conns.sftp, targetPath);
+      const localHash = await sha256File(sourcePath);
+      const remoteHash = await sha256Remote(this.conns.sftp, targetPath);
+      return resolveDirSkip(entry, remoteStats.size, localHash, remoteHash);
+    } catch {
+      return false;
+    }
+  }
+
+  private async transferOne(sourcePath: string, targetPath: string, size: number): Promise<number> {
+    const download = this.direction === 'download-dir';
+    const ft = new FileTransfer(
+      `sub-${this.id}`,
+      this.hostId,
+      download ? targetPath : sourcePath,
+      download ? sourcePath : targetPath,
+      download ? 'download' : 'upload',
+      this.conns as any,
+    );
+    await ft.start();
+    const info = ft.getInfo();
+    if (info.state !== 'completed') {
+      throw new Error(info.error ?? 'file transfer failed');
+    }
+    return size;
+  }
+
+  getInfo(): TransferInfo {
+    const percent = this.totalBytes && this.totalBytes > 0
+      ? Math.min(100, Math.round((this.transferredBytes / this.totalBytes) * 100))
+      : null;
+    const download = this.direction === 'download-dir';
+    return {
+      id: this.id,
+      mode: 'single',
+      kind: this.direction,
+      state: this.state,
+      sourceHost: download ? this.hostId : 'local',
+      sourcePath: download ? this.sourcePath : this.targetPath,
+      targetHost: download ? 'local' : this.hostId,
+      targetPath: download ? this.targetPath : this.sourcePath,
+      totalBytes: this.totalBytes,
+      transferredBytes: this.transferredBytes,
+      percent,
+      error: this.error,
+      createdAt: this.createdAt,
+      finishedAt: this.finishedAt,
+      filesDone: this.filesDone,
+      filesTotal: this.filesTotal,
+    };
+  }
+
+  async cancel(): Promise<void> {
+    if (this.state === 'completed' || this.state === 'failed' || this.state === 'cancelled') {
+      throw new McpError(ErrorCode.InvalidParams, `Transfer ${this.id} is already ${this.state}`);
+    }
+    this.cancelled = true;
+    this.finish('cancelled', null);
+  }
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.conns.sftp.end();
+    this.conns.conn.end();
+    for (const jumpConn of this.conns.jumpConns) jumpConn.end();
+    this.conns = null as any;
+  }
+
+  private complete(): void {
+    if (this.cancelled) return;
+    this.finish('completed', null);
+  }
+
+  private markFailed(message: string): void {
+    if (this.state === 'completed' || this.state === 'failed' || this.state === 'cancelled') return;
+    this.finish('failed', message);
+  }
+
+  private finish(state: TransferState, error: string | null): void {
+    if (this.state === 'completed' || this.state === 'failed' || this.state === 'cancelled') return;
+    this.state = state;
+    this.error = error;
+    this.finishedAt = Date.now();
+    this.dispose();
   }
 }
 
