@@ -714,12 +714,16 @@ async function sha256Remote(sftp: SFTPWrapper, remotePath: string): Promise<stri
 export type DirEntry = {
   relPath: string;
   size: number;
+  isDir?: boolean;
 };
+
+export const DEFAULT_CHUNK_THRESHOLD_BYTES = 400 * 1024 * 1024;
 
 export function dirEntriesToTotal(entries: DirEntry[]): { filesTotal: number; totalBytes: number } {
   let filesTotal = 0;
   let totalBytes = 0;
   for (const e of entries) {
+    if (e.isDir) continue;
     filesTotal += 1;
     totalBytes += e.size;
   }
@@ -763,6 +767,10 @@ export function chunkSegments(
     segs.push({ start, end });
   }
   return segs;
+}
+
+export function shouldUseChunking(fileSize: number, offset: number, threshold: number, threads: number): boolean {
+  return offset === 0 && threads > 1 && fileSize >= threshold;
 }
 
 export function validateTransferParams(params: {
@@ -1674,9 +1682,10 @@ server.tool(
     local_dir: z.string().min(1).describe("Local destination directory (created if missing)"),
     concurrency: z.number().int().min(1).max(16).default(4).describe("Max concurrent files to transfer (default 4)"),
     chunk_threads: z.number().int().min(1).max(16).default(4).describe("Max parallel segments per large file (default 4)"),
-    chunk_size_mb: z.number().int().min(1).default(8).describe("Files at least this many MB are chunked (default 8)"),
+    chunk_size_mb: z.number().int().min(1).default(8).describe("Minimum size of each parallel segment in MB (default 8)"),
+    chunk_threshold_mb: z.number().int().min(1).default(400).describe("Only files at least this many MB are chunked (default 400)"),
   },
-  async ({ host_id, remote_dir, local_dir, concurrency, chunk_threads, chunk_size_mb }) => {
+  async ({ host_id, remote_dir, local_dir, concurrency, chunk_threads, chunk_size_mb, chunk_threshold_mb }) => {
     const resolvedLocalDir = resolvePath(local_dir);
     const id = randomUUID();
     const resolved = await resolveHost(host_id);
@@ -1688,7 +1697,7 @@ server.tool(
       throw new McpError(ErrorCode.InternalError, `Failed to connect to host '${host_id}': ${error instanceof Error ? error.message : String(error)}`);
     }
     const transfer = new DirectoryTransfer(id, host_id, remote_dir, resolvedLocalDir, 'download-dir',
-      conn, { concurrency, chunkThreads: chunk_threads, chunkSize: chunk_size_mb * 1024 * 1024 });
+      conn, { concurrency, chunkThreads: chunk_threads, chunkSize: chunk_size_mb * 1024 * 1024, chunkThreshold: chunk_threshold_mb * 1024 * 1024 });
     activeTransfers.set(id, transfer);
     transfer.start().catch(() => {});
     return {
@@ -1706,13 +1715,21 @@ server.tool(
     remote_dir: z.string().min(1).describe("Remote destination directory (created if missing)"),
     concurrency: z.number().int().min(1).max(16).default(4).describe("Max concurrent files to transfer (default 4)"),
     chunk_threads: z.number().int().min(1).max(16).default(4).describe("Max parallel segments per large file (default 4)"),
-    chunk_size_mb: z.number().int().min(1).default(8).describe("Files at least this many MB are chunked (default 8)"),
+    chunk_size_mb: z.number().int().min(1).default(8).describe("Minimum size of each parallel segment in MB (default 8)"),
+    chunk_threshold_mb: z.number().int().min(1).default(400).describe("Only files at least this many MB are chunked (default 400)"),
   },
-  async ({ host_id, local_dir, remote_dir, concurrency, chunk_threads, chunk_size_mb }) => {
+  async ({ host_id, local_dir, remote_dir, concurrency, chunk_threads, chunk_size_mb, chunk_threshold_mb }) => {
     const resolvedLocalDir = resolvePath(local_dir);
     const id = randomUUID();
     const resolved = await resolveHost(host_id);
-    await mkdir(resolvedLocalDir, { recursive: true });
+    try {
+      const localStats = await stat(resolvedLocalDir);
+      if (!localStats.isDirectory()) {
+        throw new McpError(ErrorCode.InvalidParams, `Local path '${resolvedLocalDir}' is not a directory`);
+      }
+    } catch (error: any) {
+      throw resolveLocalStatError(error, resolvedLocalDir);
+    }
     let conn: { conn: InstanceType<typeof SSHClient>; jumpConns: InstanceType<typeof SSHClient>[]; sftp: SFTPWrapper };
     try {
       conn = await openSftpConnection(resolved);
@@ -1720,7 +1737,7 @@ server.tool(
       throw new McpError(ErrorCode.InternalError, `Failed to connect to host '${host_id}': ${error instanceof Error ? error.message : String(error)}`);
     }
     const transfer = new DirectoryTransfer(id, host_id, remote_dir, resolvedLocalDir, 'upload-dir',
-      conn, { concurrency, chunkThreads: chunk_threads, chunkSize: chunk_size_mb * 1024 * 1024 });
+      conn, { concurrency, chunkThreads: chunk_threads, chunkSize: chunk_size_mb * 1024 * 1024, chunkThreshold: chunk_threshold_mb * 1024 * 1024 });
     activeTransfers.set(id, transfer);
     transfer.start().catch(() => {});
     return {
@@ -1736,8 +1753,11 @@ server.tool(
     host_id: z.string().describe("Identifier of the source host"),
     remote_path: z.string().min(1).describe("Path to the source file on the remote host"),
     local_path: z.string().min(1).describe("Destination path on the MCP server machine (absolute or relative to its working directory)"),
+    chunk_threads: z.number().int().min(1).max(16).default(4).describe("Max parallel segments for files above the chunk threshold (default 4)"),
+    chunk_size_mb: z.number().int().min(1).default(8).describe("Minimum size of each parallel segment in MB (default 8)"),
+    chunk_threshold_mb: z.number().int().min(1).default(400).describe("Only files at least this many MB are chunked (default 400)"),
   },
-  async ({ host_id, remote_path, local_path }) => {
+  async ({ host_id, remote_path, local_path, chunk_threads, chunk_size_mb, chunk_threshold_mb }) => {
     const resolvedLocalPath = resolvePath(local_path);
     await assertLocalDestinationParent(posixPath.dirname(resolvedLocalPath));
     const id = randomUUID();
@@ -1748,7 +1768,8 @@ server.tool(
     } catch (error: any) {
       throw new McpError(ErrorCode.InternalError, `Failed to connect to host '${host_id}': ${error instanceof Error ? error.message : String(error)}`);
     }
-    const transfer = new FileTransfer(id, host_id, resolvedLocalPath, remote_path, 'download', conn);
+    const transfer = new FileTransfer(id, host_id, resolvedLocalPath, remote_path, 'download', conn,
+      { chunkThreads: chunk_threads, chunkSize: chunk_size_mb * 1024 * 1024, chunkThreshold: chunk_threshold_mb * 1024 * 1024 });
     activeTransfers.set(id, transfer);
     transfer.start().catch(() => {
       // start() records failures internally; nothing further to do.
@@ -1769,8 +1790,11 @@ server.tool(
     host_id: z.string().describe("Identifier of the destination host"),
     local_path: z.string().describe("Path to the local source file (absolute or relative to the MCP server process)"),
     remote_path: z.string().min(1).describe("Destination path on the remote host"),
+    chunk_threads: z.number().int().min(1).max(16).default(4).describe("Max parallel segments for files above the chunk threshold (default 4)"),
+    chunk_size_mb: z.number().int().min(1).default(8).describe("Minimum size of each parallel segment in MB (default 8)"),
+    chunk_threshold_mb: z.number().int().min(1).default(400).describe("Only files at least this many MB are chunked (default 400)"),
   },
-  async ({ host_id, local_path, remote_path }) => {
+  async ({ host_id, local_path, remote_path, chunk_threads, chunk_size_mb, chunk_threshold_mb }) => {
     const resolvedLocalPath = resolvePath(local_path);
     try {
       const localStats = await stat(resolvedLocalPath);
@@ -1788,7 +1812,8 @@ server.tool(
     } catch (error: any) {
       throw new McpError(ErrorCode.InternalError, `Failed to connect to host '${host_id}': ${error instanceof Error ? error.message : String(error)}`);
     }
-    const transfer = new FileTransfer(id, host_id, resolvedLocalPath, remote_path, 'upload', conn);
+    const transfer = new FileTransfer(id, host_id, resolvedLocalPath, remote_path, 'upload', conn,
+      { chunkThreads: chunk_threads, chunkSize: chunk_size_mb * 1024 * 1024, chunkThreshold: chunk_threshold_mb * 1024 * 1024 });
     activeTransfers.set(id, transfer);
     transfer.start().catch(() => {
       // start() records failures internally; nothing further to do.
@@ -2950,6 +2975,7 @@ export class FileTransfer {
   private partPath: string;
   private readonly chunkThreads: number;
   private readonly chunkSize: number;
+  private readonly chunkThreshold: number;
 
   constructor(
     private readonly id: string,
@@ -2958,10 +2984,11 @@ export class FileTransfer {
     private readonly remotePath: string,
     private readonly direction: 'download' | 'upload',
     private conns: { conn: InstanceType<typeof SSHClient>; jumpConns: InstanceType<typeof SSHClient>[]; sftp: SFTPWrapper },
-    options?: { chunkThreads?: number; chunkSize?: number },
+    options?: { chunkThreads?: number; chunkSize?: number; chunkThreshold?: number },
   ) {
     this.chunkThreads = Math.max(1, Math.floor(options?.chunkThreads ?? 4));
     this.chunkSize = options?.chunkSize ?? 8 * 1024 * 1024;
+    this.chunkThreshold = options?.chunkThreshold ?? DEFAULT_CHUNK_THRESHOLD_BYTES;
     this.partPath = direction === 'download'
       ? partPathFor(localPath)
       : partPathFor(remotePath);
@@ -3083,9 +3110,20 @@ export class FileTransfer {
     }
     this.transferredBytes = offset;
     if (offset < stats.size) {
-      const segs = chunkSegments(stats.size, offset, this.chunkSize, this.chunkThreads);
-      if (offset === 0 && segs.length > 1) {
-        await this.downloadChunks(segs);
+      const segs = shouldUseChunking(stats.size, offset, this.chunkThreshold, this.chunkThreads)
+        ? chunkSegments(stats.size, offset, this.chunkSize, this.chunkThreads)
+        : [];
+      if (segs.length > 1) {
+        try {
+          await this.downloadChunks(segs);
+        } catch (error) {
+          await rm(this.partPath, { force: true });
+          throw error;
+        }
+        if (this.disposed || this.cancelled) {
+          await rm(this.partPath, { force: true });
+          throw new Error('transfer cancelled');
+        }
       } else {
         const read = this.conns.sftp.createReadStream(this.remotePath, { start: offset });
         const write = createWriteStream(this.partPath, { flags: offset > 0 ? 'a' : 'w' });
@@ -3145,9 +3183,24 @@ export class FileTransfer {
       await this.removeRemotePart();
     }
     this.transferredBytes = offset;
-    const segs = chunkSegments(localStats.size, offset, this.chunkSize, this.chunkThreads);
-    if (offset === 0 && segs.length > 1) {
-      await this.uploadChunks(segs);
+    const segs = shouldUseChunking(localStats.size, offset, this.chunkThreshold, this.chunkThreads)
+      ? chunkSegments(localStats.size, offset, this.chunkSize, this.chunkThreads)
+      : [];
+    if (segs.length > 1) {
+      try {
+        await this.uploadChunks(segs);
+      } catch (error) {
+        if (this.conns) {
+          await this.removeRemotePart();
+        }
+        throw error;
+      }
+      if (this.disposed || this.cancelled) {
+        if (this.conns) {
+          await this.removeRemotePart();
+        }
+        throw new Error('transfer cancelled');
+      }
     } else {
       await this.uploadWithOffset(this.localPath, this.partPath, offset);
     }
@@ -3398,6 +3451,7 @@ export class DirectoryTransfer {
   private finishedAt: number | null = null;
   private cancelled = false;
   private disposed = false;
+  private readonly subTransfers = new Set<FileTransfer>();
 
   constructor(
     private readonly id: string,
@@ -3406,11 +3460,12 @@ export class DirectoryTransfer {
     private readonly targetPath: string,
     private readonly direction: 'download-dir' | 'upload-dir',
     private conns: { conn: InstanceType<typeof SSHClient>; jumpConns: InstanceType<typeof SSHClient>[]; sftp: SFTPWrapper },
-    options?: { concurrency?: number; chunkThreads?: number; chunkSize?: number },
+    options?: { concurrency?: number; chunkThreads?: number; chunkSize?: number; chunkThreshold?: number },
   ) {
     this.concurrency = Math.max(1, options?.concurrency ?? 4);
     this.chunkThreads = Math.max(1, Math.floor(options?.chunkThreads ?? 4));
     this.chunkSize = options?.chunkSize ?? 8 * 1024 * 1024;
+    this.chunkThreshold = options?.chunkThreshold ?? DEFAULT_CHUNK_THRESHOLD_BYTES;
     conns.conn.once?.('error', (error: Error) => this.markFailed(error.message));
     conns.conn.once?.('end', () => this.markFailed('SSH connection ended'));
     conns.conn.once?.('close', () => this.markFailed('SSH connection closed'));
@@ -3423,6 +3478,7 @@ export class DirectoryTransfer {
   private readonly concurrency: number;
   private readonly chunkThreads: number;
   private readonly chunkSize: number;
+  private readonly chunkThreshold: number;
 
   async start(): Promise<void> {
     if (this.disposed) {
@@ -3450,41 +3506,63 @@ export class DirectoryTransfer {
     const workers = Math.min(Math.max(1, this.concurrency), Math.max(1, entries.length));
     let index = 0;
     let doneBytes = 0;
+    let failed = false;
+    let failure: unknown;
     const worker = async () => {
       while (true) {
-        if (this.disposed || this.cancelled) {
+        if (failed || this.disposed || this.cancelled) {
           throw new Error('transfer cancelled');
         }
         const i = index;
         index += 1;
         if (i >= entries.length) break;
-        const entry = entries[i];
-        const relPath = entry.relPath;
-        const source = this.direction === 'download-dir'
-          ? posixPath.join(this.sourcePath, relPath)
-          : posixPath.join(this.targetPath, relPath);
-        const target = this.direction === 'download-dir'
-          ? posixPath.join(this.targetPath, relPath)
-          : posixPath.join(this.sourcePath, relPath);
-        if (this.direction === 'download-dir') {
-          await ensureRemoteParentDirectory(this.conns.sftp, source);
-          await mkdir(posixPath.dirname(target), { recursive: true });
-        }
-        const skipped = await this.maybeSkip(entry, source, target);
-        if (skipped) {
-          doneBytes += entry.size;
+        try {
+          const entry = entries[i];
+          const relPath = entry.relPath;
+          const source = this.direction === 'download-dir'
+            ? posixPath.join(this.sourcePath, relPath)
+            : posixPath.join(this.targetPath, relPath);
+          const target = this.direction === 'download-dir'
+            ? posixPath.join(this.targetPath, relPath)
+            : posixPath.join(this.sourcePath, relPath);
+          if (entry.isDir) {
+            if (this.direction === 'download-dir') {
+              await mkdir(target, { recursive: true });
+            } else {
+              await ensureRemoteParentDirectory(this.conns.sftp, posixPath.join(target, '.mkdir'));
+            }
+            continue;
+          }
+          if (this.direction === 'download-dir') {
+            await mkdir(posixPath.dirname(target), { recursive: true });
+          }
+          const skipped = await this.maybeSkip(entry, source, target);
+          if (skipped) {
+            doneBytes += entry.size;
+            this.filesDone += 1;
+            this.transferredBytes = doneBytes;
+            continue;
+          }
+          if (failed || this.disposed || this.cancelled) {
+            throw new Error('transfer cancelled');
+          }
+          const transferred = await this.transferOne(source, target, entry.size);
+          doneBytes += transferred;
           this.filesDone += 1;
           this.transferredBytes = doneBytes;
-          continue;
+        } catch (error) {
+          if (!failed) {
+            failed = true;
+            failure = error;
+            await this.cancelSubTransfers();
+          }
+          throw error;
         }
-        const transferred = await this.transferOne(source, target, entry.size);
-        doneBytes += transferred;
-        this.filesDone += 1;
-        this.transferredBytes = doneBytes;
       }
     };
     const pool = Array.from({ length: workers }, () => worker());
-    await Promise.all(pool);
+    await Promise.allSettled(pool);
+    if (failed) throw failure;
   }
 
   private async listFiles(rootPath: string): Promise<DirEntry[]> {
@@ -3511,6 +3589,7 @@ export class DirectoryTransfer {
           if (name === '.' || name === '..') continue;
           const relPath = relDir ? `${relDir}/${name}` : name;
           if (item.attrs.isDirectory()) {
+            out.push({ relPath, size: 0, isDir: true });
             await walk(`${dirPath}/${name}`, relPath);
           } else {
             out.push({ relPath, size: item.attrs.size ?? 0 });
@@ -3538,6 +3617,7 @@ export class DirectoryTransfer {
         const relPath = relDir ? `${relDir}/${name}` : name;
         const fullPath = posixPath.join(dirPath, name);
         if (dirent.isDirectory()) {
+          out.push({ relPath, size: 0, isDir: true });
           await walk(fullPath, relPath);
         } else if (dirent.isFile()) {
           const st = await stat(fullPath);
@@ -3599,14 +3679,29 @@ export class DirectoryTransfer {
         jumpConns: [],
         sftp: subProxy(this.conns.sftp),
       } as any,
-      { chunkThreads: this.chunkThreads, chunkSize: this.chunkSize },
+      { chunkThreads: this.chunkThreads, chunkSize: this.chunkSize, chunkThreshold: this.chunkThreshold },
     );
-    await ft.start();
-    const info = ft.getInfo();
-    if (info.state !== 'completed') {
-      throw new Error(info.error ?? 'file transfer failed');
+    this.subTransfers.add(ft);
+    try {
+      await ft.start();
+      const info = ft.getInfo();
+      if (info.state !== 'completed') {
+        throw new Error(info.error ?? 'file transfer failed');
+      }
+      return size;
+    } finally {
+      this.subTransfers.delete(ft);
     }
-    return size;
+  }
+
+  private async cancelSubTransfers(): Promise<void> {
+    await Promise.all([...this.subTransfers].map(async (transfer) => {
+      try {
+        await transfer.cancel();
+      } catch {
+        // A sibling may have completed between the snapshot and cancellation.
+      }
+    }));
   }
 
   getInfo(): TransferInfo {
@@ -3639,6 +3734,7 @@ export class DirectoryTransfer {
       throw new McpError(ErrorCode.InvalidParams, `Transfer ${this.id} is already ${this.state}`);
     }
     this.cancelled = true;
+    await this.cancelSubTransfers();
     this.finish('cancelled', null);
   }
 

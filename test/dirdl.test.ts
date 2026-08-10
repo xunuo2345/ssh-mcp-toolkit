@@ -53,6 +53,15 @@ describe('dir helpers', () => {
     }
     expect(segs[segs.length - 1].end).toBe(31);
   });
+
+  it('only enables parallel chunking from the configured threshold and never for resumed transfers', async () => {
+    const { DEFAULT_CHUNK_THRESHOLD_BYTES, shouldUseChunking } = await import('../src/index.js');
+    const threshold = DEFAULT_CHUNK_THRESHOLD_BYTES;
+    expect(shouldUseChunking(threshold - 1, 0, threshold, 4)).toBe(false);
+    expect(shouldUseChunking(threshold, 0, threshold, 4)).toBe(true);
+    expect(shouldUseChunking(threshold * 2, 1, threshold, 4)).toBe(false);
+    expect(shouldUseChunking(threshold * 2, 0, threshold, 1)).toBe(false);
+  });
 });
 
 describe('DirectoryTransfer listing', () => {
@@ -102,6 +111,7 @@ describe('DirectoryTransfer listing', () => {
     const listing = await (t as any).listFiles('/data');
     expect(listing).toEqual([
       { relPath: 'a.bin', size: 100 },
+      { relPath: 'sub', size: 0, isDir: true },
       { relPath: 'sub/b.bin', size: 200 },
     ]);
   });
@@ -122,8 +132,56 @@ describe('DirectoryTransfer listing', () => {
     const listing = await (t as any).listLocalFiles(localRoot);
     expect(listing).toEqual([
       { relPath: 'file.txt', size: 42 },
+      { relPath: 'nested', size: 0, isDir: true },
       { relPath: 'nested/deep.bin', size: 7 },
     ]);
+    await rm(localRoot, { recursive: true, force: true });
+  });
+
+  it('download-dir reproduces empty subdirectories', async () => {
+    const { DirectoryTransfer } = await import('../src/index.js');
+    const { mkdtemp, rm, stat } = await import('fs/promises');
+    const { join } = await import('path');
+    const { tmpdir } = await import('os');
+    const localRoot = await mkdtemp(join(tmpdir(), 'dirdl-empty-'));
+    const tree = {
+      '/data': { size: 0, dir: true },
+      '/data/empty': { size: 0, dir: true },
+    };
+    const sftp = makeDirSftp(tree);
+    const t = new DirectoryTransfer('dl3', 'A', '/data', localRoot, 'download-dir',
+      { conn: { end() {} } as any, jumpConns: [], sftp: sftp as any });
+    await t.start();
+    expect(t.getInfo().state).toBe('completed');
+    expect(t.getInfo().filesDone).toBe(0); // empty dirs are not progress-counted files
+    const st = await stat(join(localRoot, 'empty'));
+    expect(st.isDirectory()).toBe(true);
+    await rm(localRoot, { recursive: true, force: true });
+  });
+
+  it('upload-dir creates empty subdirectories remotely', async () => {
+    const { DirectoryTransfer } = await import('../src/index.js');
+    const { mkdtemp, mkdir, rm } = await import('fs/promises');
+    const { join } = await import('path');
+    const { tmpdir } = await import('os');
+    const localRoot = await mkdtemp(join(tmpdir(), 'dirup-empty-'));
+    await mkdir(join(localRoot, 'empty'), { recursive: true });
+    const existing = new Set<string>();
+    const mkdirs: string[] = [];
+    const sftp = {
+      stat(path: string, cb: (e: Error | null, s?: any) => void) {
+        if (existing.has(path)) cb(null, { size: 0, isDirectory: () => true });
+        else cb(new Error('ENOENT') as any);
+      },
+      mkdir(path: string, _opts: any, cb: (e: Error | null) => void) { mkdirs.push(path); existing.add(path); cb(null); },
+      end() {},
+    };
+    const t = new DirectoryTransfer('du1', 'A', '/remote/data', localRoot, 'upload-dir',
+      { conn: { end() {} } as any, jumpConns: [], sftp: sftp as any });
+    await t.start();
+    expect(t.getInfo().state).toBe('completed');
+    expect(t.getInfo().filesDone).toBe(0);
+    expect(mkdirs).toContain('/remote/data/empty');
     await rm(localRoot, { recursive: true, force: true });
   });
 
@@ -144,6 +202,7 @@ describe('DirectoryTransfer listing', () => {
       ['/data/sub/b.bin', Buffer.from([5, 6, 7, 8])],
     ]);
     const consumed: Record<string, boolean> = {};
+    const statCalls: string[] = [];
     const sftp = {
       opendir(path: string, cb: (err: Error | null, handle?: Buffer) => void) { cb(null, Buffer.from(path)); },
       readdir(handle: Buffer, cb: (err: Error | null, list?: any[]) => void) {
@@ -160,6 +219,7 @@ describe('DirectoryTransfer listing', () => {
         cb(null, items);
       },
       stat(path: string, cb: (err: Error | null, stats?: any) => void) {
+        statCalls.push(path);
         const info = tree[path];
         if (info) cb(null, { size: info.size, isDirectory: () => !!info.dir });
         else cb(new Error('ENOENT') as any);
@@ -186,6 +246,8 @@ describe('DirectoryTransfer listing', () => {
     await access(join(localRoot, 'sub', 'b.bin'));
     const nestedFile = await readFile(join(localRoot, 'sub', 'b.bin'));
     expect([...nestedFile]).toEqual([5, 6, 7, 8]);
+    expect(statCalls).not.toContain('/data');
+    expect(statCalls).not.toContain('/data/sub');
     await rm(localRoot, { recursive: true, force: true });
   });
 });
@@ -218,6 +280,44 @@ describe('DirectoryTransfer concurrency', () => {
     expect(maxActive).toBeGreaterThanOrEqual(2); // concurrency genuinely engages
     await rm(localRoot, { recursive: true, force: true });
   });
+
+  it('waits for in-flight workers before closing the shared connection after a failure', async () => {
+    const { DirectoryTransfer } = await import('../src/index.js');
+    const { mkdtemp, rm } = await import('fs/promises');
+    const { join } = await import('path');
+    const { tmpdir } = await import('os');
+    const localRoot = await mkdtemp(join(tmpdir(), 'dirfail-'));
+    let releaseSecond!: () => void;
+    const secondStarted = new Promise<void>((resolve) => { releaseSecond = resolve; });
+    let signalSecondStarted!: () => void;
+    const slowWorkerStarted = new Promise<void>((resolve) => { signalSecondStarted = resolve; });
+    let secondActive = false;
+    const t = new DirectoryTransfer('c2', 'A', '/data', localRoot, 'download-dir',
+      { conn: { end() {} } as any, jumpConns: [], sftp: { end() {} } as any },
+      { concurrency: 2 });
+    (t as any).listFiles = async () => [{ relPath: 'bad', size: 1 }, { relPath: 'slow', size: 1 }];
+    (t as any).maybeSkip = async () => false;
+    (t as any).transferOne = async (source: string) => {
+      if (source.endsWith('/bad')) {
+        await slowWorkerStarted;
+        throw new Error('injected failure');
+      }
+      secondActive = true;
+      signalSecondStarted();
+      await secondStarted;
+      secondActive = false;
+      return 1;
+    };
+    let settled = false;
+    const start = t.start().then(() => { settled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(secondActive).toBe(true);
+    expect(settled).toBe(false);
+    releaseSecond();
+    await start;
+    expect(t.getInfo().state).toBe('failed');
+    await rm(localRoot, { recursive: true, force: true });
+  });
 });
 
 describe('FileTransfer chunked download', () => {
@@ -247,7 +347,7 @@ describe('FileTransfer chunked download', () => {
     };
     const ft = new FileTransfer('x1', 'A', local, '/remote/big.bin', 'download',
       { conn: { end() {} } as any, jumpConns: [], sftp: sftp as any },
-      { chunkThreads: 4, chunkSize: 50 });
+      { chunkThreads: 4, chunkSize: 50, chunkThreshold: 100 });
     await ft.start();
     expect(starts.length).toBeGreaterThan(1); // chunked into multiple range reads
     expect(new Set(starts).size).toBeGreaterThan(1); // distinct range starts prove parallel segments
@@ -284,7 +384,7 @@ describe('FileTransfer chunked download', () => {
     };
     const ft = new FileTransfer('x3', 'A', local, '/remote/big.bin', 'download',
       { conn: { end() {} } as any, jumpConns: [], sftp: sftp as any },
-      { chunkThreads: 4, chunkSize: 50 });
+      { chunkThreads: 4, chunkSize: 50, chunkThreshold: 100 });
     await ft.start();
     expect(ft.getInfo().state).toBe('completed');
     expect((await readFile(local)).length).toBe(100);
@@ -321,11 +421,63 @@ describe('FileTransfer chunked download', () => {
     };
     const ft = new FileTransfer('x4', 'A', local, '/remote/big.bin', 'download',
       { conn: { end() {} } as any, jumpConns: [], sftp: sftp as any },
-      { chunkThreads: 4, chunkSize: 50 });
+      { chunkThreads: 4, chunkSize: 50, chunkThreshold: 100 });
     await ft.start();
     expect(ft.getInfo().state).toBe('failed');
     expect(ft.getInfo().error).toContain('segment 0 read failed');
     expect(destroyed).toContain(50);
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('removes the sparse .part on chunked failure so a re-run succeeds', async () => {
+    const { FileTransfer } = await import('../src/index.js');
+    const { mkdtemp, readFile, rm, stat } = await import('fs/promises');
+    const { join } = await import('path');
+    const { tmpdir } = await import('os');
+    const dir = await mkdtemp(join(tmpdir(), 'chunk-dlfix-'));
+    const local = join(dir, 'big.bin');
+    const part = `${local}.part`;
+    const full = Buffer.alloc(100, 0x42);
+    let failFirst = true;
+    const makeSftp = () => {
+      let readCount = 0;
+      return {
+        stat(p: string, cb: (e: Error | null, s?: any) => void) { cb(null, { size: full.length, isDirectory: () => false }); },
+        createReadStream(p: string, opts?: any) {
+          const { Readable } = require('stream');
+          const r = new Readable();
+          r._read = () => {};
+          if (failFirst && readCount === 0) {
+            readCount += 1;
+            r.destroy(new Error('segment 0 read failed'));
+            return r;
+          }
+          readCount += 1;
+          const start = opts?.start ?? 0;
+          const end = opts?.end === undefined ? full.length - 1 : opts.end;
+          r.push(full.subarray(start, Math.min(end + 1, full.length)));
+          r.push(null);
+          return r;
+        },
+        rename(f: string, t: string, cb: (e: Error | null) => void) { cb(null); },
+        end() {},
+      };
+    };
+
+    const t1 = new FileTransfer('x5', 'A', local, '/remote/big.bin', 'download',
+      { conn: { end() {} } as any, jumpConns: [], sftp: makeSftp() as any },
+      { chunkThreads: 4, chunkSize: 50, chunkThreshold: 100 });
+    await t1.start();
+    expect(t1.getInfo().state).toBe('failed');
+    await expect(stat(part)).rejects.toThrow(); // sparse chunked .part cleaned up
+
+    failFirst = false;
+    const t2 = new FileTransfer('x6', 'A', local, '/remote/big.bin', 'download',
+      { conn: { end() {} } as any, jumpConns: [], sftp: makeSftp() as any },
+      { chunkThreads: 4, chunkSize: 50, chunkThreshold: 100 });
+    await t2.start();
+    expect(t2.getInfo().state).toBe('completed');
+    expect((await readFile(local)).length).toBe(100);
     await rm(dir, { recursive: true, force: true });
   });
 });

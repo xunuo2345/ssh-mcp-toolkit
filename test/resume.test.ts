@@ -323,4 +323,85 @@ describe('FileTransfer upload resume', () => {
     expect(remote.getContent().length).toBe(0);
     await rm(dir, { recursive: true, force: true });
   });
+
+  it('removes the sparse remote .part on chunked failure so a re-run succeeds', async () => {
+    const { FileTransfer } = await import('../src/index.js');
+    const dir = await mkdtemp(join(tmpdir(), 'resume-up6-'));
+    const local = join(dir, 'src.bin');
+    const full = Buffer.alloc(100, 0x7a);
+    await writeFile(local, full);
+
+    let failNext = true;
+    let remoteContent = Buffer.alloc(0);
+    let remoteExists = false;
+    const calls = { unlink: 0, rename: 0, open: [] as string[] };
+    const sftp = {
+      stat(path: string, cb: (e: Error | null, s?: any) => void) {
+        if (!remoteExists) { cb(new Error('ENOENT') as any); return; }
+        cb(null, { size: remoteContent.length, isDirectory: () => false });
+      },
+      open(path: string, flags: string, cb: (e: Error | null, h?: Buffer) => void) {
+        calls.open.push(flags);
+        remoteExists = true;
+        cb(null, Buffer.from([calls.open.length]));
+      },
+      write(_h: Buffer, buf: Buffer, _o: number, length: number, position: number, cb: (e: Error | null) => void) {
+        if (failNext) {
+          failNext = false;
+          cb(new Error('injected write failure'));
+          return;
+        }
+        const endPos = position + length;
+        if (endPos > remoteContent.length) {
+          const grown = Buffer.alloc(endPos);
+          remoteContent.copy(grown);
+          buf.copy(grown, position);
+          remoteContent = grown;
+        } else {
+          buf.copy(remoteContent, position);
+        }
+        cb(null);
+      },
+      unlink(path: string, cb: (e: Error | null) => void) {
+        calls.unlink += 1;
+        remoteExists = false;
+        remoteContent = Buffer.alloc(0);
+        cb(null);
+      },
+      mkdir(path: string, _opts: any, cb: (e: Error | null) => void) { cb(null); },
+      close(_h: Buffer, cb: (e: Error | null) => void) { cb(null); },
+      fstat(_h: Buffer, cb: (e: Error | null, s?: any) => void) { cb(null, { size: remoteContent.length }); },
+      rename(from: string, to: string, cb: (e: Error | null) => void) {
+        calls.rename += 1;
+        remoteExists = false;
+        cb(null);
+      },
+      createReadStream(path: string) {
+        const r = new Readable();
+        r._read = () => {};
+        r.push(remoteContent);
+        r.push(null);
+        return r;
+      },
+      end() {},
+    };
+    const conns = { conn: { end() {} } as any, jumpConns: [] as any[], sftp: sftp as any };
+
+    const t1 = new FileTransfer('u6', 'A', local, '/remote/dst.bin', 'upload',
+      { conn: conns.conn, jumpConns: conns.jumpConns, sftp: conns.sftp },
+      { chunkThreads: 4, chunkSize: 50, chunkThreshold: 100 });
+    await t1.start();
+    expect(t1.getInfo().state).toBe('failed');
+    expect(calls.unlink).toBe(1); // sparse chunked .part removed for a clean restart
+    expect(remoteExists).toBe(false);
+
+    const t2 = new FileTransfer('u7', 'A', local, '/remote/dst.bin', 'upload',
+      { conn: conns.conn, jumpConns: conns.jumpConns, sftp: conns.sftp },
+      { chunkThreads: 4, chunkSize: 50, chunkThreshold: 100 });
+    await t2.start();
+    expect(t2.getInfo().state).toBe('completed');
+    expect(calls.rename).toBe(1);
+    expect(remoteContent.equals(full)).toBe(true);
+    await rm(dir, { recursive: true, force: true });
+  });
 });
