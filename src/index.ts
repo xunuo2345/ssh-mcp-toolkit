@@ -2,12 +2,12 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
-import type { ClientChannel, ConnectConfig, SFTPWrapper, Stats } from 'ssh2';
+import type { ClientChannel, ConnectConfig, OpenMode, SFTPWrapper, Stats } from 'ssh2';
 import SSH2Module from 'ssh2';
 const { Client: SSHClient, utils: sshUtils } = SSH2Module as typeof import('ssh2');
 import { z } from 'zod';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { readFile, writeFile, mkdir, stat, rename, rm, open, readdir } from 'fs/promises';
+import { readFile, writeFile, mkdir, stat, lstat, rename, rm, open, readdir } from 'fs/promises';
 import { createReadStream, createWriteStream } from 'fs';
 import { posix as posixPath, resolve as resolvePath } from 'path';
 import os from 'os';
@@ -163,11 +163,13 @@ async function resolveHost(hostId: string): Promise<ResolvedHost> {
   return resolveHostFromList(hostId, hosts);
 }
 
-type SftpConnection = {
+export type SftpConnection = {
   conn: InstanceType<typeof SSHClient>;
   jumpConns: InstanceType<typeof SSHClient>[];
   sftp: SFTPWrapper;
 };
+
+export type ParallelSftpConnectionFactory = () => Promise<SftpConnection>;
 
 /**
  * Open an SSH connection to a configured host, hopping through every
@@ -267,14 +269,18 @@ async function openSftpConnection(resolved: ResolvedHost): Promise<SftpConnectio
   });
 }
 
+function closeSftpConnection(connection: SftpConnection): void {
+  connection.sftp.end();
+  connection.conn.end();
+  for (const jumpConn of connection.jumpConns) jumpConn.end();
+}
+
 async function withSftpConnection<T>(resolved: ResolvedHost, action: (sftp: SFTPWrapper) => Promise<T>): Promise<T> {
   const { conn, jumpConns, sftp } = await openSftpConnection(resolved);
   try {
     return await action(sftp);
   } finally {
-    sftp.end();
-    conn.end();
-    for (const jumpConn of jumpConns) jumpConn.end();
+    closeSftpConnection({ conn, jumpConns, sftp });
   }
 }
 
@@ -296,6 +302,12 @@ function sftpStat(sftp: SFTPWrapper, remotePath: string): Promise<Stats> {
   });
 }
 
+function sftpLstat(sftp: SFTPWrapper, remotePath: string): Promise<Stats> {
+  return new Promise((resolve, reject) => {
+    sftp.lstat(remotePath, (error, stats) => error ? reject(error) : resolve(stats));
+  });
+}
+
 function sftpRename(sftp: SFTPWrapper, from: string, to: string): Promise<void> {
   return new Promise((resolve, reject) => {
     sftp.rename(from, to, (err) => err ? reject(err) : resolve());
@@ -308,29 +320,49 @@ function sftpMkdir(sftp: SFTPWrapper, remotePath: string): Promise<void> {
   });
 }
 
-/** Create every missing component of the remote parent directory over SFTP. */
-async function ensureRemoteParentDirectory(sftp: SFTPWrapper, remotePath: string): Promise<void> {
+/**
+ * Create every missing component of the remote parent directory over SFTP.
+ * When `rejectSymlinks` is set (directory transfers), intermediate components
+ * that are symlinks are rejected instead of written through, preventing a
+ * write escape (e.g. `/tmp/out/sub -> /etc`). Single-file transfers keep the
+ * legacy follow-symlink behavior.
+ */
+async function ensureRemoteParentDirectory(
+  sftp: SFTPWrapper,
+  remotePath: string,
+  rejectSymlinks = false,
+): Promise<void> {
   const directory = posixPath.normalize(posixPath.dirname(remotePath));
   if (directory === '.' || directory === '/') return;
 
+  const statPath = rejectSymlinks ? sftpLstat : sftpStat;
   const absolute = directory.startsWith('/');
   let current = absolute ? '/' : '';
   for (const component of directory.split('/').filter(Boolean)) {
     current = current ? posixPath.join(current, component) : component;
     try {
-      const stats = await sftpStat(sftp, current);
+      const stats = await statPath(sftp, current);
+      if (rejectSymlinks && stats.isSymbolicLink()) {
+        throw new Error(`Remote path '${current}' is a symlink; refusing to write through it`);
+      }
       if (!stats.isDirectory()) {
         throw new Error(`Remote path '${current}' exists but is not a directory`);
       }
     } catch (statError: any) {
-      if (statError?.message?.includes('is not a directory')) {
+      if (
+        statError?.message?.includes('is not a directory')
+        || statError?.message?.includes('is a symlink')
+      ) {
         throw statError;
       }
       try {
         await sftpMkdir(sftp, current);
       } catch (mkdirError) {
         // Another client may have created the directory between stat and mkdir.
-        const stats = await sftpStat(sftp, current).catch(() => { throw mkdirError; });
+        const stats = await statPath(sftp, current).catch(() => { throw mkdirError; });
+        if (rejectSymlinks && stats.isSymbolicLink()) {
+          throw new Error(`Remote path '${current}' is a symlink; refusing to write through it`);
+        }
         if (!stats.isDirectory()) {
           throw new Error(`Remote path '${current}' exists but is not a directory`);
         }
@@ -1697,7 +1729,13 @@ server.tool(
       throw new McpError(ErrorCode.InternalError, `Failed to connect to host '${host_id}': ${error instanceof Error ? error.message : String(error)}`);
     }
     const transfer = new DirectoryTransfer(id, host_id, remote_dir, resolvedLocalDir, 'download-dir',
-      conn, { concurrency, chunkThreads: chunk_threads, chunkSize: chunk_size_mb * 1024 * 1024, chunkThreshold: chunk_threshold_mb * 1024 * 1024 });
+      conn, {
+        concurrency,
+        chunkThreads: chunk_threads,
+        chunkSize: chunk_size_mb * 1024 * 1024,
+        chunkThreshold: chunk_threshold_mb * 1024 * 1024,
+        parallelConnectionFactory: () => openSftpConnection(resolved),
+      });
     activeTransfers.set(id, transfer);
     transfer.start().catch(() => {});
     return {
@@ -1723,7 +1761,10 @@ server.tool(
     const id = randomUUID();
     const resolved = await resolveHost(host_id);
     try {
-      const localStats = await stat(resolvedLocalDir);
+      const localStats = await lstat(resolvedLocalDir);
+      if (localStats.isSymbolicLink()) {
+        throw new McpError(ErrorCode.InvalidParams, `Local path '${resolvedLocalDir}' is a symlink; refusing to follow it for upload`);
+      }
       if (!localStats.isDirectory()) {
         throw new McpError(ErrorCode.InvalidParams, `Local path '${resolvedLocalDir}' is not a directory`);
       }
@@ -1737,7 +1778,13 @@ server.tool(
       throw new McpError(ErrorCode.InternalError, `Failed to connect to host '${host_id}': ${error instanceof Error ? error.message : String(error)}`);
     }
     const transfer = new DirectoryTransfer(id, host_id, remote_dir, resolvedLocalDir, 'upload-dir',
-      conn, { concurrency, chunkThreads: chunk_threads, chunkSize: chunk_size_mb * 1024 * 1024, chunkThreshold: chunk_threshold_mb * 1024 * 1024 });
+      conn, {
+        concurrency,
+        chunkThreads: chunk_threads,
+        chunkSize: chunk_size_mb * 1024 * 1024,
+        chunkThreshold: chunk_threshold_mb * 1024 * 1024,
+        parallelConnectionFactory: () => openSftpConnection(resolved),
+      });
     activeTransfers.set(id, transfer);
     transfer.start().catch(() => {});
     return {
@@ -1769,7 +1816,12 @@ server.tool(
       throw new McpError(ErrorCode.InternalError, `Failed to connect to host '${host_id}': ${error instanceof Error ? error.message : String(error)}`);
     }
     const transfer = new FileTransfer(id, host_id, resolvedLocalPath, remote_path, 'download', conn,
-      { chunkThreads: chunk_threads, chunkSize: chunk_size_mb * 1024 * 1024, chunkThreshold: chunk_threshold_mb * 1024 * 1024 });
+      {
+        chunkThreads: chunk_threads,
+        chunkSize: chunk_size_mb * 1024 * 1024,
+        chunkThreshold: chunk_threshold_mb * 1024 * 1024,
+        parallelConnectionFactory: () => openSftpConnection(resolved),
+      });
     activeTransfers.set(id, transfer);
     transfer.start().catch(() => {
       // start() records failures internally; nothing further to do.
@@ -1813,7 +1865,12 @@ server.tool(
       throw new McpError(ErrorCode.InternalError, `Failed to connect to host '${host_id}': ${error instanceof Error ? error.message : String(error)}`);
     }
     const transfer = new FileTransfer(id, host_id, resolvedLocalPath, remote_path, 'upload', conn,
-      { chunkThreads: chunk_threads, chunkSize: chunk_size_mb * 1024 * 1024, chunkThreshold: chunk_threshold_mb * 1024 * 1024 });
+      {
+        chunkThreads: chunk_threads,
+        chunkSize: chunk_size_mb * 1024 * 1024,
+        chunkThreshold: chunk_threshold_mb * 1024 * 1024,
+        parallelConnectionFactory: () => openSftpConnection(resolved),
+      });
     activeTransfers.set(id, transfer);
     transfer.start().catch(() => {
       // start() records failures internally; nothing further to do.
@@ -2976,6 +3033,10 @@ export class FileTransfer {
   private readonly chunkThreads: number;
   private readonly chunkSize: number;
   private readonly chunkThreshold: number;
+  private readonly parallelConnectionFactory?: ParallelSftpConnectionFactory;
+  private readonly parallelConnections = new Set<SftpConnection>();
+  private readonly rejectRemoteSymlinks: boolean;
+  private chunked = false;
 
   constructor(
     private readonly id: string,
@@ -2983,12 +3044,14 @@ export class FileTransfer {
     private readonly localPath: string,
     private readonly remotePath: string,
     private readonly direction: 'download' | 'upload',
-    private conns: { conn: InstanceType<typeof SSHClient>; jumpConns: InstanceType<typeof SSHClient>[]; sftp: SFTPWrapper },
-    options?: { chunkThreads?: number; chunkSize?: number; chunkThreshold?: number },
+    private conns: SftpConnection,
+    options?: { chunkThreads?: number; chunkSize?: number; chunkThreshold?: number; parallelConnectionFactory?: ParallelSftpConnectionFactory; rejectRemoteSymlinks?: boolean },
   ) {
     this.chunkThreads = Math.max(1, Math.floor(options?.chunkThreads ?? 4));
     this.chunkSize = options?.chunkSize ?? 8 * 1024 * 1024;
     this.chunkThreshold = options?.chunkThreshold ?? DEFAULT_CHUNK_THRESHOLD_BYTES;
+    this.parallelConnectionFactory = options?.parallelConnectionFactory;
+    this.rejectRemoteSymlinks = options?.rejectRemoteSymlinks ?? false;
     this.partPath = direction === 'download'
       ? partPathFor(localPath)
       : partPathFor(remotePath);
@@ -3046,6 +3109,14 @@ export class FileTransfer {
     }
     this.cancelled = true;
     for (const stream of this.streams) (stream as any).destroy();
+    if (this.direction === 'upload' && this.chunked && this.conns) {
+      // A cancelled chunked upload may have a sparse (multi-segment) .part;
+      // remove it while the SFTP channel is still alive so a re-run does not
+      // resume from a holey prefix and fail its sha256 check forever. Linear
+      // uploads keep their .part as a valid resume point. dispose() closes the
+      // channel below, so this must happen before finish() -> dispose().
+      await new Promise<void>((resolve) => this.conns.sftp.unlink(this.partPath, () => resolve()));
+    }
     this.finish('cancelled', null);
   }
 
@@ -3053,9 +3124,8 @@ export class FileTransfer {
     if (this.disposed) return;
     this.disposed = true;
     for (const stream of this.streams) (stream as any).destroy();
-    this.conns.sftp.end();
-    this.conns.conn.end();
-    for (const jumpConn of this.conns.jumpConns) jumpConn.end();
+    this.closeParallelConnections();
+    closeSftpConnection(this.conns);
     this.streams = [];
     this.conns = null as any;
   }
@@ -3167,7 +3237,7 @@ export class FileTransfer {
       throw new Error('upload source is not a file');
     }
     this.totalBytes = localStats.size;
-    await ensureRemoteParentDirectory(this.conns.sftp, this.remotePath);
+    await ensureRemoteParentDirectory(this.conns.sftp, this.remotePath, this.rejectRemoteSymlinks);
     if (this.disposed || this.cancelled) {
       throw new Error('transfer cancelled');
     }
@@ -3187,6 +3257,7 @@ export class FileTransfer {
       ? chunkSegments(localStats.size, offset, this.chunkSize, this.chunkThreads)
       : [];
     if (segs.length > 1) {
+      this.chunked = true;
       try {
         await this.uploadChunks(segs);
       } catch (error) {
@@ -3295,12 +3366,57 @@ export class FileTransfer {
     });
   }
 
+  private async openChunkConnections(count: number): Promise<SftpConnection[]> {
+    const connections = [this.conns];
+    const factory = this.parallelConnectionFactory;
+    if (!factory) return connections;
+    try {
+      const extras = await Promise.all(
+        Array.from({ length: Math.max(0, count - 1) }, () => factory()),
+      );
+      for (const connection of extras) {
+        this.parallelConnections.add(connection);
+        connections.push(connection);
+      }
+      if (this.disposed || this.cancelled) {
+        this.closeParallelConnections();
+        throw new Error('transfer cancelled');
+      }
+      return connections;
+    } catch (error) {
+      this.closeParallelConnections();
+      throw error;
+    }
+  }
+
+  private closeParallelConnections(): void {
+    for (const connection of this.parallelConnections) {
+      try {
+        closeSftpConnection(connection);
+      } catch {
+        // Best-effort cleanup for connections that may already be closed.
+      }
+    }
+    this.parallelConnections.clear();
+  }
+
+  private openRemoteFile(sftp: SFTPWrapper, path: string, flags: OpenMode): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+      sftp.open(path, flags, (err, handle) => err ? reject(err) : resolve(handle));
+    });
+  }
+
+  private closeRemoteFile(sftp: SFTPWrapper, handle: Buffer): Promise<void> {
+    return new Promise((resolve) => sftp.close(handle, () => resolve()));
+  }
+
   private async downloadChunks(segs: Array<{ start: number; end: number }>): Promise<void> {
     const fd = await open(this.partPath, 'w');
     const reads: Array<NodeJS.ReadableStream> = [];
     try {
-      await Promise.all(segs.map(async (seg) => {
-        const read = this.conns.sftp.createReadStream(this.remotePath, { start: seg.start, end: seg.end - 1 });
+      const connections = await this.openChunkConnections(segs.length);
+      const tasks = segs.map(async (seg, index) => {
+        const read = connections[index % connections.length].sftp.createReadStream(this.remotePath, { start: seg.start, end: seg.end - 1 });
         reads.push(read);
         this.streams.push(read);
         let position = seg.start;
@@ -3354,82 +3470,102 @@ export class FileTransfer {
             }
           });
         });
-      }));
+      });
+      try {
+        await Promise.all(tasks);
+      } catch (error) {
+        reads.forEach((read) => (read as any).destroy());
+        await Promise.allSettled(tasks);
+        throw error;
+      }
     } catch (err) {
-      reads.forEach((r) => (r as any).destroy());
       throw err;
     } finally {
       await fd.close();
+      this.closeParallelConnections();
     }
   }
 
   private async uploadChunks(segs: Array<{ start: number; end: number }>): Promise<void> {
-    const handle = await new Promise<Buffer>((resolve, reject) => {
-      this.conns.sftp.open(this.partPath, 'w', (err, h) => err ? reject(err) : resolve(h));
-    });
     const reads: Array<NodeJS.ReadableStream> = [];
     try {
-      await Promise.all(segs.map(async (seg) => {
-        const localRead = createReadStream(this.localPath, { start: seg.start, end: seg.end - 1 });
-        reads.push(localRead);
-        this.streams.push(localRead);
-        let position = seg.start;
-        let streamEnded = false;
-        let pendingWrites = 0;
-        let writeError: Error | null = null;
-        const MAX_INFLIGHT = 64;
-        await new Promise<void>((resolve, reject) => {
-          const maybeResolve = () => {
-            if (streamEnded && pendingWrites === 0 && !writeError) {
-              resolve();
-            }
-          };
-          localRead.on('error', (err: Error) => {
-            writeError = err;
-            reject(err);
-          });
-          localRead.on('close', () => {
-            streamEnded = true;
-            if (writeError) return;
-            maybeResolve();
-          });
-          localRead.on('end', () => {
-            streamEnded = true;
-            if (writeError) return;
-            maybeResolve();
-          });
-          localRead.on('data', (chunk: string | Buffer) => {
-            const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-            pendingWrites += 1;
-            this.transferredBytes += buf.length;
-            const pos = position;
-            position += buf.length;
-            this.conns.sftp.write(handle, buf, 0, buf.length, pos, (err) => {
-              pendingWrites -= 1;
-              if (err) {
-                writeError = err;
-                localRead.destroy();
-                reject(err);
-                return;
+      const connections = await this.openChunkConnections(segs.length);
+      const primarySftp = this.conns.sftp;
+      const initialHandle = await this.openRemoteFile(primarySftp, this.partPath, 'w');
+      await this.closeRemoteFile(primarySftp, initialHandle);
+      const tasks = segs.map(async (seg, index) => {
+        const sftp = connections[index % connections.length].sftp;
+        const handle = await this.openRemoteFile(sftp, this.partPath, 'r+');
+        try {
+          const localRead = createReadStream(this.localPath, { start: seg.start, end: seg.end - 1 });
+          reads.push(localRead);
+          this.streams.push(localRead);
+          let position = seg.start;
+          let streamEnded = false;
+          let pendingWrites = 0;
+          let writeError: Error | null = null;
+          const MAX_INFLIGHT = 64;
+          await new Promise<void>((resolve, reject) => {
+            const maybeResolve = () => {
+              if (streamEnded && pendingWrites === 0 && !writeError) {
+                resolve();
               }
-              if (pendingWrites < MAX_INFLIGHT) {
-                localRead.resume();
-              }
+            };
+            localRead.on('error', (err: Error) => {
+              writeError = err;
+              reject(err);
+            });
+            localRead.on('close', () => {
+              streamEnded = true;
+              if (writeError) return;
               maybeResolve();
             });
-            if (pendingWrites >= MAX_INFLIGHT) {
-              localRead.pause();
-            }
+            localRead.on('end', () => {
+              streamEnded = true;
+              if (writeError) return;
+              maybeResolve();
+            });
+            localRead.on('data', (chunk: string | Buffer) => {
+              const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+              pendingWrites += 1;
+              this.transferredBytes += buf.length;
+              const pos = position;
+              position += buf.length;
+              sftp.write(handle, buf, 0, buf.length, pos, (err) => {
+                pendingWrites -= 1;
+                if (err) {
+                  writeError = err;
+                  localRead.destroy();
+                  reject(err);
+                  return;
+                }
+                if (pendingWrites < MAX_INFLIGHT) {
+                  localRead.resume();
+                }
+                maybeResolve();
+              });
+              if (pendingWrites >= MAX_INFLIGHT) {
+                localRead.pause();
+              }
+            });
           });
-        });
-      }));
+        } finally {
+          if (!this.disposed) {
+            await this.closeRemoteFile(sftp, handle);
+          }
+        }
+      });
+      try {
+        await Promise.all(tasks);
+      } catch (error) {
+        reads.forEach((read) => (read as any).destroy());
+        await Promise.allSettled(tasks);
+        throw error;
+      }
     } catch (err) {
-      reads.forEach((r) => (r as any).destroy());
       throw err;
     } finally {
-      if (this.conns) {
-        await new Promise<void>((resolve) => this.conns.sftp.close(handle, () => resolve()));
-      }
+      this.closeParallelConnections();
     }
   }
 
@@ -3459,13 +3595,20 @@ export class DirectoryTransfer {
     private readonly sourcePath: string,
     private readonly targetPath: string,
     private readonly direction: 'download-dir' | 'upload-dir',
-    private conns: { conn: InstanceType<typeof SSHClient>; jumpConns: InstanceType<typeof SSHClient>[]; sftp: SFTPWrapper },
-    options?: { concurrency?: number; chunkThreads?: number; chunkSize?: number; chunkThreshold?: number },
+    private conns: SftpConnection,
+    options?: {
+      concurrency?: number;
+      chunkThreads?: number;
+      chunkSize?: number;
+      chunkThreshold?: number;
+      parallelConnectionFactory?: ParallelSftpConnectionFactory;
+    },
   ) {
     this.concurrency = Math.max(1, options?.concurrency ?? 4);
     this.chunkThreads = Math.max(1, Math.floor(options?.chunkThreads ?? 4));
     this.chunkSize = options?.chunkSize ?? 8 * 1024 * 1024;
     this.chunkThreshold = options?.chunkThreshold ?? DEFAULT_CHUNK_THRESHOLD_BYTES;
+    this.parallelConnectionFactory = options?.parallelConnectionFactory;
     conns.conn.once?.('error', (error: Error) => this.markFailed(error.message));
     conns.conn.once?.('end', () => this.markFailed('SSH connection ended'));
     conns.conn.once?.('close', () => this.markFailed('SSH connection closed'));
@@ -3479,6 +3622,7 @@ export class DirectoryTransfer {
   private readonly chunkThreads: number;
   private readonly chunkSize: number;
   private readonly chunkThreshold: number;
+  private readonly parallelConnectionFactory?: ParallelSftpConnectionFactory;
 
   async start(): Promise<void> {
     if (this.disposed) {
@@ -3529,7 +3673,7 @@ export class DirectoryTransfer {
             if (this.direction === 'download-dir') {
               await mkdir(target, { recursive: true });
             } else {
-              await ensureRemoteParentDirectory(this.conns.sftp, posixPath.join(target, '.mkdir'));
+              await ensureRemoteParentDirectory(this.conns.sftp, posixPath.join(target, '.mkdir'), true);
             }
             continue;
           }
@@ -3566,6 +3710,10 @@ export class DirectoryTransfer {
   }
 
   private async listFiles(rootPath: string): Promise<DirEntry[]> {
+    const rootStats = await sftpLstat(this.conns.sftp, rootPath);
+    if (rootStats.isSymbolicLink()) {
+      throw new McpError(ErrorCode.InvalidParams, `Remote path '${rootPath}' is a symlink; refusing to follow it for download`);
+    }
     const out: DirEntry[] = [];
     const walk = async (dirPath: string, relDir: string) => {
       const handle = await new Promise<Buffer>((resolve, reject) => {
@@ -3587,6 +3735,11 @@ export class DirectoryTransfer {
         for (const item of list) {
           const name = item.filename;
           if (name === '.' || name === '..') continue;
+          if (item.attrs.isSymbolicLink()) {
+            // Never follow remote symlinks: they may point outside the tree.
+            // The download manifest must contain only real files and dirs.
+            continue;
+          }
           const relPath = relDir ? `${relDir}/${name}` : name;
           if (item.attrs.isDirectory()) {
             out.push({ relPath, size: 0, isDir: true });
@@ -3679,7 +3832,13 @@ export class DirectoryTransfer {
         jumpConns: [],
         sftp: subProxy(this.conns.sftp),
       } as any,
-      { chunkThreads: this.chunkThreads, chunkSize: this.chunkSize, chunkThreshold: this.chunkThreshold },
+      {
+        chunkThreads: this.chunkThreads,
+        chunkSize: this.chunkSize,
+        chunkThreshold: this.chunkThreshold,
+        parallelConnectionFactory: this.parallelConnectionFactory,
+        rejectRemoteSymlinks: this.direction === 'upload-dir',
+      },
     );
     this.subTransfers.add(ft);
     try {
@@ -3741,9 +3900,7 @@ export class DirectoryTransfer {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    this.conns.sftp.end();
-    this.conns.conn.end();
-    for (const jumpConn of this.conns.jumpConns) jumpConn.end();
+    closeSftpConnection(this.conns);
     this.conns = null as any;
   }
 

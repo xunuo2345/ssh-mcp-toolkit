@@ -229,6 +229,7 @@ describe('FileTransfer upload resume', () => {
         calls.rename.push({ from, to });
         cb(null);
       },
+      unlink(_path: string, cb: (error: Error | null) => void) { cb(null); },
       createReadStream(path: string) {
         const data = corruptRead ? Buffer.alloc(remoteContent.length, 0xff) : remoteContent;
         const r = new Readable();
@@ -324,6 +325,82 @@ describe('FileTransfer upload resume', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
+  it('unlinks the sparse remote .part when a chunked upload is cancelled mid-flight', async () => {
+    const { FileTransfer, partPathFor } = await import('../src/index.js');
+    const dir = await mkdtemp(join(tmpdir(), 'chunk-up-cancel-'));
+    const local = join(dir, 'src.bin');
+    const full = Buffer.alloc(100, 0x7a);
+    await writeFile(local, full);
+    let remoteContent = Buffer.alloc(0);
+    let remoteExists = false;
+    const calls = { unlink: [] as string[], open: [] as string[], rename: 0, writes: 0 };
+    // First write blocks until the test releases it, so cancel() is guaranteed
+    // to land while segments are still in flight (deterministic, no sleeps).
+    let releaseFirstWrite!: () => void;
+    const firstWriteGate = new Promise<void>((r) => { releaseFirstWrite = r; });
+    let firstWriteSeen!: () => void;
+    const firstWriteStarted = new Promise<void>((r) => { firstWriteSeen = r; });
+    let blocked = true;
+    const sftp = {
+      stat(path: string, cb: (e: Error | null, s?: any) => void) {
+        if (path === '/remote') { cb(null, { size: 0, isDirectory: () => true }); return; }
+        if (!remoteExists) { cb(new Error('ENOENT') as any); return; }
+        cb(null, { size: remoteContent.length, isDirectory: () => false });
+      },
+      lstat(path: string, cb: (e: Error | null, s?: any) => void) {
+        if (path === '/remote') { cb(null, { size: 0, isDirectory: () => true, isSymbolicLink: () => false }); return; }
+        cb(new Error('ENOENT') as any);
+      },
+      open(path: string, flags: string, cb: (e: Error | null, h?: Buffer) => void) {
+        calls.open.push(flags);
+        if (flags === 'w') {
+          remoteContent = Buffer.alloc(full.length, 0);
+          remoteExists = true;
+        }
+        cb(null, Buffer.from([calls.open.length]));
+      },
+      write(_h: Buffer, buf: Buffer, _o: number, length: number, position: number, cb: (e: Error | null) => void) {
+        calls.writes += 1;
+        buf.copy(remoteContent, position, 0, length);
+        if (blocked) {
+          blocked = false;
+          firstWriteSeen();
+          void firstWriteGate.then(() => cb(null));
+        } else {
+          cb(null);
+        }
+      },
+      close(_h: Buffer, cb: (e: Error | null) => void) { cb(null); },
+      fstat(_h: Buffer, cb: (e: Error | null, s?: any) => void) { cb(null, { size: remoteContent.length }); },
+      rename(_f: string, _t: string, cb: (e: Error | null) => void) { calls.rename += 1; cb(null); },
+      unlink(path: string, cb: (e: Error | null) => void) { calls.unlink.push(path); cb(null); },
+      createReadStream(_p: string) {
+        const r = new Readable();
+        r._read = () => {};
+        r.push(remoteContent);
+        r.push(null);
+        return r;
+      },
+      end() {},
+    };
+    const conns = { conn: { end() {} } as any, jumpConns: [] as any[], sftp: sftp as any };
+    const t = new FileTransfer('cu1', 'A', local, '/remote/dst.bin', 'upload',
+      { conn: conns.conn, jumpConns: conns.jumpConns, sftp: conns.sftp },
+      { chunkThreads: 4, chunkSize: 50, chunkThreshold: 100 });
+    const startPromise = t.start();
+    // Wait until the first chunk write is actually in flight before cancelling.
+    await firstWriteStarted;
+    await t.cancel();
+    // Now let the in-flight writes complete so start() can settle.
+    releaseFirstWrite();
+    await startPromise;
+    expect(t.getInfo().state).toBe('cancelled');
+    // cancel() must unlink the holey .part while the channel is alive, so a
+    // re-run cannot resume from a sparse prefix and fail its sha256 check.
+    expect(calls.unlink).toEqual([partPathFor('/remote/dst.bin')]);
+    await rm(dir, { recursive: true, force: true });
+  });
+
   it('removes the sparse remote .part on chunked failure so a re-run succeeds', async () => {
     const { FileTransfer } = await import('../src/index.js');
     const dir = await mkdtemp(join(tmpdir(), 'resume-up6-'));
@@ -402,6 +479,74 @@ describe('FileTransfer upload resume', () => {
     expect(t2.getInfo().state).toBe('completed');
     expect(calls.rename).toBe(1);
     expect(remoteContent.equals(full)).toBe(true);
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('uses independent SFTP sessions for concurrent upload chunks when supplied', async () => {
+    const { FileTransfer } = await import('../src/index.js');
+    const dir = await mkdtemp(join(tmpdir(), 'chunk-up-conns-'));
+    const local = join(dir, 'src.bin');
+    const full = Buffer.alloc(100, 0x7a);
+    await writeFile(local, full);
+    let remoteContent = Buffer.alloc(0);
+    let remoteExists = false;
+    let factoryCalls = 0;
+    const writes: string[] = [];
+    const closed: string[] = [];
+    const makeSftp = (connection: string) => ({
+      stat(path: string, cb: (e: Error | null, s?: any) => void) {
+        if (path === '/remote') { cb(null, { size: 0, isDirectory: () => true }); return; }
+        if (remoteExists) { cb(null, { size: remoteContent.length, isDirectory: () => false }); return; }
+        cb(new Error('ENOENT') as any);
+      },
+      open(_path: string, flags: string, cb: (e: Error | null, h?: Buffer) => void) {
+        if (flags === 'w') {
+          remoteContent = Buffer.alloc(0);
+          remoteExists = true;
+        }
+        cb(null, Buffer.from(connection));
+      },
+      write(_h: Buffer, buf: Buffer, _o: number, length: number, position: number, cb: (e: Error | null) => void) {
+        writes.push(connection);
+        const endPos = position + length;
+        if (endPos > remoteContent.length) {
+          const grown = Buffer.alloc(endPos);
+          remoteContent.copy(grown);
+          remoteContent = grown;
+        }
+        buf.copy(remoteContent, position, 0, length);
+        cb(null);
+      },
+      close(_h: Buffer, cb: (e: Error | null) => void) { cb(null); },
+      fstat(_h: Buffer, cb: (e: Error | null, s?: any) => void) { cb(null, { size: remoteContent.length }); },
+      rename(_from: string, _to: string, cb: (e: Error | null) => void) { cb(null); },
+      createReadStream(_path: string) {
+        const r = new Readable();
+        r._read = () => {};
+        r.push(remoteContent);
+        r.push(null);
+        return r;
+      },
+      end() { closed.push(connection); },
+    });
+    const primary = makeSftp('primary');
+    const transfer = new FileTransfer('u8', 'A', local, '/remote/dst.bin', 'upload',
+      { conn: { end() {} } as any, jumpConns: [], sftp: primary as any },
+      {
+        chunkThreads: 4,
+        chunkSize: 50,
+        chunkThreshold: 100,
+        parallelConnectionFactory: async () => {
+          factoryCalls += 1;
+          return { conn: { end() {} } as any, jumpConns: [], sftp: makeSftp(`extra-${factoryCalls}`) as any };
+        },
+      });
+    await transfer.start();
+    expect(transfer.getInfo().state).toBe('completed');
+    expect(factoryCalls).toBe(1);
+    expect(new Set(writes)).toEqual(new Set(['primary', 'extra-1']));
+    expect(closed).toContain('extra-1');
+    expect(remoteContent).toEqual(full);
     await rm(dir, { recursive: true, force: true });
   });
 });

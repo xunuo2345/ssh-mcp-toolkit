@@ -65,15 +65,15 @@ describe('dir helpers', () => {
 });
 
 describe('DirectoryTransfer listing', () => {
-  function makeDirSftp(tree: Record<string, { size: number; dir?: boolean }>) {
-    const entries: Record<string, Array<{ filename: string; attrs: { size: number; isDirectory: () => boolean } }>> = {};
+  function makeDirSftp(tree: Record<string, { size: number; dir?: boolean; symlink?: boolean }>) {
+    const entries: Record<string, Array<{ filename: string; attrs: { size: number; isDirectory: () => boolean; isSymbolicLink: () => boolean } }>> = {};
     for (const [path, info] of Object.entries(tree)) {
       const parent = path.slice(0, path.lastIndexOf('/'));
       const name = path.slice(path.lastIndexOf('/') + 1);
       if (info.dir) {
-        (entries[parent] ??= []).push({ filename: name, attrs: { size: 0, isDirectory: () => true } });
+        (entries[parent] ??= []).push({ filename: name, attrs: { size: 0, isDirectory: () => true, isSymbolicLink: () => false } });
       } else {
-        (entries[parent] ??= []).push({ filename: name, attrs: { size: info.size, isDirectory: () => false } });
+        (entries[parent] ??= []).push({ filename: name, attrs: { size: info.size, isDirectory: () => false, isSymbolicLink: () => !!info.symlink } });
       }
     }
     const consumed: Record<string, boolean> = {};
@@ -87,7 +87,12 @@ describe('DirectoryTransfer listing', () => {
       },
       stat(path: string, cb: (err: Error | null, stats?: any) => void) {
         const info = tree[path];
-        if (info) cb(null, { size: info.size, isDirectory: () => !!info.dir });
+        if (info) cb(null, { size: info.size, isDirectory: () => !!info.dir, isSymbolicLink: () => false });
+        else cb(new Error('ENOENT') as any);
+      },
+      lstat(path: string, cb: (err: Error | null, stats?: any) => void) {
+        const info = tree[path];
+        if (info) cb(null, { size: info.size, isDirectory: () => !!info.dir, isSymbolicLink: () => !!info.symlink });
         else cb(new Error('ENOENT') as any);
       },
       close(_handle: Buffer, cb: (err: Error | null) => void) { cb(null); },
@@ -114,6 +119,40 @@ describe('DirectoryTransfer listing', () => {
       { relPath: 'sub', size: 0, isDir: true },
       { relPath: 'sub/b.bin', size: 200 },
     ]);
+  });
+
+  it('skips remote symlink entries so the manifest never follows them', async () => {
+    const { DirectoryTransfer } = await import('../src/index.js');
+    const tree = {
+      '/data': { size: 0, dir: true },
+      '/data/a.bin': { size: 100 },
+      '/data/secret': { size: 0, symlink: true },
+      '/data/sub': { size: 0, dir: true },
+      '/data/sub/b.bin': { size: 200 },
+    };
+    const sftp = makeDirSftp(tree);
+    const t = new DirectoryTransfer('d1s', 'A', '/data', '/local/data', 'download-dir',
+      { conn: { end() {} } as any, jumpConns: [], sftp: sftp as any });
+    (t as any).conns = { conn: { end() {} }, jumpConns: [], sftp };
+    const listing = await (t as any).listFiles('/data');
+    expect(listing).toEqual([
+      { relPath: 'a.bin', size: 100 },
+      { relPath: 'sub', size: 0, isDir: true },
+      { relPath: 'sub/b.bin', size: 200 },
+    ]);
+  });
+
+  it('rejects a remote download root that is itself a symlink', async () => {
+    const { DirectoryTransfer } = await import('../src/index.js');
+    const tree = {
+      '/data': { size: 0, symlink: true },
+      '/target/file.bin': { size: 100 },
+    };
+    const sftp = makeDirSftp(tree);
+    const t = new DirectoryTransfer('d1r', 'A', '/data', '/local/data', 'download-dir',
+      { conn: { end() {} } as any, jumpConns: [], sftp: sftp as any });
+    (t as any).conns = { conn: { end() {} }, jumpConns: [], sftp };
+    await expect((t as any).listFiles('/data')).rejects.toThrow(/symlink/);
   });
 
   it('lists the local tree for upload-dir', async () => {
@@ -173,6 +212,10 @@ describe('DirectoryTransfer listing', () => {
         if (existing.has(path)) cb(null, { size: 0, isDirectory: () => true });
         else cb(new Error('ENOENT') as any);
       },
+      lstat(path: string, cb: (e: Error | null, s?: any) => void) {
+        if (existing.has(path)) cb(null, { size: 0, isDirectory: () => true, isSymbolicLink: () => false });
+        else cb(new Error('ENOENT') as any);
+      },
       mkdir(path: string, _opts: any, cb: (e: Error | null) => void) { mkdirs.push(path); existing.add(path); cb(null); },
       end() {},
     };
@@ -182,6 +225,38 @@ describe('DirectoryTransfer listing', () => {
     expect(t.getInfo().state).toBe('completed');
     expect(t.getInfo().filesDone).toBe(0);
     expect(mkdirs).toContain('/remote/data/empty');
+    await rm(localRoot, { recursive: true, force: true });
+  });
+
+  it('upload-dir refuses to write through a symlinked remote parent', async () => {
+    const { DirectoryTransfer } = await import('../src/index.js');
+    const { mkdtemp, mkdir, writeFile, rm } = await import('fs/promises');
+    const { join } = await import('path');
+    const { tmpdir } = await import('os');
+    const localRoot = await mkdtemp(join(tmpdir(), 'dirup-sym-'));
+    await mkdir(join(localRoot, 'sub'), { recursive: true });
+    await writeFile(join(localRoot, 'sub', 'evil.bin'), Buffer.alloc(5));
+    const mkdirs: string[] = [];
+    const sftp = {
+      stat(_path: string, cb: (e: Error | null, s?: any) => void) {
+        cb(new Error('ENOENT') as any);
+      },
+      lstat(path: string, cb: (e: Error | null, s?: any) => void) {
+        if (path === '/remote') {
+          cb(null, { size: 0, isDirectory: () => true, isSymbolicLink: () => false });
+          return;
+        }
+        // '/remote/data' and below are a symlink -> /etc
+        cb(null, { size: 0, isDirectory: () => true, isSymbolicLink: () => true });
+      },
+      mkdir(path: string, _opts: any, cb: (e: Error | null) => void) { mkdirs.push(path); cb(null); },
+      end() {},
+    };
+    const t = new DirectoryTransfer('du1s', 'A', '/remote/data', localRoot, 'upload-dir',
+      { conn: { end() {} } as any, jumpConns: [], sftp: sftp as any });
+    await t.start();
+    expect(t.getInfo().state).toBe('failed');
+    expect(t.getInfo().error).toContain('symlink');
     await rm(localRoot, { recursive: true, force: true });
   });
 
@@ -207,11 +282,11 @@ describe('DirectoryTransfer listing', () => {
       opendir(path: string, cb: (err: Error | null, handle?: Buffer) => void) { cb(null, Buffer.from(path)); },
       readdir(handle: Buffer, cb: (err: Error | null, list?: any[]) => void) {
         const key = handle.toString();
-        const items: Array<{ filename: string; attrs: { size: number; isDirectory: () => boolean } }> = [];
+        const items: Array<{ filename: string; attrs: { size: number; isDirectory: () => boolean; isSymbolicLink: () => boolean } }> = [];
         for (const [p, info] of Object.entries(tree)) {
           if (p.slice(0, p.lastIndexOf('/')) === key) {
             const name = p.slice(p.lastIndexOf('/') + 1);
-            items.push({ filename: name, attrs: { size: info.size, isDirectory: () => !!info.dir } });
+            items.push({ filename: name, attrs: { size: info.size, isDirectory: () => !!info.dir, isSymbolicLink: () => false } });
           }
         }
         if (consumed[key]) { cb({ code: 1, message: 'End of file' } as any); return; }
@@ -221,7 +296,12 @@ describe('DirectoryTransfer listing', () => {
       stat(path: string, cb: (err: Error | null, stats?: any) => void) {
         statCalls.push(path);
         const info = tree[path];
-        if (info) cb(null, { size: info.size, isDirectory: () => !!info.dir });
+        if (info) cb(null, { size: info.size, isDirectory: () => !!info.dir, isSymbolicLink: () => false });
+        else cb(new Error('ENOENT') as any);
+      },
+      lstat(path: string, cb: (err: Error | null, stats?: any) => void) {
+        const info = tree[path];
+        if (info) cb(null, { size: info.size, isDirectory: () => !!info.dir, isSymbolicLink: () => false });
         else cb(new Error('ENOENT') as any);
       },
       createReadStream(path: string) {
@@ -353,6 +433,110 @@ describe('FileTransfer chunked download', () => {
     expect(new Set(starts).size).toBeGreaterThan(1); // distinct range starts prove parallel segments
     const finalContent = await readFile(local);
     expect(finalContent.length).toBe(100);
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('uses independent SFTP sessions for chunk ranges when supplied', async () => {
+    const { FileTransfer } = await import('../src/index.js');
+    const { mkdtemp, readFile, rm } = await import('fs/promises');
+    const { join } = await import('path');
+    const { tmpdir } = await import('os');
+    const dir = await mkdtemp(join(tmpdir(), 'chunk-dl-conns-'));
+    const local = join(dir, 'big.bin');
+    const full = Buffer.alloc(100, 0x42);
+    const reads: Array<{ connection: string; start: number }> = [];
+    const closed: string[] = [];
+    const makeSftp = (connection: string) => ({
+      stat(_p: string, cb: (e: Error | null, s?: any) => void) { cb(null, { size: full.length, isDirectory: () => false }); },
+      createReadStream(_p: string, opts?: any) {
+        reads.push({ connection, start: opts?.start ?? 0 });
+        const { Readable } = require('stream');
+        const r = new Readable();
+        r._read = () => {};
+        r.push(full.subarray(opts?.start ?? 0, Math.min((opts?.end ?? full.length - 1) + 1, full.length)));
+        r.push(null);
+        return r;
+      },
+      rename(_f: string, _t: string, cb: (e: Error | null) => void) { cb(null); },
+      end() { closed.push(connection); },
+    });
+    let factoryCalls = 0;
+    const ft = new FileTransfer('x2', 'A', local, '/remote/big.bin', 'download',
+      { conn: { end() {} } as any, jumpConns: [], sftp: makeSftp('primary') as any },
+      {
+        chunkThreads: 4,
+        chunkSize: 50,
+        chunkThreshold: 100,
+        parallelConnectionFactory: async () => {
+          factoryCalls += 1;
+          return { conn: { end() {} } as any, jumpConns: [], sftp: makeSftp(`extra-${factoryCalls}`) as any };
+        },
+      });
+    await ft.start();
+    expect(ft.getInfo().state).toBe('completed');
+    expect(factoryCalls).toBe(1);
+    expect(new Set(reads.map((read) => read.connection))).toEqual(new Set(['primary', 'extra-1']));
+    expect(closed).toContain('extra-1');
+    expect(await readFile(local)).toEqual(full);
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('opens extra chunk connections concurrently, not serially', async () => {
+    const { FileTransfer } = await import('../src/index.js');
+    const { mkdtemp, readFile, rm } = await import('fs/promises');
+    const { join } = await import('path');
+    const { tmpdir } = await import('os');
+    const dir = await mkdtemp(join(tmpdir(), 'chunk-dl-par-'));
+    const local = join(dir, 'big.bin');
+    const full = Buffer.alloc(100, 0x42);
+    const reads: Array<{ connection: string; start: number }> = [];
+    const closed: string[] = [];
+    const makeSftp = (connection: string) => ({
+      stat(_p: string, cb: (e: Error | null, s?: any) => void) { cb(null, { size: full.length, isDirectory: () => false }); },
+      createReadStream(_p: string, opts?: any) {
+        reads.push({ connection, start: opts?.start ?? 0 });
+        const { Readable } = require('stream');
+        const r = new Readable();
+        r._read = () => {};
+        r.push(full.subarray(opts?.start ?? 0, Math.min((opts?.end ?? full.length - 1) + 1, full.length)));
+        r.push(null);
+        return r;
+      },
+      rename(_f: string, _t: string, cb: (e: Error | null) => void) { cb(null); },
+      end() { closed.push(connection); },
+    });
+    let factoryCalls = 0;
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const started = Date.now();
+    const ft = new FileTransfer('x7', 'A', local, '/remote/big.bin', 'download',
+      { conn: { end() {} } as any, jumpConns: [], sftp: makeSftp('primary') as any },
+      {
+        chunkThreads: 4,
+        chunkSize: 25,
+        chunkThreshold: 100,
+        parallelConnectionFactory: async () => {
+          const name = `extra-${++factoryCalls}`;
+          inFlight += 1;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          await new Promise((r) => setTimeout(r, 40));
+          inFlight -= 1;
+          return { conn: { end() {} } as any, jumpConns: [], sftp: makeSftp(name) as any };
+        },
+      });
+    await ft.start();
+    const elapsed = Date.now() - started;
+    expect(ft.getInfo().state).toBe('completed');
+    expect(factoryCalls).toBe(3);
+    // Three extras open concurrently: peak in-flight > 1 proves Promise.all,
+    // not a serial loop. Wall-clock stays well under 2× the factory latency.
+    expect(maxInFlight).toBeGreaterThan(1);
+    expect(elapsed).toBeLessThan(100);
+    expect(new Set(reads.map((read) => read.connection))).toEqual(new Set(['primary', 'extra-1', 'extra-2', 'extra-3']));
+    expect(closed).toContain('extra-1');
+    expect(closed).toContain('extra-2');
+    expect(closed).toContain('extra-3');
+    expect(await readFile(local)).toEqual(full);
     await rm(dir, { recursive: true, force: true });
   });
 
