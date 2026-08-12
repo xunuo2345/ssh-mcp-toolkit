@@ -1722,6 +1722,55 @@ export type CommandCallbacks = {
 };
 
 /**
+ * Remote shell flavour. Drives both the PS1/prompt cleanup on session start
+ * and the completion-marker command injected by `ShellCommandQueue` after
+ * each command. POSIX (bash/zsh/sh) uses `printf` + `$?`; Windows (cmd.exe /
+ * PowerShell) uses `echo` + `%ERRORLEVEL%` because cmd has no `printf` and
+ * the `$?` variable is POSIX-specific.
+ */
+export type ShellType = 'posix' | 'windows';
+
+/**
+ * Build the completion-marker line that the queue writes after each command.
+ * The marker must be a single line whose suffix is the last command's exit
+ * code; the queue's parser (`processPending`) strips the marker from the
+ * output buffer and reads the trailing digits as the exit code.
+ *
+ * Exported for unit testing; see `test/exec-async.test.ts`.
+ */
+export function buildMarkerCommand(shellType: ShellType, marker: string): string {
+  if (shellType === 'windows') {
+    return `echo ${marker}%ERRORLEVEL%\n`;
+  }
+  return `printf '${marker}%d\\n' $?\n`;
+}
+
+/**
+ * Classify the remote shell from the probe response text captured between
+ * `__MCP_PROBE_<uuid>__` markers. The probe writes `$(uname -s 2>/dev/null)`:
+ * - POSIX shells (bash/zsh/sh) expand the substitution → `Linux`/`Darwin`/...
+ * - cmd.exe does not understand `$()` → echoes the literal `$(uname -s ...)`
+ *   and prints `'<cmd>' is not recognized` for the failed call.
+ * - PowerShell expands `$()` but `uname` is missing → echoes empty string;
+ *   we treat that as POSIX-shaped since pwsh's `echo <token>$LASTEXITCODE`
+ *   cannot use `%ERRORLEVEL%` anyway and is out of scope (Windows branch
+ *   targets cmd.exe specifically).
+ *
+ * Returns 'posix' on ambiguous/empty responses to preserve the legacy
+ * behaviour for any shell that successfully runs `uname`.
+ */
+export function detectShellTypeFromProbe(response: string): ShellType {
+  const trimmed = response.trim();
+  if (/\b(Linux|Darwin|FreeBSD|OpenBSD|NetBSD)\b/i.test(trimmed)) {
+    return 'posix';
+  }
+  if (trimmed.includes('$(') || /is not recognized/i.test(trimmed)) {
+    return 'windows';
+  }
+  return 'posix';
+}
+
+/**
  * Serialises shell command execution over a single shell stream: one command at
  * a time, completion detected via a `__MCP_DONE__{uuid}__` marker, output
  * streamed incrementally through onData until the marker is consumed.
@@ -1747,7 +1796,25 @@ export class ShellCommandQueue {
     markerExpected: boolean;
   } | null = null;
 
-  constructor(private readonly shell: { write(data: string, cb?: (err: Error | null | undefined) => void): void }) {}
+  constructor(
+    private readonly shell: { write(data: string, cb?: (err: Error | null | undefined) => void): void },
+    options?: { shellType?: ShellType },
+  ) {
+    this.shellType = options?.shellType ?? 'posix';
+  }
+
+  private shellType: ShellType;
+
+  /**
+   * Switch the shell flavour used to emit the completion marker. Called by
+   * `PersistentSession.ensureConnected` once it has detected whether the
+   * remote shell is POSIX (bash/zsh/sh) or Windows (cmd.exe). Changing this
+   * mid-session is safe because each `launch` reads `shellType` at the
+   * moment the marker is written.
+   */
+  setShellType(shellType: ShellType): void {
+    this.shellType = shellType;
+  }
 
   get hasPending(): boolean {
     return this.pending !== null;
@@ -1776,9 +1843,9 @@ export class ShellCommandQueue {
       if (options?.interactive) {
         return;
       }
-      this.shell.write(`printf '${marker}%d\n' $?\n`, (printfErr) => {
-        if (printfErr) {
-          this.rejectPending(printfErr);
+      this.shell.write(buildMarkerCommand(this.shellType, marker), (markerErr) => {
+        if (markerErr) {
+          this.rejectPending(markerErr);
         }
       });
     });
@@ -1808,7 +1875,7 @@ export class ShellCommandQueue {
       // subsequent output. Trim is now unsafe (see pending.markerExpected).
       this.pending.markerExpected = true;
       this.shell.write('\n');
-      this.shell.write(`printf '${this.pending.marker}%d\n' $?\n`);
+      this.shell.write(buildMarkerCommand(this.shellType, this.pending.marker));
     }
   }
 
@@ -1834,17 +1901,32 @@ export class ShellCommandQueue {
       return;
     }
     const afterMarker = this.buffer.slice(markerIndex + marker.length);
-    const newlineIndex = afterMarker.indexOf('\n');
-    if (newlineIndex === -1) {
+    // Match the exit code as one or more digits immediately after the
+    // marker. POSIX `printf '%d\n' $?` ends with a single `\n`; cmd's
+    // `echo marker%ERRORLEVEL%` ends with a trailing space (and possibly a
+    // `\r\n` that the channel layer has not yet delivered). Accepting the
+    // exit code as soon as `\d+` is present lets both formats complete
+    // without waiting for a newline that may never arrive over cmd.
+    const codeMatch = /^(\d+)/.exec(afterMarker);
+    if (!codeMatch) {
       this.pushIncrement(markerIndex);
       return;
     }
+    const exitCode = Number.parseInt(codeMatch[1], 10);
+    const codeLen = codeMatch[1].length;
+    // Consume any trailing whitespace (newline / space / CRLF) so the
+    // remainder of `buffer` starts cleanly at the next command's output.
+    const trailingMatch = /^[\s\r\n]*/.exec(afterMarker.slice(codeLen));
+    const trailingLen = trailingMatch?.[0].length ?? 0;
+    const consumedInBuffer = markerIndex + marker.length + codeLen + trailingLen;
+    // Flush the pre-marker chunk to the consumer first (pushIncrement in
+    // non-interactive mode just advances pushedUntil without trimming the
+    // buffer — the marker line itself is protocol data and must not be
+    // surfaced as command output).
     this.pushIncrement(markerIndex);
-    const exitCodeText = afterMarker.slice(0, newlineIndex).trim();
-    const remaining = afterMarker.slice(newlineIndex + 1);
     const output = this.buffer.slice(0, markerIndex).replace(/\r/g, '');
-    const exitCode = Number.parseInt(exitCodeText, 10);
-    this.buffer = remaining;
+    this.buffer = this.buffer.slice(consumedInBuffer);
+    this.pending.pushedUntil = Math.max(0, this.pending.pushedUntil - consumedInBuffer);
     if (this.buffer.startsWith('__MCP_DONE__') || /^\s*$/.test(this.buffer)) {
       this.buffer = '';
     }
@@ -1969,6 +2051,11 @@ export class PersistentSession {
   private readonly createdAt = Date.now();
   private lastCommand: string | null = null;
   private sessionOutput = '';
+  private shellType: ShellType = 'posix';
+  /** Probe marker in flight; cleared once `applyShellSetup` resolves. */
+  private shellProbeMarker: string | null = null;
+  /** Timeout handle for the shell-type probe fallback (defaults to posix). */
+  private shellProbeTimer: NodeJS.Timeout | null = null;
 
   constructor(
     private readonly id: string,
@@ -2021,6 +2108,80 @@ export class PersistentSession {
     this.commandQueue?.handleData(data);
   }
 
+  /**
+   * Route shell output. While the initial shell-type probe is in flight the
+   * raw data is also fed into the probe handler so we can decide whether the
+   * remote is POSIX or Windows before any user-visible command runs. After
+   * the probe resolves, behaves identically to `onSessionData`.
+   */
+  private handleShellData(data: string): void {
+    if (this.shellProbeMarker && data.includes(this.shellProbeMarker)) {
+      const idx = data.indexOf(this.shellProbeMarker);
+      const response = data.slice(idx + this.shellProbeMarker.length);
+      this.finaliseShellTypeProbe(detectShellTypeFromProbe(response));
+      // Trim the marker (and the shell-defined echo output) from the probe
+      // chunk so it does not pollute `sessionOutput` or the commandQueue.
+      const before = data.slice(0, idx);
+      if (before) {
+        this.onSessionData(before);
+      }
+      // The trailing response line is the echo's own output — drop it.
+      return;
+    }
+    this.onSessionData(data);
+  }
+
+  private beginShellTypeProbe(): void {
+    const marker = `__MCP_PROBE_${randomUUID()}__`;
+    this.shellProbeMarker = marker;
+    // The probe is `echo <marker>$(uname -s 2>/dev/null)`. On POSIX the
+    // `$(...)` expands to e.g. `Linux`; on cmd.exe it is echoed literally
+    // and `uname` errors with `is not recognized`. Both responses are
+    // classified by `detectShellTypeFromProbe`.
+    this.shell?.write(`echo ${marker}$(uname -s 2>/dev/null)\n`);
+    // 1.5 s fallback so a slow or noisy shell does not block first command.
+    this.shellProbeTimer = setTimeout(() => {
+      if (this.shellProbeMarker === marker) {
+        this.finaliseShellTypeProbe('posix');
+      }
+    }, 1500);
+  }
+
+  private finaliseShellTypeProbe(detected: ShellType): void {
+    if (!this.shellProbeMarker) {
+      return;
+    }
+    this.shellType = detected;
+    this.commandQueue?.setShellType(detected);
+    this.shellProbeMarker = null;
+    if (this.shellProbeTimer) {
+      clearTimeout(this.shellProbeTimer);
+      this.shellProbeTimer = null;
+    }
+    this.applyShellSetup(detected);
+  }
+
+  /**
+   * Emit shell-specific PS1 / echo setup commands. POSIX uses `export PS1=""`
+   * to silence the prompt and `stty -echo` to suppress terminal echo of
+   * typed input; cmd.exe does not understand either command, so we skip
+   * setup entirely and let the default cmd prompt + echo behaviour stand.
+   * PowerShell users on the Windows branch are unsupported by this fix —
+   * see `.trail/issues.md` for scope.
+   */
+  private applyShellSetup(shellType: ShellType): void {
+    if (!this.shell) {
+      return;
+    }
+    if (shellType === 'posix') {
+      this.shell.write('export PS1=""\n');
+      this.shell.write('stty -echo 2>/dev/null\n');
+    }
+    // For 'windows' we intentionally write nothing: cmd.exe's default
+    // prompt and echo behaviour are left in place so the first user
+    // command is not preceded by a 'export is not recognized' error.
+  }
+
   async ensureConnected(): Promise<void> {
     if (this.disposed) {
       throw new McpError(ErrorCode.InternalError, `Session ${this.id} has been disposed`);
@@ -2062,7 +2223,7 @@ export class PersistentSession {
         stream.setEncoding('utf8');
         this.commandQueue = new ShellCommandQueue(stream);
         stream.on('data', (data: string) => {
-          this.onSessionData(data);
+          this.handleShellData(data);
         });
         stream.on('close', () => {
           this.commandQueue?.handleClose();
@@ -2072,8 +2233,9 @@ export class PersistentSession {
           this.onSessionData(data);
         });
 
-        stream.write('export PS1=""\n');
-        stream.write('stty -echo 2>/dev/null\n');
+        // Defer session-output routing for the in-flight probe chunk so it
+        // doesn't bleed into the user-visible session output buffer.
+        this.beginShellTypeProbe();
         resolve();
       });
     });
