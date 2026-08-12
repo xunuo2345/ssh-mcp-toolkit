@@ -1724,11 +1724,12 @@ export type CommandCallbacks = {
 /**
  * Remote shell flavour. Drives both the PS1/prompt cleanup on session start
  * and the completion-marker command injected by `ShellCommandQueue` after
- * each command. POSIX (bash/zsh/sh) uses `printf` + `$?`; Windows (cmd.exe /
- * PowerShell) uses `echo` + `%ERRORLEVEL%` because cmd has no `printf` and
- * the `$?` variable is POSIX-specific.
+ * each command. POSIX (bash/zsh/sh) uses `printf` + `$?`; cmd.exe uses
+ * `echo` + `%ERRORLEVEL%` (cmd has no `printf` and `$?` is POSIX-specific);
+ * PowerShell uses `echo` + `$LASTEXITCODE` (pwsh echoes with `Write-Output`
+ * semantics and `$?` is a boolean, not a numeric exit code).
  */
-export type ShellType = 'posix' | 'windows';
+export type ShellType = 'posix' | 'cmd' | 'pwsh';
 
 /**
  * Build the completion-marker line that the queue writes after each command.
@@ -1739,33 +1740,48 @@ export type ShellType = 'posix' | 'windows';
  * Exported for unit testing; see `test/exec-async.test.ts`.
  */
 export function buildMarkerCommand(shellType: ShellType, marker: string): string {
-  if (shellType === 'windows') {
+  if (shellType === 'cmd') {
     return `echo ${marker}%ERRORLEVEL%\n`;
+  }
+  if (shellType === 'pwsh') {
+    return `echo "${marker}$LASTEXITCODE"\n`;
   }
   return `printf '${marker}%d\\n' $?\n`;
 }
 
 /**
- * Classify the remote shell from the probe response text captured between
- * `__MCP_PROBE_<uuid>__` markers. The probe writes `$(uname -s 2>/dev/null)`:
- * - POSIX shells (bash/zsh/sh) expand the substitution → `Linux`/`Darwin`/...
- * - cmd.exe does not understand `$()` → echoes the literal `$(uname -s ...)`
- *   and prints `'<cmd>' is not recognized` for the failed call.
- * - PowerShell expands `$()` but `uname` is missing → echoes empty string;
- *   we treat that as POSIX-shaped since pwsh's `echo <token>$LASTEXITCODE`
- *   cannot use `%ERRORLEVEL%` anyway and is out of scope (Windows branch
- *   targets cmd.exe specifically).
+ * Classify the remote shell from the two probe responses captured between
+ * `__MCP_PROBE_<uuid>__` markers. The probes are:
  *
- * Returns 'posix' on ambiguous/empty responses to preserve the legacy
- * behaviour for any shell that successfully runs `uname`.
+ *   1. `echo <m1>$(uname -s 2>/dev/null)` — distinguishes Unix-like shells
+ *      from Windows shells.
+ *   2. `echo <m2>$Host.Name` — distinguishes cmd.exe from PowerShell.
+ *
+ * Classification order:
+ *   - uname returns `Linux`/`Darwin`/`FreeBSD`/...          → 'posix'
+ *   - $Host.Name expands to `ConsoleHost`/`ServerHost`/...   → 'pwsh'
+ *   - uname echoes literally / 'is not recognized' AND/OR
+ *     $Host.Name echoes as the literal `$Host.Name`           → 'cmd'
+ *   - otherwise (both empty / ambiguous)                      → 'posix'
+ *
+ * 'posix' is the safe fallback because every successfully-running `uname`
+ * (including macOS, BSDs, WSL, msys) keeps the legacy behaviour.
  */
-export function detectShellTypeFromProbe(response: string): ShellType {
-  const trimmed = response.trim();
-  if (/\b(Linux|Darwin|FreeBSD|OpenBSD|NetBSD)\b/i.test(trimmed)) {
+export function detectShellTypeFromProbe(unameProbe: string, hostProbe: string): ShellType {
+  const uname = unameProbe.trim();
+  const host = hostProbe.trim();
+  if (/\b(Linux|Darwin|FreeBSD|OpenBSD|NetBSD)\b/i.test(uname)) {
     return 'posix';
   }
-  if (trimmed.includes('$(') || /is not recognized/i.test(trimmed)) {
-    return 'windows';
+  if (/^(ConsoleHost|ServerHost|Visual Studio Code Host|IseHost)$/i.test(host)) {
+    return 'pwsh';
+  }
+  if (
+    uname.includes('$(') ||
+    /is not recognized/i.test(uname) ||
+    host === '$Host.Name'
+  ) {
+    return 'cmd';
   }
   return 'posix';
 }
@@ -2052,8 +2068,13 @@ export class PersistentSession {
   private lastCommand: string | null = null;
   private sessionOutput = '';
   private shellType: ShellType = 'posix';
-  /** Probe marker in flight; cleared once `applyShellSetup` resolves. */
-  private shellProbeMarker: string | null = null;
+  /** True while the initial shell-type probe is in flight. */
+  private shellProbeActive = false;
+  /** Per-probe marker keys; cleared as responses arrive. */
+  private shellProbeUname: string | null = null;
+  private shellProbeHost: string | null = null;
+  /** Captured response text for each probe (between marker and newline). */
+  private probeResponses: { uname?: string; host?: string } = {};
   /** Timeout handle for the shell-type probe fallback (defaults to posix). */
   private shellProbeTimer: NodeJS.Timeout | null = null;
 
@@ -2111,49 +2132,148 @@ export class PersistentSession {
   /**
    * Route shell output. While the initial shell-type probe is in flight the
    * raw data is also fed into the probe handler so we can decide whether the
-   * remote is POSIX or Windows before any user-visible command runs. After
-   * the probe resolves, behaves identically to `onSessionData`.
+   * remote is POSIX / cmd / PowerShell before any user-visible command
+   * runs. After the probe resolves, behaves identically to `onSessionData`.
    */
   private handleShellData(data: string): void {
-    if (this.shellProbeMarker && data.includes(this.shellProbeMarker)) {
-      const idx = data.indexOf(this.shellProbeMarker);
-      const response = data.slice(idx + this.shellProbeMarker.length);
-      this.finaliseShellTypeProbe(detectShellTypeFromProbe(response));
-      // Trim the marker (and the shell-defined echo output) from the probe
-      // chunk so it does not pollute `sessionOutput` or the commandQueue.
-      const before = data.slice(0, idx);
-      if (before) {
-        this.onSessionData(before);
+    if (this.shellProbeActive) {
+      const captured = this.consumeProbeResponses(data);
+      if (captured.before) {
+        this.onSessionData(captured.before);
       }
-      // The trailing response line is the echo's own output — drop it.
+      if (captured.complete) {
+        this.finaliseShellTypeProbe(
+          detectShellTypeFromProbe(
+            this.probeResponses.uname ?? '',
+            this.probeResponses.host ?? '',
+          ),
+        );
+      }
       return;
     }
     this.onSessionData(data);
   }
 
+  /**
+   * Scan a data chunk for any in-flight probe marker and record the trailing
+   * response text into `probeResponses`. Returns the prefix that should be
+   * forwarded to the user-visible session output (everything before the
+   * first marker) plus a flag indicating whether both probes have now
+   * landed and the probe can be finalised.
+   */
+  private consumeProbeResponses(data: string): { before: string; complete: boolean } {
+    let before = '';
+    let cursor = 0;
+    let complete = this.shellProbeActive === false;
+    while (cursor < data.length) {
+      const nextMarkerIdx = this.findNextProbeMarker(data, cursor);
+      if (nextMarkerIdx === -1) {
+        break;
+      }
+      const markerLen = this.activeProbeTokenLength(data, nextMarkerIdx);
+      if (markerLen === 0) {
+        // Should not happen — findNextProbeMarker only returns indices that
+        // match an in-flight marker. Bail to avoid an infinite loop.
+        break;
+      }
+      const markerKey = data.slice(nextMarkerIdx, nextMarkerIdx + markerLen);
+      before += data.slice(cursor, nextMarkerIdx);
+      cursor = nextMarkerIdx + markerKey.length;
+      const lineEnd = data.indexOf('\n', cursor);
+      const response = lineEnd === -1 ? data.slice(cursor) : data.slice(cursor, lineEnd);
+      if (markerKey === this.shellProbeUname) {
+        this.probeResponses.uname = response;
+        this.shellProbeUname = null;
+      } else if (markerKey === this.shellProbeHost) {
+        this.probeResponses.host = response;
+        this.shellProbeHost = null;
+      }
+      if (lineEnd !== -1) {
+        cursor = lineEnd + 1;
+      } else {
+        // No newline yet — wait for more data before forwarding past the
+        // unterminated line.
+        cursor = nextMarkerIdx + markerKey.length;
+        break;
+      }
+      if (!this.shellProbeUname && !this.shellProbeHost) {
+        complete = true;
+        break;
+      }
+    }
+    if (cursor < data.length) {
+      before += data.slice(cursor);
+    }
+    return { before, complete: complete && this.shellProbeActive === false };
+  }
+
+  /**
+   * Find the next in-flight probe marker in `data` starting at `from`.
+   * Returns the index of the first byte of the marker, or -1 if neither
+   * marker is present. Caller must then compare against the expected
+   * marker length for that index — markers share a prefix (`__MCP_PROBE_`)
+   * and the unique tail (`UNAME_`/`HOST_`) is what distinguishes them.
+   */
+  private findNextProbeMarker(data: string, from: number): number {
+    let bestIdx = -1;
+    let bestMarker: string | null = null;
+    if (this.shellProbeUname) {
+      const idx = data.indexOf(this.shellProbeUname, from);
+      if (idx !== -1 && (bestIdx === -1 || idx < bestIdx)) {
+        bestIdx = idx;
+        bestMarker = this.shellProbeUname;
+      }
+    }
+    if (this.shellProbeHost) {
+      const idx = data.indexOf(this.shellProbeHost, from);
+      if (idx !== -1 && (bestIdx === -1 || idx < bestIdx)) {
+        bestIdx = idx;
+        bestMarker = this.shellProbeHost;
+      }
+    }
+    return bestIdx;
+  }
+
+  private activeProbeTokenLength(data: string, markerIdx: number): number {
+    // The two markers share `__MCP_PROBE_` prefix; pick whichever is at
+    // markerIdx. This helper exists so the caller can read the marker
+    // string after `findNextProbeMarker` finds its index.
+    if (this.shellProbeUname && data.startsWith(this.shellProbeUname, markerIdx)) {
+      return this.shellProbeUname.length;
+    }
+    if (this.shellProbeHost && data.startsWith(this.shellProbeHost, markerIdx)) {
+      return this.shellProbeHost.length;
+    }
+    return 0;
+  }
+
   private beginShellTypeProbe(): void {
-    const marker = `__MCP_PROBE_${randomUUID()}__`;
-    this.shellProbeMarker = marker;
-    // The probe is `echo <marker>$(uname -s 2>/dev/null)`. On POSIX the
-    // `$(...)` expands to e.g. `Linux`; on cmd.exe it is echoed literally
-    // and `uname` errors with `is not recognized`. Both responses are
-    // classified by `detectShellTypeFromProbe`.
-    this.shell?.write(`echo ${marker}$(uname -s 2>/dev/null)\n`);
+    this.shellProbeUname = `__MCP_PROBE_UNAME_${randomUUID()}__`;
+    this.shellProbeHost = `__MCP_PROBE_HOST_${randomUUID()}__`;
+    this.probeResponses = {};
+    this.shellProbeActive = true;
+    // Two probes:
+    //  - `uname -s` distinguishes Unix-like shells from Windows shells.
+    //  - `$Host.Name` (only PowerShell expands) distinguishes cmd from pwsh.
+    this.shell?.write(`echo ${this.shellProbeUname}$(uname -s 2>/dev/null)\n`);
+    this.shell?.write(`echo ${this.shellProbeHost}$Host.Name\n`);
     // 1.5 s fallback so a slow or noisy shell does not block first command.
     this.shellProbeTimer = setTimeout(() => {
-      if (this.shellProbeMarker === marker) {
+      if (this.shellProbeActive) {
         this.finaliseShellTypeProbe('posix');
       }
     }, 1500);
   }
 
   private finaliseShellTypeProbe(detected: ShellType): void {
-    if (!this.shellProbeMarker) {
+    if (!this.shellProbeActive) {
       return;
     }
     this.shellType = detected;
     this.commandQueue?.setShellType(detected);
-    this.shellProbeMarker = null;
+    this.shellProbeActive = false;
+    this.shellProbeUname = null;
+    this.shellProbeHost = null;
     if (this.shellProbeTimer) {
       clearTimeout(this.shellProbeTimer);
       this.shellProbeTimer = null;
@@ -2162,12 +2282,12 @@ export class PersistentSession {
   }
 
   /**
-   * Emit shell-specific PS1 / echo setup commands. POSIX uses `export PS1=""`
-   * to silence the prompt and `stty -echo` to suppress terminal echo of
-   * typed input; cmd.exe does not understand either command, so we skip
-   * setup entirely and let the default cmd prompt + echo behaviour stand.
-   * PowerShell users on the Windows branch are unsupported by this fix —
-   * see `.trail/issues.md` for scope.
+   * Emit shell-specific PS1 / prompt cleanup commands. POSIX uses
+   * `export PS1=""` to silence the prompt and `stty -echo` to suppress
+   * terminal echo of typed input. cmd.exe does not understand either
+   * command, so we skip setup entirely and let the default cmd prompt
+   * and echo behaviour stand. PowerShell uses `function prompt { '' }`
+   * to override the default prompt with an empty string.
    */
   private applyShellSetup(shellType: ShellType): void {
     if (!this.shell) {
@@ -2176,10 +2296,12 @@ export class PersistentSession {
     if (shellType === 'posix') {
       this.shell.write('export PS1=""\n');
       this.shell.write('stty -echo 2>/dev/null\n');
+    } else if (shellType === 'pwsh') {
+      this.shell.write("function prompt { '' }\n");
     }
-    // For 'windows' we intentionally write nothing: cmd.exe's default
-    // prompt and echo behaviour are left in place so the first user
-    // command is not preceded by a 'export is not recognized' error.
+    // For 'cmd' we intentionally write nothing: cmd.exe's default prompt
+    // and echo behaviour are left in place so the first user command is
+    // not preceded by an 'is not recognized' error.
   }
 
   async ensureConnected(): Promise<void> {
