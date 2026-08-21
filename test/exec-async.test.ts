@@ -95,7 +95,7 @@ describe('ShellCommandQueue', () => {
     q.interrupt();
     expect(writes[2]).toBe('\u0003');
     expect(writes[3]).toBe('\n');
-    expect(writes[4]).toContain(`printf '${marker}%d\n' $?`);
+    expect(writes[4]).toContain(`printf '${marker}%d\\n' $?`);
   });
 
   it('launch rejects a second concurrent command', async () => {
@@ -185,6 +185,157 @@ describe('ShellCommandQueue', () => {
     q.handleClose();
     expect(err).not.toBeNull();
     expect(q.hasPending).toBe(false);
+  });
+
+  it('launch uses POSIX marker command by default (printf + $?)', async () => {
+    const { ShellCommandQueue } = await import('../src/index.js');
+    const { shell, writes } = makeFakeShell();
+    const q = new ShellCommandQueue(shell as any);
+    q.launch('ls', { onData: () => {}, onDone: () => {}, onError: () => {} });
+    expect(writes[0]).toBe('ls\n');
+    expect(writes[1]).toMatch(/^printf '__MCP_DONE__[0-9a-f-]+__%d\\n' \$\?\n$/);
+  });
+
+  it('launch uses cmd marker command when shellType is cmd (echo + %ERRORLEVEL%)', async () => {
+    const { ShellCommandQueue } = await import('../src/index.js');
+    const { shell, writes } = makeFakeShell();
+    const q = new ShellCommandQueue(shell as any, { shellType: 'cmd' });
+    q.launch('dir', { onData: () => {}, onDone: () => {}, onError: () => {} });
+    expect(writes[0]).toBe('dir\n');
+    expect(writes[1]).toMatch(/^echo __MCP_DONE__[0-9a-f-]+__%ERRORLEVEL%\n$/);
+    expect(writes[1]).not.toContain('$?');
+  });
+
+  it('launch uses pwsh marker command when shellType is pwsh (echo + $LASTEXITCODE)', async () => {
+    const { ShellCommandQueue } = await import('../src/index.js');
+    const { shell, writes } = makeFakeShell();
+    const q = new ShellCommandQueue(shell as any, { shellType: 'pwsh' });
+    q.launch('Get-ChildItem', { onData: () => {}, onDone: () => {}, onError: () => {} });
+    expect(writes[0]).toBe('Get-ChildItem\n');
+    expect(writes[1]).toMatch(/^echo "__MCP_DONE__[0-9a-f-]+__\$LASTEXITCODE"\n$/);
+    expect(writes[1]).not.toContain('$?');
+    expect(writes[1]).not.toContain('%ERRORLEVEL%');
+  });
+
+  it('setShellType switches marker command for subsequent launches', async () => {
+    const { ShellCommandQueue } = await import('../src/index.js');
+    const { shell, writes } = makeFakeShell();
+    const q = new ShellCommandQueue(shell as any);
+    q.setShellType('cmd');
+    q.launch('dir', { onData: () => {}, onDone: () => {}, onError: () => {} });
+    expect(writes[1]).toContain('%ERRORLEVEL%');
+    expect(writes[1]).not.toContain('$?');
+  });
+
+  it('cmd marker parses back into the correct exit code', async () => {
+    const { ShellCommandQueue } = await import('../src/index.js');
+    const { shell, writes } = makeFakeShell();
+    const q = new ShellCommandQueue(shell as any, { shellType: 'cmd' });
+    let done: { output: string; exitCode: number } | null = null;
+    q.launch('dir', { onDone: (r) => { done = r; } });
+    const marker = markerFromWrites(writes);
+    // cmd echo output: '__MCP_DONE__<uuid>__0' followed by trailing space
+    q.handleData(`contents\r\n${marker}0 `);
+    expect(done).not.toBeNull();
+    expect(done!.exitCode).toBe(0);
+    expect(done!.output).toBe('contents');
+  });
+
+  it('cmd marker parses non-zero exit code', async () => {
+    const { ShellCommandQueue } = await import('../src/index.js');
+    const { shell, writes } = makeFakeShell();
+    const q = new ShellCommandQueue(shell as any, { shellType: 'cmd' });
+    let done: { output: string; exitCode: number } | null = null;
+    q.launch('bad-cmd', { onDone: (r) => { done = r; } });
+    const marker = markerFromWrites(writes);
+    q.handleData(`err line\r\n${marker}9009 `);
+    expect(done).toEqual({ output: 'err line', exitCode: 9009 });
+  });
+
+  it('pwsh marker parses back into the correct exit code', async () => {
+    const { ShellCommandQueue } = await import('../src/index.js');
+    const { shell, writes } = makeFakeShell();
+    const q = new ShellCommandQueue(shell as any, { shellType: 'pwsh' });
+    let done: { output: string; exitCode: number } | null = null;
+    q.launch('Get-ChildItem', { onDone: (r) => { done = r; } });
+    const marker = markerFromWrites(writes);
+    // pwsh echo output: '__MCP_DONE__<uuid>__0\n' (no trailing space, pwsh echo is Write-Output)
+    q.handleData(`contents\r\n${marker}0\n`);
+    expect(done).not.toBeNull();
+    expect(done!.exitCode).toBe(0);
+    expect(done!.output).toBe('contents');
+  });
+
+  it('pwsh marker parses non-zero exit code', async () => {
+    const { ShellCommandQueue } = await import('../src/index.js');
+    const { shell, writes } = makeFakeShell();
+    const q = new ShellCommandQueue(shell as any, { shellType: 'pwsh' });
+    let done: { output: string; exitCode: number } | null = null;
+    q.launch('bad-cmd', { onDone: (r) => { done = r; } });
+    const marker = markerFromWrites(writes);
+    q.handleData(`err line\r\n${marker}1\n`);
+    expect(done).toEqual({ output: 'err line', exitCode: 1 });
+  });
+});
+
+describe('buildMarkerCommand', () => {
+  it('returns the POSIX printf command for shellType posix', async () => {
+    const { buildMarkerCommand } = await import('../src/index.js');
+    expect(buildMarkerCommand('posix', '__MCP_DONE__abc__')).toBe(
+      `printf '__MCP_DONE__abc__%d\\n' $?\n`,
+    );
+  });
+
+  it('returns the cmd echo command for shellType cmd', async () => {
+    const { buildMarkerCommand } = await import('../src/index.js');
+    expect(buildMarkerCommand('cmd', '__MCP_DONE__abc__')).toBe(
+      `echo __MCP_DONE__abc__%ERRORLEVEL%\n`,
+    );
+  });
+
+  it('returns the pwsh echo command for shellType pwsh', async () => {
+    const { buildMarkerCommand } = await import('../src/index.js');
+    expect(buildMarkerCommand('pwsh', '__MCP_DONE__abc__')).toBe(
+      `echo "__MCP_DONE__abc__$LASTEXITCODE"\n`,
+    );
+  });
+});
+
+describe('detectShellTypeFromProbe', () => {
+  it('returns posix when uname output is Linux/Darwin/FreeBSD', async () => {
+    const { detectShellTypeFromProbe } = await import('../src/index.js');
+    expect(detectShellTypeFromProbe('Linux', '')).toBe('posix');
+    expect(detectShellTypeFromProbe('Darwin', '')).toBe('posix');
+    expect(detectShellTypeFromProbe('FreeBSD', '')).toBe('posix');
+  });
+
+  it('returns pwsh when $Host.Name expands to ConsoleHost', async () => {
+    const { detectShellTypeFromProbe } = await import('../src/index.js');
+    expect(detectShellTypeFromProbe('', 'ConsoleHost')).toBe('pwsh');
+    expect(detectShellTypeFromProbe('', 'ServerHost')).toBe('pwsh');
+  });
+
+  it('returns cmd when uname response carries $(...) literally', async () => {
+    const { detectShellTypeFromProbe } = await import('../src/index.js');
+    expect(
+      detectShellTypeFromProbe('$(uname -s 2>/dev/null)', '$Host.Name'),
+    ).toBe('cmd');
+  });
+
+  it('returns cmd when uname response contains "is not recognized" (cmd error text)', async () => {
+    const { detectShellTypeFromProbe } = await import('../src/index.js');
+    expect(
+      detectShellTypeFromProbe(
+        `'uname' is not recognized as an internal or external command`,
+        '$Host.Name',
+      ),
+    ).toBe('cmd');
+  });
+
+  it('returns posix when both probes are empty/unknown (pwsh-shaped fallback)', async () => {
+    const { detectShellTypeFromProbe } = await import('../src/index.js');
+    expect(detectShellTypeFromProbe('', '')).toBe('posix');
+    expect(detectShellTypeFromProbe('???', '???')).toBe('posix');
   });
 });
 

@@ -1722,6 +1722,71 @@ export type CommandCallbacks = {
 };
 
 /**
+ * Remote shell flavour. Drives both the PS1/prompt cleanup on session start
+ * and the completion-marker command injected by `ShellCommandQueue` after
+ * each command. POSIX (bash/zsh/sh) uses `printf` + `$?`; cmd.exe uses
+ * `echo` + `%ERRORLEVEL%` (cmd has no `printf` and `$?` is POSIX-specific);
+ * PowerShell uses `echo` + `$LASTEXITCODE` (pwsh echoes with `Write-Output`
+ * semantics and `$?` is a boolean, not a numeric exit code).
+ */
+export type ShellType = 'posix' | 'cmd' | 'pwsh';
+
+/**
+ * Build the completion-marker line that the queue writes after each command.
+ * The marker must be a single line whose suffix is the last command's exit
+ * code; the queue's parser (`processPending`) strips the marker from the
+ * output buffer and reads the trailing digits as the exit code.
+ *
+ * Exported for unit testing; see `test/exec-async.test.ts`.
+ */
+export function buildMarkerCommand(shellType: ShellType, marker: string): string {
+  if (shellType === 'cmd') {
+    return `echo ${marker}%ERRORLEVEL%\n`;
+  }
+  if (shellType === 'pwsh') {
+    return `echo "${marker}$LASTEXITCODE"\n`;
+  }
+  return `printf '${marker}%d\\n' $?\n`;
+}
+
+/**
+ * Classify the remote shell from the two probe responses captured between
+ * `__MCP_PROBE_<uuid>__` markers. The probes are:
+ *
+ *   1. `echo <m1>$(uname -s 2>/dev/null)` — distinguishes Unix-like shells
+ *      from Windows shells.
+ *   2. `echo <m2>$Host.Name` — distinguishes cmd.exe from PowerShell.
+ *
+ * Classification order:
+ *   - uname returns `Linux`/`Darwin`/`FreeBSD`/...          → 'posix'
+ *   - $Host.Name expands to `ConsoleHost`/`ServerHost`/...   → 'pwsh'
+ *   - uname echoes literally / 'is not recognized' AND/OR
+ *     $Host.Name echoes as the literal `$Host.Name`           → 'cmd'
+ *   - otherwise (both empty / ambiguous)                      → 'posix'
+ *
+ * 'posix' is the safe fallback because every successfully-running `uname`
+ * (including macOS, BSDs, WSL, msys) keeps the legacy behaviour.
+ */
+export function detectShellTypeFromProbe(unameProbe: string, hostProbe: string): ShellType {
+  const uname = unameProbe.trim();
+  const host = hostProbe.trim();
+  if (/\b(Linux|Darwin|FreeBSD|OpenBSD|NetBSD)\b/i.test(uname)) {
+    return 'posix';
+  }
+  if (/^(ConsoleHost|ServerHost|Visual Studio Code Host|IseHost)$/i.test(host)) {
+    return 'pwsh';
+  }
+  if (
+    uname.includes('$(') ||
+    /is not recognized/i.test(uname) ||
+    host === '$Host.Name'
+  ) {
+    return 'cmd';
+  }
+  return 'posix';
+}
+
+/**
  * Serialises shell command execution over a single shell stream: one command at
  * a time, completion detected via a `__MCP_DONE__{uuid}__` marker, output
  * streamed incrementally through onData until the marker is consumed.
@@ -1747,7 +1812,25 @@ export class ShellCommandQueue {
     markerExpected: boolean;
   } | null = null;
 
-  constructor(private readonly shell: { write(data: string, cb?: (err: Error | null | undefined) => void): void }) {}
+  constructor(
+    private readonly shell: { write(data: string, cb?: (err: Error | null | undefined) => void): void },
+    options?: { shellType?: ShellType },
+  ) {
+    this.shellType = options?.shellType ?? 'posix';
+  }
+
+  private shellType: ShellType;
+
+  /**
+   * Switch the shell flavour used to emit the completion marker. Called by
+   * `PersistentSession.ensureConnected` once it has detected whether the
+   * remote shell is POSIX (bash/zsh/sh) or Windows (cmd.exe). Changing this
+   * mid-session is safe because each `launch` reads `shellType` at the
+   * moment the marker is written.
+   */
+  setShellType(shellType: ShellType): void {
+    this.shellType = shellType;
+  }
 
   get hasPending(): boolean {
     return this.pending !== null;
@@ -1776,9 +1859,9 @@ export class ShellCommandQueue {
       if (options?.interactive) {
         return;
       }
-      this.shell.write(`printf '${marker}%d\n' $?\n`, (printfErr) => {
-        if (printfErr) {
-          this.rejectPending(printfErr);
+      this.shell.write(buildMarkerCommand(this.shellType, marker), (markerErr) => {
+        if (markerErr) {
+          this.rejectPending(markerErr);
         }
       });
     });
@@ -1808,7 +1891,7 @@ export class ShellCommandQueue {
       // subsequent output. Trim is now unsafe (see pending.markerExpected).
       this.pending.markerExpected = true;
       this.shell.write('\n');
-      this.shell.write(`printf '${this.pending.marker}%d\n' $?\n`);
+      this.shell.write(buildMarkerCommand(this.shellType, this.pending.marker));
     }
   }
 
@@ -1834,17 +1917,32 @@ export class ShellCommandQueue {
       return;
     }
     const afterMarker = this.buffer.slice(markerIndex + marker.length);
-    const newlineIndex = afterMarker.indexOf('\n');
-    if (newlineIndex === -1) {
+    // Match the exit code as one or more digits immediately after the
+    // marker. POSIX `printf '%d\n' $?` ends with a single `\n`; cmd's
+    // `echo marker%ERRORLEVEL%` ends with a trailing space (and possibly a
+    // `\r\n` that the channel layer has not yet delivered). Accepting the
+    // exit code as soon as `\d+` is present lets both formats complete
+    // without waiting for a newline that may never arrive over cmd.
+    const codeMatch = /^(\d+)/.exec(afterMarker);
+    if (!codeMatch) {
       this.pushIncrement(markerIndex);
       return;
     }
+    const exitCode = Number.parseInt(codeMatch[1], 10);
+    const codeLen = codeMatch[1].length;
+    // Consume any trailing whitespace (newline / space / CRLF) so the
+    // remainder of `buffer` starts cleanly at the next command's output.
+    const trailingMatch = /^[\s\r\n]*/.exec(afterMarker.slice(codeLen));
+    const trailingLen = trailingMatch?.[0].length ?? 0;
+    const consumedInBuffer = markerIndex + marker.length + codeLen + trailingLen;
+    // Flush the pre-marker chunk to the consumer first (pushIncrement in
+    // non-interactive mode just advances pushedUntil without trimming the
+    // buffer — the marker line itself is protocol data and must not be
+    // surfaced as command output).
     this.pushIncrement(markerIndex);
-    const exitCodeText = afterMarker.slice(0, newlineIndex).trim();
-    const remaining = afterMarker.slice(newlineIndex + 1);
     const output = this.buffer.slice(0, markerIndex).replace(/\r/g, '');
-    const exitCode = Number.parseInt(exitCodeText, 10);
-    this.buffer = remaining;
+    this.buffer = this.buffer.slice(consumedInBuffer);
+    this.pending.pushedUntil = Math.max(0, this.pending.pushedUntil - consumedInBuffer);
     if (this.buffer.startsWith('__MCP_DONE__') || /^\s*$/.test(this.buffer)) {
       this.buffer = '';
     }
@@ -1969,6 +2067,16 @@ export class PersistentSession {
   private readonly createdAt = Date.now();
   private lastCommand: string | null = null;
   private sessionOutput = '';
+  private shellType: ShellType = 'posix';
+  /** True while the initial shell-type probe is in flight. */
+  private shellProbeActive = false;
+  /** Per-probe marker keys; cleared as responses arrive. */
+  private shellProbeUname: string | null = null;
+  private shellProbeHost: string | null = null;
+  /** Captured response text for each probe (between marker and newline). */
+  private probeResponses: { uname?: string; host?: string } = {};
+  /** Timeout handle for the shell-type probe fallback (defaults to posix). */
+  private shellProbeTimer: NodeJS.Timeout | null = null;
 
   constructor(
     private readonly id: string,
@@ -2021,6 +2129,181 @@ export class PersistentSession {
     this.commandQueue?.handleData(data);
   }
 
+  /**
+   * Route shell output. While the initial shell-type probe is in flight the
+   * raw data is also fed into the probe handler so we can decide whether the
+   * remote is POSIX / cmd / PowerShell before any user-visible command
+   * runs. After the probe resolves, behaves identically to `onSessionData`.
+   */
+  private handleShellData(data: string): void {
+    if (this.shellProbeActive) {
+      const captured = this.consumeProbeResponses(data);
+      if (captured.before) {
+        this.onSessionData(captured.before);
+      }
+      if (captured.complete) {
+        this.finaliseShellTypeProbe(
+          detectShellTypeFromProbe(
+            this.probeResponses.uname ?? '',
+            this.probeResponses.host ?? '',
+          ),
+        );
+      }
+      return;
+    }
+    this.onSessionData(data);
+  }
+
+  /**
+   * Scan a data chunk for any in-flight probe marker and record the trailing
+   * response text into `probeResponses`. Returns the prefix that should be
+   * forwarded to the user-visible session output (everything before the
+   * first marker) plus a flag indicating whether both probes have now
+   * landed and the probe can be finalised.
+   */
+  private consumeProbeResponses(data: string): { before: string; complete: boolean } {
+    let before = '';
+    let cursor = 0;
+    let complete = this.shellProbeActive === false;
+    while (cursor < data.length) {
+      const nextMarkerIdx = this.findNextProbeMarker(data, cursor);
+      if (nextMarkerIdx === -1) {
+        break;
+      }
+      const markerLen = this.activeProbeTokenLength(data, nextMarkerIdx);
+      if (markerLen === 0) {
+        // Should not happen — findNextProbeMarker only returns indices that
+        // match an in-flight marker. Bail to avoid an infinite loop.
+        break;
+      }
+      const markerKey = data.slice(nextMarkerIdx, nextMarkerIdx + markerLen);
+      before += data.slice(cursor, nextMarkerIdx);
+      cursor = nextMarkerIdx + markerKey.length;
+      const lineEnd = data.indexOf('\n', cursor);
+      const response = lineEnd === -1 ? data.slice(cursor) : data.slice(cursor, lineEnd);
+      if (markerKey === this.shellProbeUname) {
+        this.probeResponses.uname = response;
+        this.shellProbeUname = null;
+      } else if (markerKey === this.shellProbeHost) {
+        this.probeResponses.host = response;
+        this.shellProbeHost = null;
+      }
+      if (lineEnd !== -1) {
+        cursor = lineEnd + 1;
+      } else {
+        // No newline yet — wait for more data before forwarding past the
+        // unterminated line.
+        cursor = nextMarkerIdx + markerKey.length;
+        break;
+      }
+      if (!this.shellProbeUname && !this.shellProbeHost) {
+        complete = true;
+        break;
+      }
+    }
+    if (cursor < data.length) {
+      before += data.slice(cursor);
+    }
+    return { before, complete: complete && this.shellProbeActive === false };
+  }
+
+  /**
+   * Find the next in-flight probe marker in `data` starting at `from`.
+   * Returns the index of the first byte of the marker, or -1 if neither
+   * marker is present. Caller must then compare against the expected
+   * marker length for that index — markers share a prefix (`__MCP_PROBE_`)
+   * and the unique tail (`UNAME_`/`HOST_`) is what distinguishes them.
+   */
+  private findNextProbeMarker(data: string, from: number): number {
+    let bestIdx = -1;
+    let bestMarker: string | null = null;
+    if (this.shellProbeUname) {
+      const idx = data.indexOf(this.shellProbeUname, from);
+      if (idx !== -1 && (bestIdx === -1 || idx < bestIdx)) {
+        bestIdx = idx;
+        bestMarker = this.shellProbeUname;
+      }
+    }
+    if (this.shellProbeHost) {
+      const idx = data.indexOf(this.shellProbeHost, from);
+      if (idx !== -1 && (bestIdx === -1 || idx < bestIdx)) {
+        bestIdx = idx;
+        bestMarker = this.shellProbeHost;
+      }
+    }
+    return bestIdx;
+  }
+
+  private activeProbeTokenLength(data: string, markerIdx: number): number {
+    // The two markers share `__MCP_PROBE_` prefix; pick whichever is at
+    // markerIdx. This helper exists so the caller can read the marker
+    // string after `findNextProbeMarker` finds its index.
+    if (this.shellProbeUname && data.startsWith(this.shellProbeUname, markerIdx)) {
+      return this.shellProbeUname.length;
+    }
+    if (this.shellProbeHost && data.startsWith(this.shellProbeHost, markerIdx)) {
+      return this.shellProbeHost.length;
+    }
+    return 0;
+  }
+
+  private beginShellTypeProbe(): void {
+    this.shellProbeUname = `__MCP_PROBE_UNAME_${randomUUID()}__`;
+    this.shellProbeHost = `__MCP_PROBE_HOST_${randomUUID()}__`;
+    this.probeResponses = {};
+    this.shellProbeActive = true;
+    // Two probes:
+    //  - `uname -s` distinguishes Unix-like shells from Windows shells.
+    //  - `$Host.Name` (only PowerShell expands) distinguishes cmd from pwsh.
+    this.shell?.write(`echo ${this.shellProbeUname}$(uname -s 2>/dev/null)\n`);
+    this.shell?.write(`echo ${this.shellProbeHost}$Host.Name\n`);
+    // 1.5 s fallback so a slow or noisy shell does not block first command.
+    this.shellProbeTimer = setTimeout(() => {
+      if (this.shellProbeActive) {
+        this.finaliseShellTypeProbe('posix');
+      }
+    }, 1500);
+  }
+
+  private finaliseShellTypeProbe(detected: ShellType): void {
+    if (!this.shellProbeActive) {
+      return;
+    }
+    this.shellType = detected;
+    this.commandQueue?.setShellType(detected);
+    this.shellProbeActive = false;
+    this.shellProbeUname = null;
+    this.shellProbeHost = null;
+    if (this.shellProbeTimer) {
+      clearTimeout(this.shellProbeTimer);
+      this.shellProbeTimer = null;
+    }
+    this.applyShellSetup(detected);
+  }
+
+  /**
+   * Emit shell-specific PS1 / prompt cleanup commands. POSIX uses
+   * `export PS1=""` to silence the prompt and `stty -echo` to suppress
+   * terminal echo of typed input. cmd.exe does not understand either
+   * command, so we skip setup entirely and let the default cmd prompt
+   * and echo behaviour stand. PowerShell uses `function prompt { '' }`
+   * to override the default prompt with an empty string.
+   */
+  private applyShellSetup(shellType: ShellType): void {
+    if (!this.shell) {
+      return;
+    }
+    if (shellType === 'posix') {
+      this.shell.write('export PS1=""\n');
+      this.shell.write('stty -echo 2>/dev/null\n');
+    } else if (shellType === 'pwsh') {
+      this.shell.write("function prompt { '' }\n");
+    }
+    // For 'cmd' we intentionally write nothing: cmd.exe's default prompt
+    // and echo behaviour are left in place so the first user command is
+    // not preceded by an 'is not recognized' error.
+  }
+
   async ensureConnected(): Promise<void> {
     if (this.disposed) {
       throw new McpError(ErrorCode.InternalError, `Session ${this.id} has been disposed`);
@@ -2062,7 +2345,7 @@ export class PersistentSession {
         stream.setEncoding('utf8');
         this.commandQueue = new ShellCommandQueue(stream);
         stream.on('data', (data: string) => {
-          this.onSessionData(data);
+          this.handleShellData(data);
         });
         stream.on('close', () => {
           this.commandQueue?.handleClose();
@@ -2072,8 +2355,9 @@ export class PersistentSession {
           this.onSessionData(data);
         });
 
-        stream.write('export PS1=""\n');
-        stream.write('stty -echo 2>/dev/null\n');
+        // Defer session-output routing for the in-flight probe chunk so it
+        // doesn't bleed into the user-visible session output buffer.
+        this.beginShellTypeProbe();
         resolve();
       });
     });
