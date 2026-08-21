@@ -206,14 +206,14 @@ describe('ShellCommandQueue', () => {
     expect(writes[1]).not.toContain('$?');
   });
 
-  it('launch uses pwsh marker command when shellType is pwsh (echo + $LASTEXITCODE)', async () => {
+  it('launch uses pwsh marker command when shellType is pwsh (echo + numeric $?)', async () => {
     const { ShellCommandQueue } = await import('../src/index.js');
     const { shell, writes } = makeFakeShell();
     const q = new ShellCommandQueue(shell as any, { shellType: 'pwsh' });
     q.launch('Get-ChildItem', { onData: () => {}, onDone: () => {}, onError: () => {} });
     expect(writes[0]).toBe('Get-ChildItem\n');
-    expect(writes[1]).toMatch(/^echo "__MCP_DONE__[0-9a-f-]+__\$LASTEXITCODE"\n$/);
-    expect(writes[1]).not.toContain('$?');
+    expect(writes[1]).toMatch(/^echo "__MCP_DONE__[0-9a-f-]+__\$\(\[int\]\(-not \$\?\)\)"\n$/);
+    expect(writes[1]).not.toContain('$LASTEXITCODE');
     expect(writes[1]).not.toContain('%ERRORLEVEL%');
   });
 
@@ -296,7 +296,7 @@ describe('buildMarkerCommand', () => {
   it('returns the pwsh echo command for shellType pwsh', async () => {
     const { buildMarkerCommand } = await import('../src/index.js');
     expect(buildMarkerCommand('pwsh', '__MCP_DONE__abc__')).toBe(
-      `echo "__MCP_DONE__abc__$LASTEXITCODE"\n`,
+      `echo "__MCP_DONE__abc__$([int](-not $?))"\n`,
     );
   });
 });
@@ -336,6 +336,23 @@ describe('detectShellTypeFromProbe', () => {
     const { detectShellTypeFromProbe } = await import('../src/index.js');
     expect(detectShellTypeFromProbe('', '')).toBe('posix');
     expect(detectShellTypeFromProbe('???', '???')).toBe('posix');
+  });
+
+  it('buffers split probe lines and ignores PTY-echoed probe commands', async () => {
+    const { PersistentSession } = await import('../src/index.js');
+    const session = new PersistentSession('probe', { config: { host: 'h' } } as any);
+    const uname = '__MCP_PROBE_UNAME_test__';
+    const host = '__MCP_PROBE_HOST_test__';
+    (session as any).shellProbeActive = true;
+    (session as any).shellProbeUname = uname;
+    (session as any).shellProbeHost = host;
+    const first = (session as any).consumeProbeResponses(`$ echo ${uname}$(uname -s 2>/dev/null)\r\n${uname.slice(0, 12)}`);
+    expect(first.complete).toBe(false);
+    const second = (session as any).consumeProbeResponses(
+      `${uname.slice(12)}Linux\r\nPS C:\\>echo ${host}$Host.Name\r\n${host}ConsoleHost\r\n`,
+    );
+    expect(second.complete).toBe(true);
+    expect((session as any).probeResponses).toEqual({ uname: 'Linux', host: 'ConsoleHost' });
   });
 });
 

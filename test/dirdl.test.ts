@@ -62,6 +62,13 @@ describe('dir helpers', () => {
     expect(shouldUseChunking(threshold * 2, 1, threshold, 4)).toBe(false);
     expect(shouldUseChunking(threshold * 2, 0, threshold, 1)).toBe(false);
   });
+
+  it('caps directory chunk threads so concurrent files cannot amplify SFTP sessions', async () => {
+    const { resolveDirectoryChunkThreads } = await import('../src/index.js');
+    expect(resolveDirectoryChunkThreads(1, 16)).toBe(16);
+    expect(resolveDirectoryChunkThreads(4, 16)).toBe(4);
+    expect(resolveDirectoryChunkThreads(16, 16)).toBe(1);
+  });
 });
 
 describe('DirectoryTransfer listing', () => {
@@ -401,6 +408,32 @@ describe('DirectoryTransfer concurrency', () => {
 });
 
 describe('FileTransfer chunked download', () => {
+  it('closes every resolved extra connection when one factory fails', async () => {
+    const { FileTransfer } = await import('../src/index.js');
+    const closed: string[] = [];
+    let calls = 0;
+    const makeConnection = (name: string) => ({
+      conn: { end() {} },
+      jumpConns: [],
+      sftp: { end() { closed.push(name); } },
+    });
+    const ft = new FileTransfer('x-leak', 'A', '/tmp/source', '/remote/file', 'download',
+      makeConnection('primary') as any,
+      {
+        parallelConnectionFactory: async () => {
+          const name = `extra-${++calls}`;
+          if (name === 'extra-2') {
+            await new Promise((resolve) => setTimeout(resolve, 5));
+            throw new Error('factory failed');
+          }
+          await new Promise((resolve) => setTimeout(resolve, name === 'extra-1' ? 15 : 1));
+          return makeConnection(name) as any;
+        },
+      });
+    await expect((ft as any).openChunkConnections(4)).rejects.toThrow('factory failed');
+    expect(closed).toEqual(expect.arrayContaining(['extra-1', 'extra-3']));
+  });
+
   it('chunks a large file into range reads', async () => {
     const { FileTransfer, partPathFor } = await import('../src/index.js');
     const { mkdtemp, writeFile, readFile, rm } = await import('fs/promises');

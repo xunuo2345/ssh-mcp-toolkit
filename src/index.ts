@@ -9,7 +9,7 @@ import { z } from 'zod';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { readFile, writeFile, mkdir, stat, lstat, rename, rm, open, readdir } from 'fs/promises';
 import { createReadStream, createWriteStream } from 'fs';
-import { posix as posixPath, resolve as resolvePath } from 'path';
+import { posix as posixPath, relative as relativePath, resolve as resolvePath, sep as pathSeparator } from 'path';
 import os from 'os';
 import { randomUUID, createHash } from 'crypto';
 import net from 'net';
@@ -306,6 +306,10 @@ function sftpLstat(sftp: SFTPWrapper, remotePath: string): Promise<Stats> {
   return new Promise((resolve, reject) => {
     sftp.lstat(remotePath, (error, stats) => error ? reject(error) : resolve(stats));
   });
+}
+
+function isMissingPathError(error: any): boolean {
+  return error?.code === 'ENOENT' || /(?:ENOENT|no such file|not found)/i.test(String(error?.message ?? error));
 }
 
 function sftpRename(sftp: SFTPWrapper, from: string, to: string): Promise<void> {
@@ -750,6 +754,21 @@ export type DirEntry = {
 };
 
 export const DEFAULT_CHUNK_THRESHOLD_BYTES = 400 * 1024 * 1024;
+/** Directory transfers share one primary SFTP connection plus chunk sessions. */
+export const MAX_DIRECTORY_PARALLEL_CONNECTIONS = 16;
+export const MAX_DIRECTORY_ENTRIES = 100_000;
+
+export function resolveDirectoryChunkThreads(
+  concurrency: number,
+  requestedThreads: number,
+  maxConnections = MAX_DIRECTORY_PARALLEL_CONNECTIONS,
+): number {
+  const safeConcurrency = Math.max(1, Math.floor(concurrency));
+  const safeRequested = Math.max(1, Math.floor(requestedThreads));
+  const safeMaxConnections = Math.max(1, Math.floor(maxConnections));
+  const maxThreads = Math.max(1, Math.floor((safeMaxConnections - 1) / safeConcurrency) + 1);
+  return Math.min(safeRequested, maxThreads);
+}
 
 export function dirEntriesToTotal(entries: DirEntry[]): { filesTotal: number; totalBytes: number } {
   let filesTotal = 0;
@@ -850,6 +869,54 @@ export async function assertLocalDestinationParent(parent: string): Promise<void
   }
   if (!parentStats.isDirectory()) {
     throw new McpError(ErrorCode.InvalidParams, `Local destination parent '${parent}' is not a directory`);
+  }
+}
+
+/** Refuse to create or use a directory root that is a symlink. */
+async function ensureLocalDirectoryRoot(directory: string): Promise<void> {
+  try {
+    const stats = await lstat(directory);
+    if (stats.isSymbolicLink()) {
+      throw new McpError(ErrorCode.InvalidParams, `Local directory '${directory}' is a symlink; refusing to follow it`);
+    }
+    if (!stats.isDirectory()) {
+      throw new McpError(ErrorCode.InvalidParams, `Local path '${directory}' is not a directory`);
+    }
+  } catch (error: any) {
+    if (error instanceof McpError) throw error;
+    if (error?.code === 'ENOENT') {
+      await mkdir(directory, { recursive: true });
+      return;
+    }
+    throw resolveLocalStatError(error, directory);
+  }
+}
+
+/** Ensure a local directory path stays inside a checked, non-symlink root. */
+async function ensureLocalDirectoryPath(root: string, directory: string): Promise<void> {
+  const resolvedRoot = resolvePath(root);
+  const resolvedDirectory = resolvePath(directory);
+  const relative = relativePath(resolvedRoot, resolvedDirectory);
+  if (relative === '..' || relative.startsWith(`..${pathSeparator}`) || relativePath(resolvedRoot, resolvedDirectory).startsWith(pathSeparator)) {
+    throw new McpError(ErrorCode.InvalidParams, `Local path '${directory}' escapes destination root '${root}'`);
+  }
+  await ensureLocalDirectoryRoot(resolvedRoot);
+  let current = resolvedRoot;
+  for (const component of relative.split(pathSeparator).filter(Boolean)) {
+    current = resolvePath(current, component);
+    try {
+      const stats = await lstat(current);
+      if (stats.isSymbolicLink()) {
+        throw new McpError(ErrorCode.InvalidParams, `Local directory '${current}' is a symlink; refusing to follow it`);
+      }
+      if (!stats.isDirectory()) {
+        throw new McpError(ErrorCode.InvalidParams, `Local path '${current}' is not a directory`);
+      }
+    } catch (error: any) {
+      if (error instanceof McpError) throw error;
+      if (error?.code !== 'ENOENT') throw resolveLocalStatError(error, current);
+      await mkdir(current);
+    }
   }
 }
 
@@ -1721,7 +1788,7 @@ server.tool(
     const resolvedLocalDir = resolvePath(local_dir);
     const id = randomUUID();
     const resolved = await resolveHost(host_id);
-    await mkdir(resolvedLocalDir, { recursive: true });
+    await ensureLocalDirectoryRoot(resolvedLocalDir);
     let conn: { conn: InstanceType<typeof SSHClient>; jumpConns: InstanceType<typeof SSHClient>[]; sftp: SFTPWrapper };
     try {
       conn = await openSftpConnection(resolved);
@@ -1928,8 +1995,8 @@ export type CommandCallbacks = {
  * and the completion-marker command injected by `ShellCommandQueue` after
  * each command. POSIX (bash/zsh/sh) uses `printf` + `$?`; cmd.exe uses
  * `echo` + `%ERRORLEVEL%` (cmd has no `printf` and `$?` is POSIX-specific);
- * PowerShell uses `echo` + `$LASTEXITCODE` (pwsh echoes with `Write-Output`
- * semantics and `$?` is a boolean, not a numeric exit code).
+ * PowerShell uses `echo` plus a numeric projection of `$?` because
+ * `$LASTEXITCODE` can be stale or empty for PowerShell cmdlets.
  */
 export type ShellType = 'posix' | 'cmd' | 'pwsh';
 
@@ -1946,7 +2013,7 @@ export function buildMarkerCommand(shellType: ShellType, marker: string): string
     return `echo ${marker}%ERRORLEVEL%\n`;
   }
   if (shellType === 'pwsh') {
-    return `echo "${marker}$LASTEXITCODE"\n`;
+    return `echo "${marker}$([int](-not $?))"\n`;
   }
   return `printf '${marker}%d\\n' $?\n`;
 }
@@ -2279,6 +2346,12 @@ export class PersistentSession {
   private probeResponses: { uname?: string; host?: string } = {};
   /** Timeout handle for the shell-type probe fallback (defaults to posix). */
   private shellProbeTimer: NodeJS.Timeout | null = null;
+  /** Preserve probe lines that arrive split across SSH data events. */
+  private shellProbeBuffer = '';
+  /** First commands must wait until shell probing and setup are complete. */
+  private shellProbeReady: Promise<void> | null = null;
+  private resolveShellProbeReady: (() => void) | null = null;
+  private rejectShellProbeReady: ((error: Error) => void) | null = null;
 
   constructor(
     private readonly id: string,
@@ -2357,103 +2430,68 @@ export class PersistentSession {
   }
 
   /**
-   * Scan a data chunk for any in-flight probe marker and record the trailing
-   * response text into `probeResponses`. Returns the prefix that should be
-   * forwarded to the user-visible session output (everything before the
-   * first marker) plus a flag indicating whether both probes have now
-   * landed and the probe can be finalised.
+   * Scan complete lines from the probe buffer and record marker responses.
+   * SSH data events do not preserve line boundaries, so a marker or response
+   * may be split across multiple chunks. Incomplete lines remain buffered
+   * until the next event instead of being forwarded or discarded.
    */
   private consumeProbeResponses(data: string): { before: string; complete: boolean } {
+    this.shellProbeBuffer += data;
     let before = '';
-    let cursor = 0;
-    let complete = this.shellProbeActive === false;
-    while (cursor < data.length) {
-      const nextMarkerIdx = this.findNextProbeMarker(data, cursor);
-      if (nextMarkerIdx === -1) {
-        break;
+    while (true) {
+      const lineEnd = this.shellProbeBuffer.indexOf('\n');
+      if (lineEnd === -1) break;
+      const line = this.shellProbeBuffer.slice(0, lineEnd).replace(/\r$/, '');
+      this.shellProbeBuffer = this.shellProbeBuffer.slice(lineEnd + 1);
+
+      const unameIndex = this.shellProbeUname ? line.indexOf(this.shellProbeUname) : -1;
+      const hostIndex = this.shellProbeHost ? line.indexOf(this.shellProbeHost) : -1;
+      const markerIndex = unameIndex !== -1 && (hostIndex === -1 || unameIndex < hostIndex)
+        ? unameIndex
+        : hostIndex;
+      const markerKey = markerIndex === unameIndex ? this.shellProbeUname : this.shellProbeHost;
+
+      if (markerIndex === -1 || !markerKey) {
+        before += `${line}\n`;
+        continue;
       }
-      const markerLen = this.activeProbeTokenLength(data, nextMarkerIdx);
-      if (markerLen === 0) {
-        // Should not happen — findNextProbeMarker only returns indices that
-        // match an in-flight marker. Bail to avoid an infinite loop.
-        break;
+
+      const prefix = line.slice(0, markerIndex);
+      // PTY echo often returns the probe command itself before its output.
+      // Ignore that copy; otherwise the literal `$(uname ...)` or
+      // `$Host.Name` from the command would be mistaken for the response.
+      if (/(?:^|[>$#])\s*echo\s+$/i.test(prefix)) {
+        continue;
       }
-      const markerKey = data.slice(nextMarkerIdx, nextMarkerIdx + markerLen);
-      before += data.slice(cursor, nextMarkerIdx);
-      cursor = nextMarkerIdx + markerKey.length;
-      const lineEnd = data.indexOf('\n', cursor);
-      const response = lineEnd === -1 ? data.slice(cursor) : data.slice(cursor, lineEnd);
+      before += prefix;
+      const response = line.slice(markerIndex + markerKey.length);
       if (markerKey === this.shellProbeUname) {
         this.probeResponses.uname = response;
         this.shellProbeUname = null;
-      } else if (markerKey === this.shellProbeHost) {
+      } else {
         this.probeResponses.host = response;
         this.shellProbeHost = null;
       }
-      if (lineEnd !== -1) {
-        cursor = lineEnd + 1;
-      } else {
-        // No newline yet — wait for more data before forwarding past the
-        // unterminated line.
-        cursor = nextMarkerIdx + markerKey.length;
-        break;
-      }
+
       if (!this.shellProbeUname && !this.shellProbeHost) {
-        complete = true;
-        break;
+        before += this.shellProbeBuffer;
+        this.shellProbeBuffer = '';
+        return { before, complete: true };
       }
     }
-    if (cursor < data.length) {
-      before += data.slice(cursor);
-    }
-    return { before, complete: complete && this.shellProbeActive === false };
-  }
-
-  /**
-   * Find the next in-flight probe marker in `data` starting at `from`.
-   * Returns the index of the first byte of the marker, or -1 if neither
-   * marker is present. Caller must then compare against the expected
-   * marker length for that index — markers share a prefix (`__MCP_PROBE_`)
-   * and the unique tail (`UNAME_`/`HOST_`) is what distinguishes them.
-   */
-  private findNextProbeMarker(data: string, from: number): number {
-    let bestIdx = -1;
-    let bestMarker: string | null = null;
-    if (this.shellProbeUname) {
-      const idx = data.indexOf(this.shellProbeUname, from);
-      if (idx !== -1 && (bestIdx === -1 || idx < bestIdx)) {
-        bestIdx = idx;
-        bestMarker = this.shellProbeUname;
-      }
-    }
-    if (this.shellProbeHost) {
-      const idx = data.indexOf(this.shellProbeHost, from);
-      if (idx !== -1 && (bestIdx === -1 || idx < bestIdx)) {
-        bestIdx = idx;
-        bestMarker = this.shellProbeHost;
-      }
-    }
-    return bestIdx;
-  }
-
-  private activeProbeTokenLength(data: string, markerIdx: number): number {
-    // The two markers share `__MCP_PROBE_` prefix; pick whichever is at
-    // markerIdx. This helper exists so the caller can read the marker
-    // string after `findNextProbeMarker` finds its index.
-    if (this.shellProbeUname && data.startsWith(this.shellProbeUname, markerIdx)) {
-      return this.shellProbeUname.length;
-    }
-    if (this.shellProbeHost && data.startsWith(this.shellProbeHost, markerIdx)) {
-      return this.shellProbeHost.length;
-    }
-    return 0;
+    return { before, complete: false };
   }
 
   private beginShellTypeProbe(): void {
     this.shellProbeUname = `__MCP_PROBE_UNAME_${randomUUID()}__`;
     this.shellProbeHost = `__MCP_PROBE_HOST_${randomUUID()}__`;
     this.probeResponses = {};
+    this.shellProbeBuffer = '';
     this.shellProbeActive = true;
+    this.shellProbeReady = new Promise<void>((resolve, reject) => {
+      this.resolveShellProbeReady = resolve;
+      this.rejectShellProbeReady = reject;
+    });
     // Two probes:
     //  - `uname -s` distinguishes Unix-like shells from Windows shells.
     //  - `$Host.Name` (only PowerShell expands) distinguishes cmd from pwsh.
@@ -2476,11 +2514,15 @@ export class PersistentSession {
     this.shellProbeActive = false;
     this.shellProbeUname = null;
     this.shellProbeHost = null;
+    this.shellProbeBuffer = '';
     if (this.shellProbeTimer) {
       clearTimeout(this.shellProbeTimer);
       this.shellProbeTimer = null;
     }
     this.applyShellSetup(detected);
+    this.resolveShellProbeReady?.();
+    this.resolveShellProbeReady = null;
+    this.rejectShellProbeReady = null;
   }
 
   /**
@@ -2511,6 +2553,9 @@ export class PersistentSession {
       throw new McpError(ErrorCode.InternalError, `Session ${this.id} has been disposed`);
     }
     if (this.conn && this.shell) {
+      if (this.shellProbeReady) {
+        await this.shellProbeReady;
+      }
       return;
     }
 
@@ -2563,6 +2608,10 @@ export class PersistentSession {
         resolve();
       });
     });
+
+    if (this.shellProbeReady) {
+      await this.shellProbeReady;
+    }
 
     this.resetInactivityTimer();
   }
@@ -2636,6 +2685,19 @@ export class PersistentSession {
   }
 
   private cleanup(error?: Error): void {
+    if (this.shellProbeActive) {
+      this.shellProbeActive = false;
+      this.shellProbeUname = null;
+      this.shellProbeHost = null;
+      this.shellProbeBuffer = '';
+      if (this.shellProbeTimer) {
+        clearTimeout(this.shellProbeTimer);
+        this.shellProbeTimer = null;
+      }
+      this.rejectShellProbeReady?.(error ?? new Error('SSH session closed during shell detection'));
+      this.resolveShellProbeReady = null;
+      this.rejectShellProbeReady = null;
+    }
     this.commandQueue?.handleClose();
 
     if (this.inactivityTimer) {
@@ -3320,6 +3382,7 @@ export class FileTransfer {
   private readonly parallelConnectionFactory?: ParallelSftpConnectionFactory;
   private readonly parallelConnections = new Set<SftpConnection>();
   private readonly rejectRemoteSymlinks: boolean;
+  private readonly rejectLocalSymlinks: boolean;
   private chunked = false;
 
   constructor(
@@ -3329,13 +3392,14 @@ export class FileTransfer {
     private readonly remotePath: string,
     private readonly direction: 'download' | 'upload',
     private conns: SftpConnection,
-    options?: { chunkThreads?: number; chunkSize?: number; chunkThreshold?: number; parallelConnectionFactory?: ParallelSftpConnectionFactory; rejectRemoteSymlinks?: boolean },
+    options?: { chunkThreads?: number; chunkSize?: number; chunkThreshold?: number; parallelConnectionFactory?: ParallelSftpConnectionFactory; rejectRemoteSymlinks?: boolean; rejectLocalSymlinks?: boolean },
   ) {
     this.chunkThreads = Math.max(1, Math.floor(options?.chunkThreads ?? 4));
     this.chunkSize = options?.chunkSize ?? 8 * 1024 * 1024;
     this.chunkThreshold = options?.chunkThreshold ?? DEFAULT_CHUNK_THRESHOLD_BYTES;
     this.parallelConnectionFactory = options?.parallelConnectionFactory;
     this.rejectRemoteSymlinks = options?.rejectRemoteSymlinks ?? false;
+    this.rejectLocalSymlinks = options?.rejectLocalSymlinks ?? false;
     this.partPath = direction === 'download'
       ? partPathFor(localPath)
       : partPathFor(remotePath);
@@ -3439,19 +3503,28 @@ export class FileTransfer {
   private async runDownload(): Promise<void> {
     this.transferredBytes = 0;
     this.totalBytes = null;
-    const stats = await sftpStat(this.conns.sftp, this.remotePath);
+    const stats = this.rejectRemoteSymlinks
+      ? await sftpLstat(this.conns.sftp, this.remotePath)
+      : await sftpStat(this.conns.sftp, this.remotePath);
     if (this.disposed || this.cancelled) {
       throw new Error('transfer cancelled');
     }
     if (stats.isDirectory()) {
       throw new Error('download supports single files only; remote source is a directory');
     }
+    if (this.rejectRemoteSymlinks && stats.isSymbolicLink()) {
+      throw new Error(`Remote path '${this.remotePath}' is a symlink; refusing to follow it`);
+    }
     this.totalBytes = stats.size;
     let partSize: number | null = null;
     try {
-      const partStats = await stat(this.partPath);
+      const partStats = await (this.rejectLocalSymlinks ? lstat(this.partPath) : stat(this.partPath));
+      if (this.rejectLocalSymlinks && partStats.isSymbolicLink()) {
+        throw new Error(`Local partial path '${this.partPath}' is a symlink; refusing to follow it`);
+      }
       partSize = partStats.size;
-    } catch {
+    } catch (error: any) {
+      if (!isMissingPathError(error)) throw error;
       partSize = null;
     }
     const offset = resolveResumeOffset(partSize, stats.size);
@@ -3479,6 +3552,16 @@ export class FileTransfer {
           throw new Error('transfer cancelled');
         }
       } else {
+        if (this.rejectLocalSymlinks) {
+          try {
+            const existingPart = await lstat(this.partPath);
+            if (existingPart.isSymbolicLink()) {
+              throw new Error(`Local partial path '${this.partPath}' is a symlink; refusing to follow it`);
+            }
+          } catch (error: any) {
+            if (!isMissingPathError(error)) throw error;
+          }
+        }
         const read = this.conns.sftp.createReadStream(this.remotePath, { start: offset });
         const write = createWriteStream(this.partPath, { flags: offset > 0 ? 'a' : 'w' });
         this.streams = [read, write];
@@ -3497,7 +3580,10 @@ export class FileTransfer {
     if (this.disposed || this.cancelled) {
       throw new Error('transfer cancelled');
     }
-    const partStats = await stat(this.partPath);
+    const partStats = await (this.rejectLocalSymlinks ? lstat(this.partPath) : stat(this.partPath));
+    if (this.rejectLocalSymlinks && partStats.isSymbolicLink()) {
+      throw new Error(`Local partial path '${this.partPath}' is a symlink; refusing to follow it`);
+    }
     if (partStats.size !== stats.size) {
       throw new Error(`size mismatch: expected ${stats.size}, got ${partStats.size}`);
     }
@@ -3506,6 +3592,16 @@ export class FileTransfer {
     if (partHash !== remoteHash) {
       throw new Error(`sha256 mismatch: expected ${remoteHash}, got ${partHash}`);
     }
+    if (this.rejectLocalSymlinks) {
+      try {
+        const existingTarget = await lstat(this.localPath);
+        if (existingTarget.isSymbolicLink()) {
+          throw new Error(`Local destination '${this.localPath}' is a symlink; refusing to replace it`);
+        }
+      } catch (error: any) {
+        if (!isMissingPathError(error)) throw error;
+      }
+    }
     await rename(this.partPath, this.localPath);
     this.complete();
   }
@@ -3513,12 +3609,15 @@ export class FileTransfer {
   private async runUpload(): Promise<void> {
     this.transferredBytes = 0;
     this.totalBytes = null;
-    const localStats = await stat(this.localPath);
+    const localStats = await (this.rejectLocalSymlinks ? lstat(this.localPath) : stat(this.localPath));
     if (this.disposed || this.cancelled) {
       throw new Error('transfer cancelled');
     }
     if (!localStats.isFile()) {
       throw new Error('upload source is not a file');
+    }
+    if (this.rejectLocalSymlinks && localStats.isSymbolicLink()) {
+      throw new Error(`Local source '${this.localPath}' is a symlink; refusing to follow it`);
     }
     this.totalBytes = localStats.size;
     await ensureRemoteParentDirectory(this.conns.sftp, this.remotePath, this.rejectRemoteSymlinks);
@@ -3527,9 +3626,15 @@ export class FileTransfer {
     }
     let partSize: number | null = null;
     try {
-      const partStats = await sftpStat(this.conns.sftp, this.partPath);
+      const partStats = this.rejectRemoteSymlinks
+        ? await sftpLstat(this.conns.sftp, this.partPath)
+        : await sftpStat(this.conns.sftp, this.partPath);
+      if (this.rejectRemoteSymlinks && partStats.isSymbolicLink()) {
+        throw new Error(`Remote partial path '${this.partPath}' is a symlink; refusing to follow it`);
+      }
       partSize = partStats.size;
-    } catch {
+    } catch (error: any) {
+      if (!isMissingPathError(error)) throw error;
       partSize = null;
     }
     const offset = resolveResumeOffset(partSize, localStats.size);
@@ -3654,14 +3759,27 @@ export class FileTransfer {
     const connections = [this.conns];
     const factory = this.parallelConnectionFactory;
     if (!factory) return connections;
-    try {
-      const extras = await Promise.all(
-        Array.from({ length: Math.max(0, count - 1) }, () => factory()),
-      );
-      for (const connection of extras) {
-        this.parallelConnections.add(connection);
-        connections.push(connection);
+    const results = await Promise.allSettled(
+      Array.from({ length: Math.max(0, count - 1) }, () => factory()),
+    );
+    const extras: SftpConnection[] = [];
+    for (const result of results) {
+      if (result.status === 'fulfilled') {
+        extras.push(result.value);
       }
+    }
+    for (const connection of extras) {
+      this.parallelConnections.add(connection);
+      connections.push(connection);
+    }
+    const rejected = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+    if (rejected) {
+      // allSettled ensures every factory has finished before cleanup, so no
+      // late-resolving connection can escape the set and leak after failure.
+      this.closeParallelConnections();
+      throw rejected.reason;
+    }
+    try {
       if (this.disposed || this.cancelled) {
         this.closeParallelConnections();
         throw new Error('transfer cancelled');
@@ -3889,7 +4007,7 @@ export class DirectoryTransfer {
     },
   ) {
     this.concurrency = Math.max(1, options?.concurrency ?? 4);
-    this.chunkThreads = Math.max(1, Math.floor(options?.chunkThreads ?? 4));
+    this.chunkThreads = resolveDirectoryChunkThreads(this.concurrency, options?.chunkThreads ?? 4);
     this.chunkSize = options?.chunkSize ?? 8 * 1024 * 1024;
     this.chunkThreshold = options?.chunkThreshold ?? DEFAULT_CHUNK_THRESHOLD_BYTES;
     this.parallelConnectionFactory = options?.parallelConnectionFactory;
@@ -3914,12 +4032,20 @@ export class DirectoryTransfer {
     }
     this.state = 'running';
     try {
+      if (this.direction === 'upload-dir') {
+        await ensureLocalDirectoryRoot(this.targetPath);
+      }
       const entries = this.direction === 'upload-dir'
         ? await this.listLocalFiles(this.targetPath)
         : await this.listFiles(this.sourcePath);
       const { filesTotal, totalBytes } = dirEntriesToTotal(entries);
       this.filesTotal = filesTotal;
       this.totalBytes = totalBytes;
+      if (this.direction === 'download-dir') {
+        await ensureLocalDirectoryRoot(this.targetPath);
+      } else {
+        await ensureRemoteParentDirectory(this.conns.sftp, posixPath.join(this.sourcePath, '.mkdir'), true);
+      }
       await this.runConcurrent(entries);
       if (this.disposed || this.cancelled) {
         throw new Error('transfer cancelled');
@@ -3955,14 +4081,14 @@ export class DirectoryTransfer {
             : posixPath.join(this.sourcePath, relPath);
           if (entry.isDir) {
             if (this.direction === 'download-dir') {
-              await mkdir(target, { recursive: true });
+              await ensureLocalDirectoryPath(this.targetPath, target);
             } else {
               await ensureRemoteParentDirectory(this.conns.sftp, posixPath.join(target, '.mkdir'), true);
             }
             continue;
           }
           if (this.direction === 'download-dir') {
-            await mkdir(posixPath.dirname(target), { recursive: true });
+            await ensureLocalDirectoryPath(this.targetPath, posixPath.dirname(target));
           }
           const skipped = await this.maybeSkip(entry, source, target);
           if (skipped) {
@@ -4027,9 +4153,15 @@ export class DirectoryTransfer {
           const relPath = relDir ? `${relDir}/${name}` : name;
           if (item.attrs.isDirectory()) {
             out.push({ relPath, size: 0, isDir: true });
+            if (out.length > MAX_DIRECTORY_ENTRIES) {
+              throw new McpError(ErrorCode.InvalidParams, `Directory contains more than ${MAX_DIRECTORY_ENTRIES} entries`);
+            }
             await walk(`${dirPath}/${name}`, relPath);
           } else {
             out.push({ relPath, size: item.attrs.size ?? 0 });
+            if (out.length > MAX_DIRECTORY_ENTRIES) {
+              throw new McpError(ErrorCode.InvalidParams, `Directory contains more than ${MAX_DIRECTORY_ENTRIES} entries`);
+            }
           }
         }
       } finally {
@@ -4055,10 +4187,16 @@ export class DirectoryTransfer {
         const fullPath = posixPath.join(dirPath, name);
         if (dirent.isDirectory()) {
           out.push({ relPath, size: 0, isDir: true });
+          if (out.length > MAX_DIRECTORY_ENTRIES) {
+            throw new McpError(ErrorCode.InvalidParams, `Directory contains more than ${MAX_DIRECTORY_ENTRIES} entries`);
+          }
           await walk(fullPath, relPath);
         } else if (dirent.isFile()) {
           const st = await stat(fullPath);
           out.push({ relPath, size: st.size });
+          if (out.length > MAX_DIRECTORY_ENTRIES) {
+            throw new McpError(ErrorCode.InvalidParams, `Directory contains more than ${MAX_DIRECTORY_ENTRIES} entries`);
+          }
         }
       }
     };
@@ -4069,7 +4207,10 @@ export class DirectoryTransfer {
   private async maybeSkip(entry: DirEntry, sourcePath: string, targetPath: string): Promise<boolean> {
     if (this.direction === 'download-dir') {
       try {
-        const localStats = await stat(targetPath);
+        const localStats = await lstat(targetPath);
+        if (localStats.isSymbolicLink()) {
+          return false;
+        }
         const localHash = await sha256File(targetPath);
         const remoteHash = await sha256Remote(this.conns.sftp, sourcePath);
         return resolveDirSkip(entry, localStats.size, localHash, remoteHash);
@@ -4121,7 +4262,8 @@ export class DirectoryTransfer {
         chunkSize: this.chunkSize,
         chunkThreshold: this.chunkThreshold,
         parallelConnectionFactory: this.parallelConnectionFactory,
-        rejectRemoteSymlinks: this.direction === 'upload-dir',
+        rejectRemoteSymlinks: true,
+        rejectLocalSymlinks: this.direction === 'download-dir',
       },
     );
     this.subTransfers.add(ft);
