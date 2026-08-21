@@ -71,6 +71,7 @@ Hosts that are not directly reachable can be tunneled through any number of jump
 | 交互式输入 | `exec-input` | 向运行中命令的 stdin 发送输入并返回增量输出（`offset` 切片 + `wait_ms` 等待）；典型场景：跳板机资产选择菜单，逐层输入数字跳转到目标服务器 shell；交互式 TUI 命令永不结束，可用 `exec-cancel` 中断 | [Session Management](#session-management) |
 | 会话级交互式输入 | `session-input` / `session-output` | 直接读写会话 shell 的增量输出与 stdin，无需后台 run；典型场景：堡垒机（AIS iFORT、奇治 Umap）登录后立即弹出的 TUI 资产菜单 —— `start-session` 后先 `session-output` 读菜单，再 `session-input` 逐层输入数字进入目标服务器 | [Session Management](#session-management) |
 | 异步大文件下载/上传（断点续传） | `start-download` / `start-upload`（配合 `transfer-status` / `transfer-cancel`） | 单文件后台异步传输，立即返回 transfer id；写入 `<目标>.part` 中间文件，中断/失败后保留并可自动断点续传，成功后经大小 + sha256 校验再 rename 为目标路径；避免大文件（如 8GB）在同步 `download-file` / `upload-file` 上触发 MCP 客户端超时，旧同步工具保留用于小文件 | [File Transfer](#file-transfer) |
+| 异步目录递归传输（并行 + 分块） | `start-download-dir` / `start-upload-dir`（配合 `transfer-status` / `transfer-cancel`） | 递归传输整个目录树，后台异步执行；`concurrency` 控制并行文件数，文件达到 `chunk_threshold_mb`（默认 400MB）才以 `chunk_threads` / `chunk_size_mb` 分块，并让每个分段使用独立 SSH/SFTP 连接；`transfer-status` 报告 `filesDone` / `filesTotal` 文件级进度；重跑自动跳过已完整传输（大小 + sha256 匹配）的文件，实现清单 diff 续传 | [File Transfer](#file-transfer) |
 
 所有新增均向后兼容：原有 `hosts.json` 格式与既有工具调用方式完全不变。
 
@@ -90,6 +91,7 @@ Hosts that are not directly reachable can be tunneled through any number of jump
 - **Interactive command input:** drive interactive programs (jump-host asset menus, setup wizards) by sending stdin to a running background command with `exec-input` and reading the incremental output — the run stays `running` until the program exits, so interrupt it with `exec-cancel` when done.
 - **Session-level interactive input:** drive a bastion host's login-time TUI menu directly on the session shell — read the incremental output with `session-output` and write menu selections with `session-input`, without starting a background run.
 - **Async large-file transfer:** download or upload single files in the background — `start-download` / `start-upload` return a transfer id immediately and progress is polled via `transfer-status`, avoiding MCP client request timeouts on multi-GB files. Transfers are resumable: interrupted transfers keep a `.part` file and resume from the `.part` offset on re-run, verified by size + sha256 before the final rename.
+- **Async directory transfer:** recursively download or upload an entire directory tree in the background with `start-download-dir` / `start-upload-dir` — files transfer concurrently (`concurrency`), and only files at or above `chunk_threshold_mb` (default 400MB) split into parallel chunks (`chunk_threads` / `chunk_size_mb`) over independent SSH/SFTP connections; `transfer-status` reports per-file progress (`filesDone` / `filesTotal`), and re-running skips already-complete files (size + sha256 match) for a manifest-diff resume.
 - **Timeout & cleanup safeguards:** sessions and tunnels auto-close after prolonged inactivity; commands are marked and monitored for completion.
 - **Structured listings:** query active sessions and saved hosts directly from the MCP client.
 
@@ -123,6 +125,9 @@ MCP Client ─┬─> add-host / edit-host / remove-host
             │
             ├─> start-download / start-upload ──> FileTransfer (async SFTP pipe)
             │    transfer-status / transfer-cancel  └─> background; transfer id returned immediately
+            │
+            ├─> start-download-dir / start-upload-dir ──> DirectoryTransfer (recursive, concurrent)
+            │    transfer-status / transfer-cancel  └─> per-file FileTransfer; filesDone/filesTotal progress
             │
             └─> list-sessions
 
@@ -611,12 +616,47 @@ Progress is polled with `transfer-status` (pass the returned transfer id) and th
 | `server` | server-to-server (`start-transfer`) |
 | `download` | async local ← remote (`start-download`) |
 | `upload` | async local → remote (`start-upload`) |
+| `download-dir` | async recursive local ← remote (`start-download-dir`) |
+| `upload-dir` | async recursive local → remote (`start-upload-dir`) |
 
-The synchronous `download-file` / `upload-file` tools are retained for small files and backward compatibility. Like server-to-server transfers, async transfers run inside the MCP server's own SSH session — closing the laptop or the MCP server interrupts them.
+The synchronous `download-file` / `upload-file` tools are retained for small files and backward compatibility. All async file and directory tools accept `chunk_threshold_mb` (default **400**), `chunk_threads` (default **4**, max 16), and `chunk_size_mb` (default **8**): only a fresh transfer at or above the threshold uses parallel chunks. Each fresh chunk uses its own SSH/SFTP connection (one primary connection plus one extra connection for every additional segment), so the transfer can use multiple TCP flows in the same way as a multi-connection downloader; a resumed `.part` always continues sequentially. Like server-to-server transfers, async transfers run inside the MCP server's own SSH session — closing the laptop or the MCP server interrupts them.
 
 Async transfers are **resumable**. The file is first written to a `<目标>.part` intermediate file (the destination path plus a `.part` suffix). If the transfer is cancelled, fails, or is otherwise interrupted, the `.part` file is **kept** — re-running the same `start-download` / `start-upload` with the same destination automatically resumes from the `.part` offset instead of starting over. Only after the whole file has been transferred is the `.part` file renamed to the final destination path (replacing any existing file there at that point). Before the rename, the transferred data is verified against the source by **size and sha256 hash**; a mismatch marks the transfer `failed` and leaves the `.part` file in place for the next resume attempt. 传输先写入 `<目标>.part` 中间文件；中断或失败后 `.part` 会保留，重跑同一 `start-download` / `start-upload` 即自动从断点续传，成功后校验（大小 + sha256）并重命名为目标路径；校验不符则标记 failed 且保留 `.part` 供下次续传。
 
 > **Note:** seeing a `<目标>.part` file during or after an interrupted transfer is **normal** — it is the resume point, not garbage. Leave it in place to resume later, or delete it if you want to start from scratch. 传输中或中断后看到目标路径旁的 `<目标>.part` 文件属正常现象，它是续传断点；可保留以便后续续传，也可删除以重新开始。
+
+### Asynchronous directory upload/download (recursive)
+
+Tool: **`start-upload-dir`** and **`start-download-dir`**
+
+The async file tools transfer a single file; to move an entire directory tree (e.g. model weights, a dataset, a code checkout) use the directory variants. They return a **transfer id immediately** and transfer in the background:
+
+- **`start-upload-dir`** — `host_id`, `local_dir`, `remote_dir`, plus `concurrency` (max parallel files, default 4), `chunk_threshold_mb` (minimum file size to enable chunking, default 400), `chunk_threads` (max parallel segments, default 4), and `chunk_size_mb` (minimum segment size, default 8). Recursively uploads the local directory to the remote host; missing remote parent directories are created.
+- **`start-download-dir`** — `host_id`, `remote_dir`, `local_dir`, plus the same `concurrency` / `chunk_threshold_mb` / `chunk_threads` / `chunk_size_mb` options. Recursively downloads the remote directory to the local machine (destination directory created if missing).
+
+```json
+{
+  "host_id": "internal-host",
+  "remote_dir": "/opt/models/llama-7b",
+  "local_dir": "C:/models/llama-7b",
+  "concurrency": 8,
+  "chunk_threshold_mb": 400,
+  "chunk_threads": 8,
+  "chunk_size_mb": 16
+}
+```
+
+Response:
+
+```
+Directory download '2f1a...' started: internal-host:/opt/models/llama-7b -> 'C:/models/llama-7b'
+```
+
+Progress is polled with the same `transfer-status` / `transfer-cancel` tools. Directory transfers report a `kind` of `download-dir` / `upload-dir` and additionally surface **`filesDone` / `filesTotal`** — how many files have completed out of the total discovered in the recursive listing — alongside the byte-level `transferredBytes` / `totalBytes`. The same async-trio lifecycle applies: run inside the MCP server's own SSH session, interrupted if the laptop or server closes.
+
+Directory transfers are **manifest-diff resumable**: re-running the same `start-download-dir` / `start-upload-dir` re-lists the source tree and **skips any already-complete destination files** whose size and sha256 match the source, so only missing or changed files are transferred. There is no separate resume parameter — the source and destination paths define the manifest. 目录传输支持清单 diff 续传：重跑同一工具会重新列出源目录，跳过大小与 sha256 均匹配的已完整文件，只传输缺失或变更的文件；无需额外参数，源/目标路径即清单。
+
+**Symlink handling in directory transfers:** directory walks **skip symbolic links** (both remote `readdir` and local `readdir`), and a source **root** that is itself a symlink is **rejected**. Uploads also refuse to write through a symlinked remote parent directory. This prevents a download manifest from following a link out of the tree and an upload from silently writing through a link (e.g. `/tmp/out/sub -> /etc`). Single-file `start-download` / `start-upload` keep the legacy behavior of following symlinks. 目录传输的符号链接处理：目录遍历**跳过符号链接**条目（远端与本地一致），起始**根目录若是符号链接则拒绝**；上传也拒绝穿透符号链接的远端父目录，防止下载清单顺着链接逃出目录树、或上传经由链接（如 `/tmp/out/sub -> /etc`）落入意外路径。单文件 `start-download` / `start-upload` 保持原有跟随链接的行为。
 
 ---
 
@@ -816,7 +856,7 @@ Because rsync runs with `--size-only`, a destination file already the same size 
 
 ### Checking status / cancelling
 
-Tool: **`transfer-status`** with `transfer_id` returns JSON with `state`, `kind`, `mode`, `sourceHost`, `sourcePath`, `targetHost`, `targetPath`, `transferredBytes`, `totalBytes`, `percent`, `error`, `createdAt`, and `finishedAt`. Server-to-server transfers report `kind: 'server'`; transfers started by `start-download` / `start-upload` report `kind: 'download'` / `'upload'`, and for those one side of `sourceHost` / `targetHost` is `'local'` (`start-download`: `targetHost` is `'local'`; `start-upload`: `sourceHost` is `'local'`). Tool: **`transfer-cancel`** with `transfer_id` stops a running transfer.
+Tool: **`transfer-status`** with `transfer_id` returns JSON with `state`, `kind`, `mode`, `sourceHost`, `sourcePath`, `targetHost`, `targetPath`, `transferredBytes`, `totalBytes`, `percent`, `error`, `createdAt`, and `finishedAt`. Server-to-server transfers report `kind: 'server'`; transfers started by `start-download` / `start-upload` report `kind: 'download'` / `'upload'`, and for those one side of `sourceHost` / `targetHost` is `'local'` (`start-download`: `targetHost` is `'local'`; `start-upload`: `sourceHost` is `'local'`). Directory transfers started by `start-download-dir` / `start-upload-dir` report `kind: 'download-dir'` / `'upload-dir'` and additionally include `filesDone` / `filesTotal`. Tool: **`transfer-cancel`** with `transfer_id` stops a running transfer.
 
 ### Lifecycle & limitations
 
@@ -921,8 +961,10 @@ Below is a typical workflow using Claude Code (commands start with `/mcp`), but 
    ```
    /mcp mcp-remote-ssh start-download {"host_id":"host","remote_path":"/var/log/app.log","local_path":"C:/downloads/app.log"}
    /mcp mcp-remote-ssh start-upload {"host_id":"host","local_path":"C:/build/app.tar.gz","remote_path":"/tmp/app.tar.gz"}
+   /mcp mcp-remote-ssh start-download-dir {"host_id":"host","remote_dir":"/opt/models/llama-7b","local_dir":"C:/models/llama-7b"}
+   /mcp mcp-remote-ssh start-upload-dir {"host_id":"host","local_dir":"C:/build/release","remote_dir":"/opt/releases/latest"}
    ```
-   → each returns a transfer id immediately; `transfer-status` shows progress, `transfer-cancel` stops it. Prefer these over `download-file` / `upload-file` for files large enough to time out the synchronous tools.
+   → each returns a transfer id immediately; `transfer-status` shows progress (directory transfers also report `filesDone`/`filesTotal`), `transfer-cancel` stops it. Prefer these over `download-file` / `upload-file` for files large enough to time out the synchronous tools.
 
 9. **Inspect**
    ```
@@ -1012,6 +1054,7 @@ Issues and feature requests are welcome via GitHub.
 - **内网出网（Internet Egress）** —— 新增 `open-egress` / `close-egress` / `list-egress` 三个工具：在跳板机 A 上反向监听端口（`ssh -R` 风格），把内网 B/C 的 HTTP 代理流量经 SSH 隧道送回本地，由本地作为出口代理访问外网。无需内网开放任何入站端口，纯 JavaScript 实现。
 - **服务器间直传（Server-to-Server Transfer）** —— 新增 `start-transfer` / `transfer-status` / `transfer-cancel` 三个工具：在两台已保存主机之间传输文件。`direct` 在源服务器上用 rsync 直连目标（本地 0 带宽，适合 200GB 级别备份）；`stream` 经本地双 SFTP 流转发（适合小文件或服务器间不通）；`hybrid` 先直连失败降级流式；`auto` 按大小阈值自动选择。异步三件套便于大文件后台跟踪与取消。
 - **异步大文件下载/上传（Async Large-File Transfer，支持断点续传）** —— 新增 `start-download` / `start-upload` 两个工具：单文件经 SFTP 后台异步传输，立即返回 transfer id，用 `transfer-status` 轮询进度、`transfer-cancel` 取消，避免大文件（如 8GB）在同步的 `download-file` / `upload-file` 上触发 MCP 客户端请求超时；`transfer-status` 的 `kind` 字段区分 `server` / `download` / `upload` 三类传输。传输写入 `<目标>.part` 中间文件，中断/失败后保留并可自动断点续传，成功后经大小 + sha256 校验再 rename 为目标路径。旧同步工具保留用于小文件与向后兼容。
+- **异步目录递归传输（Async Directory Transfer，并行 + 分块）** —— 新增 `start-download-dir` / `start-upload-dir` 两个工具：递归传输整个目录树，后台异步执行，立即返回 transfer id；`concurrency` 控制并行文件数（默认 4），只有达到 `chunk_threshold_mb`（默认 400MB）的文件才使用 `chunk_threads` / `chunk_size_mb` 分块（默认最多 4 段 / 每段至少 8MB），每个分段使用独立 SSH/SFTP 连接。`transfer-status` 对目录传输报告 `kind: 'download-dir' / 'upload-dir'` 及文件级进度 `filesDone` / `filesTotal`。重跑同一工具自动跳过已完整传输（大小 + sha256 匹配）的文件，实现清单 diff 续传。
 - **单元测试** —— 覆盖主机 schema、跳板链解析与跳板配置校验。
 - **会话级交互式输入** —— 新增 `session-output` / `session-input` 两个工具：直接读写会话 shell 的增量输出与 stdin，无需后台 run。典型场景是堡垒机（AIS iFORT、奇治 Umap）登录后立即弹出的 TUI 资产菜单：`start-session` 后先 `session-output` 读菜单，再用 `session-input` 逐层输入数字进入目标服务器。与 `exec-input` 的区别在于它作用于 session 本身而非 `start-exec` 的 run；会话输出缓冲上限 1MB（最旧部分被丢弃），初始输出可能混有 shell 引导回显（`export PS1=""` / `stty -echo`）。
 
