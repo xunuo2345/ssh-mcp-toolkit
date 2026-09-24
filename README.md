@@ -894,7 +894,9 @@ Tool: **`transfer-status`** with `transfer_id` returns JSON with `state`, `kind`
 ssh-mcp-toolkit/
 ├── build/                # Compiled JS output (npm run build)
 ├── src/index.ts          # Primary MCP server implementation
-├── test/                 # Vitest tests (CLI-only; integration tests skipped)
+├── test/                 # Vitest unit tests plus optional real SSH integration tests
+├── Dockerfile            # Multi-stage runtime/test image
+├── docker-compose.yml    # OpenSSH fixtures and containerized self-test
 ├── package.json
 ├── README.md             # This document
 └── ~/.ssh-mcp/hosts.json # Created at runtime (per user)
@@ -996,7 +998,27 @@ Unit tests (Vitest):
 npm run test
 ```
 
-Integration smoke tests for SSH are not included by default because they require external infrastructure. You can manually validate with the workflow above.
+The real SSH integration suite is opt-in and expects an OpenSSH server reachable through the environment variables below:
+
+```bash
+SSH_MCP_INTEGRATION=1 \
+SSH_MCP_INTEGRATION_HOST=127.0.0.1 \
+SSH_MCP_INTEGRATION_PORT=2222 \
+SSH_MCP_INTEGRATION_USER=test \
+SSH_MCP_INTEGRATION_PASSWORD=secret \
+npm run test:integration
+```
+
+For local container runs, Compose generates a temporary Ed25519 key inside a named volume, mounts it into both OpenSSH services, and uses a dedicated `sshd_config` with TCP forwarding enabled. No test private key is committed to the repository.
+
+The repository also provides a fully containerized self-test. It builds the Node image, runs the complete unit suite, then connects through two real OpenSSH containers to exercise shell sessions, ProxyJump, SFTP file/directory transfers, server-to-server streaming, local port forwarding, and reverse forwarding:
+
+```bash
+docker compose --profile test up --build --abort-on-container-exit --exit-code-from test
+docker compose --profile test down -v
+```
+
+The default runtime image can be built with `docker build -t ssh-mcp-toolkit .`; the Compose `test` service uses the Dockerfile's `test` stage instead.
 
 ---
 

@@ -1,0 +1,10 @@
+Port 2222
+AuthorizedKeysFile .ssh/authorized_keys
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM no
+AllowTcpForwarding yes
+GatewayPorts clientspecified
+X11Forwarding no
+Subsystem sftp internal-sftp

@@ -1,11 +1,96 @@
+x-sshd: &sshd
+  image: lscr.io/linuxserver/openssh-server:latest
+  environment:
+    USER_NAME: test
+    PASSWORD_ACCESS: "true"
+    USER_PASSWORD: secret
+  healthcheck:
+    test: ["CMD-SHELL", "chmod 600 /config/ssh_host_keys/*_key 2>/dev/null || true; nc -z 127.0.0.1 2222"]
+    interval: 2s
+    timeout: 2s
+    retries: 30
+
 services:
   ssh:
-    image: lscr.io/linuxserver/openssh-server:latest
-    environment:
-      - USER_NAME=test
-      - PASSWORD_ACCESS=true
-      - USER_PASSWORD=secret
+    <<: *sshd
     ports:
       - "2222:2222"
 
+  ssh-keygen:
+    image: lscr.io/linuxserver/openssh-server:latest
+    profiles: [test]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        mkdir -p /keys
+        if [ ! -s /keys/id_ed25519 ]; then
+          ssh-keygen -q -t ed25519 -N '' -f /keys/id_ed25519 -C ssh-mcp-container-test
+        fi
+        chmod 600 /keys/id_ed25519
+        chmod 644 /keys/id_ed25519.pub
+        cp /seed/sshd_config /config-seed/sshd_config
+        tail -f /dev/null
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /keys/id_ed25519 && test -s /keys/id_ed25519.pub && test -s /config-seed/sshd_config"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    volumes:
+      - ssh-test-keys:/keys
+      - ssh-test-config:/config-seed
+      - ./docker/sshd/sshd_config:/seed/sshd_config:ro
 
+  ssh-test:
+    <<: *sshd
+    profiles: [test]
+    environment:
+      USER_NAME: test
+      PASSWORD_ACCESS: "false"
+      PUBLIC_KEY_FILE: /keys/id_ed25519.pub
+    volumes:
+      - ssh-test-keys:/keys:ro
+      - ssh-test-config:/config/sshd
+    depends_on:
+      ssh-keygen:
+        condition: service_healthy
+
+  ssh-jump-test:
+    <<: *sshd
+    profiles: [test]
+    environment:
+      USER_NAME: test
+      PASSWORD_ACCESS: "false"
+      PUBLIC_KEY_FILE: /keys/id_ed25519.pub
+    volumes:
+      - ssh-test-keys:/keys:ro
+      - ssh-test-config:/config/sshd
+    depends_on:
+      ssh-keygen:
+        condition: service_healthy
+
+  test:
+    build:
+      context: .
+      target: test
+    profiles: [test]
+    environment:
+      SSH_MCP_DISABLE_MAIN: "1"
+      SSH_MCP_INTEGRATION: "1"
+      SSH_MCP_INTEGRATION_HOST: ssh-test
+      SSH_MCP_INTEGRATION_JUMP_HOST: ssh-jump-test
+      SSH_MCP_INTEGRATION_PRIVATE_KEY: /keys/id_ed25519
+      SSH_MCP_INTEGRATION_PORT: "2222"
+      SSH_MCP_INTEGRATION_USER: test
+      SSH_MCP_INTEGRATION_PASSWORD: secret
+    volumes:
+      - ssh-test-keys:/keys:ro
+    depends_on:
+      ssh-test:
+        condition: service_healthy
+      ssh-jump-test:
+        condition: service_healthy
+
+volumes:
+  ssh-test-keys:
+  ssh-test-config:

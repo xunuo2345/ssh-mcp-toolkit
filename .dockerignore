@@ -1,0 +1,9 @@
+.git
+.trail
+.claude
+.superpowers
+node_modules
+build
+coverage
+opencode.jsonc
+*.log
