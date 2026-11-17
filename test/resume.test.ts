@@ -148,7 +148,7 @@ describe('FileTransfer download resume', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  it('download with a corrupt equal-size .part fails, preserves .part and no target', async () => {
+  it('download with a corrupt equal-size .part fails and removes the invalid partial', async () => {
     const { FileTransfer, partPathFor } = await import('../src/index.js');
     const dir = await mkdtemp(join(tmpdir(), 'resume-dl5-'));
     const local = join(dir, 'file.bin');
@@ -160,7 +160,7 @@ describe('FileTransfer download resume', () => {
       { conn: { end() {} } as any, jumpConns: [], sftp: source.sftp as any });
     await transfer.start();
     expect(transfer.getInfo().state).toBe('failed');
-    await expect(stat(part)).resolves.toBeDefined(); // .part preserved
+    await expect(stat(part)).rejects.toThrow(); // next retry starts from zero
     await expect(stat(local)).rejects.toThrow(); // no target written
     await rm(dir, { recursive: true, force: true });
   });
@@ -183,11 +183,13 @@ describe('FileTransfer download resume', () => {
 });
 
 describe('FileTransfer upload resume', () => {
-  function makeRemoteSftpForResume(initial?: Buffer, corruptRead = false, writeError?: string) {
+  function makeRemoteSftpForResume(initial?: Buffer, corruptRead = false, writeError?: string, renameFailure = false) {
     const calls = {
       open: [] as Array<{ path: string; flags: string }>,
       write: [] as Array<{ position: number; len: number }>,
       rename: [] as Array<{ from: string; to: string }>,
+      extendedRename: [] as Array<{ from: string; to: string }>,
+      unlink: [] as string[],
       fstat: [] as number[],
       end: 0,
     };
@@ -227,9 +229,17 @@ describe('FileTransfer upload resume', () => {
       },
       rename(from: string, to: string, cb: (error: Error | null) => void) {
         calls.rename.push({ from, to });
+        cb(renameFailure ? new Error('Failure') : null);
+      },
+      ext_openssh_rename(from: string, to: string, cb: (error: Error | null) => void) {
+        calls.extendedRename.push({ from, to });
         cb(null);
       },
-      unlink(_path: string, cb: (error: Error | null) => void) { cb(null); },
+      unlink(path: string, cb: (error: Error | null) => void) {
+        calls.unlink.push(path);
+        remoteContent = Buffer.alloc(0);
+        cb(null);
+      },
       createReadStream(path: string) {
         const data = corruptRead ? Buffer.alloc(remoteContent.length, 0xff) : remoteContent;
         const r = new Readable();
@@ -263,6 +273,20 @@ describe('FileTransfer upload resume', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
+  it('uses the OpenSSH posix-rename extension when replacing an existing destination', async () => {
+    const { FileTransfer, partPathFor } = await import('../src/index.js');
+    const dir = await mkdtemp(join(tmpdir(), 'resume-up-overwrite-'));
+    const local = join(dir, 'src.bin');
+    await writeFile(local, Buffer.from('replacement contents'));
+    const remote = makeRemoteSftpForResume(undefined, false, undefined, true);
+    const transfer = new FileTransfer('overwrite', 'A', local, '/remote/dst.bin', 'upload',
+      { conn: { end() {} } as any, jumpConns: [], sftp: remote.sftp as any });
+    await transfer.start();
+    expect(transfer.getInfo().state).toBe('completed');
+    expect(remote.calls.extendedRename).toEqual([{ from: partPathFor('/remote/dst.bin'), to: '/remote/dst.bin' }]);
+    await rm(dir, { recursive: true, force: true });
+  });
+
   it('upload reports failed on sha256 mismatch without renaming', async () => {
     const { FileTransfer } = await import('../src/index.js');
     const dir = await mkdtemp(join(tmpdir(), 'resume-up2-'));
@@ -274,6 +298,7 @@ describe('FileTransfer upload resume', () => {
     await transfer.start();
     expect(transfer.getInfo().state).toBe('failed');
     expect(remote.calls.rename).toEqual([]);
+    expect(remote.calls.unlink).toEqual(['/remote/dst.bin.part']);
     await rm(dir, { recursive: true, force: true });
   });
 

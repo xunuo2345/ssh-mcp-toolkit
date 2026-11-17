@@ -123,6 +123,77 @@ describe('formatEgressLine', () => {
 });
 
 describe('handleProxyConnection', () => {
+  it('preserves binary request bytes that share the header packet', async () => {
+    const { handleProxyConnection } = await import('../src/index.js');
+    const body = Buffer.from([0x00, 0x80, 0xff, 0x41]);
+    let received = Buffer.alloc(0);
+    let resolveBody!: () => void;
+    const bodyRead = new Promise<void>((resolve) => { resolveBody = resolve; });
+    const origin = net.createServer((socket) => {
+      socket.on('data', (chunk) => {
+        received = Buffer.concat([received, chunk]);
+        const end = received.indexOf('\r\n\r\n');
+        const expected = Number(/Content-Length: (\d+)/i.exec(received.subarray(0, end).toString())?.[1] ?? 0);
+        if (end >= 0 && received.length >= end + 4 + expected) {
+          resolveBody();
+          socket.end('HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok');
+        }
+      });
+    });
+    const originPort = await listenServer(origin);
+    const proxy = net.createServer((socket) => handleProxyConnection(socket, () => net.connect({ host: '127.0.0.1', port: originPort })));
+    const proxyPort = await listenServer(proxy);
+    try {
+      const client = net.connect({ host: '127.0.0.1', port: proxyPort });
+      await new Promise<void>((resolve) => client.once('connect', resolve));
+      const header = Buffer.from(`POST http://example.test/upload HTTP/1.1\r\nHost: example.test\r\nContent-Length: ${body.length}\r\n\r\n`);
+      client.write(Buffer.concat([header, body]));
+      await bodyRead;
+      const end = received.indexOf('\r\n\r\n');
+      expect(received.subarray(end + 4)).toEqual(body);
+      client.destroy();
+    } finally {
+      proxy.close();
+      origin.close();
+    }
+  });
+
+  it('buffers request body while the asynchronous upstream connection is pending', async () => {
+    const { handleProxyConnection } = await import('../src/index.js');
+    let received = '';
+    let resolveBody!: () => void;
+    const bodyRead = new Promise<void>((resolve) => { resolveBody = resolve; });
+    const origin = net.createServer((socket) => socket.on('data', (chunk) => {
+      received += chunk.toString();
+      if (received.includes('BODY')) { resolveBody(); socket.end('HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok'); }
+    }));
+    const originPort = await listenServer(origin);
+    let resolveDial!: (socket: net.Socket) => void;
+    let resolveDialStarted!: () => void;
+    const dialStarted = new Promise<void>((resolve) => { resolveDialStarted = resolve; });
+    const proxy = net.createServer((socket) => handleProxyConnection(socket, () => {
+      resolveDialStarted();
+      return new Promise<net.Socket>((resolve) => { resolveDial = resolve; });
+    }));
+    const proxyPort = await listenServer(proxy);
+    try {
+      const client = net.connect({ host: '127.0.0.1', port: proxyPort });
+      await new Promise<void>((resolve) => client.once('connect', resolve));
+      client.write('POST http://example.test/upload HTTP/1.1\r\nHost: example.test\r\nContent-Length: 4\r\n\r\n');
+      await dialStarted;
+      client.write('BODY');
+      const upstream = net.connect({ host: '127.0.0.1', port: originPort });
+      await new Promise<void>((resolve) => upstream.once('connect', resolve));
+      resolveDial(upstream);
+      await bodyRead;
+      expect(received).toContain('BODY');
+      client.destroy();
+    } finally {
+      proxy.close();
+      origin.close();
+    }
+  });
+
   it('CONNECT replies 200 and tunnels bidirectionally', async () => {
     const { handleProxyConnection } = await import('../src/index.js');
     const { server: echo, port: echoPort } = await listenEcho();

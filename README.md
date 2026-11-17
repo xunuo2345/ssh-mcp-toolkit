@@ -92,7 +92,7 @@ Hosts that are not directly reachable can be tunneled through any number of jump
 - **Cross-platform shell sessions:** automatically detect POSIX shells, Windows `cmd.exe`, and PowerShell; completion markers use the corresponding shell syntax, and the first command waits for shell detection to finish.
 - **Interactive command input:** drive interactive programs (jump-host asset menus, setup wizards) by sending stdin to a running background command with `exec-input` and reading the incremental output — the run stays `running` until the program exits, so interrupt it with `exec-cancel` when done.
 - **Session-level interactive input:** drive a bastion host's login-time TUI menu directly on the session shell — read the incremental output with `session-output` and write menu selections with `session-input`, without starting a background run.
-- **Async large-file transfer:** download or upload single files in the background — `start-download` / `start-upload` return a transfer id immediately and progress is polled via `transfer-status`, avoiding MCP client request timeouts on multi-GB files. Transfers are resumable: interrupted transfers keep a `.part` file and resume from the `.part` offset on re-run, verified by size + sha256 before the final rename.
+- **Async large-file transfer:** download or upload single files in the background — `start-download` / `start-upload` return a transfer id immediately and progress is polled via `transfer-status`, avoiding MCP client request timeouts on multi-GB files. Transfers are resumable: interrupted transfers keep a `.part` file and resume from the `.part` offset on re-run, verified by size + sha256 before the final rename; an invalid partial is removed after a hash mismatch so retry can start cleanly.
 - **Async directory transfer:** recursively download or upload an entire directory tree in the background with `start-download-dir` / `start-upload-dir` — files transfer concurrently (`concurrency`), and only files at or above `chunk_threshold_mb` (default 400MB) split into parallel chunks (`chunk_threads` / `chunk_size_mb`) over independent SSH/SFTP connections; `transfer-status` reports per-file progress (`filesDone` / `filesTotal`), and re-running skips already-complete files (size + sha256 match) for a manifest-diff resume.
 - **Timeout & cleanup safeguards:** sessions and tunnels auto-close after prolonged inactivity; commands are marked and monitored for completion.
 - **Structured listings:** query active sessions and saved hosts directly from the MCP client.
@@ -295,7 +295,8 @@ If it is not on your `PATH`, use `{ "command": "node", "args": ["/absolute/path/
       "port": 22,
       "username": "user",
       "password": "...",     // optional
-      "keyPath": "~/.ssh/id_rsa" // optional
+      "keyPath": "~/.ssh/id_rsa", // optional
+      "hostKeyFingerprint": "SHA256:..." // optional pin
     }
   ]
 }
@@ -308,6 +309,7 @@ Fields:
 - `username` (string) — SSH user.
 - `password` (optional string) — password auth.
 - `keyPath` (optional string) — private key path; tilde expansion supported.
+- `hostKeyFingerprint` (optional string) — SHA256 fingerprint pin for the SSH server key. Set it from a trusted channel to reject impersonated servers; jump hosts use their own pins.
     - If neither `password` nor `keyPath` is provided, the server attempts to use the local SSH agent via `SSH_AUTH_SOCK` (with agent forwarding enabled).
 
 > The MCP tools ensure this file remains well-formed; never edit it manually unless you know what you’re doing.
@@ -323,7 +325,8 @@ Tool: **`add-host`**
   "port": 22,
   "username": "user",
   "password": "optional",
-  "keyPath": "optional"
+  "keyPath": "optional",
+  "hostKeyFingerprint": "SHA256:trusted-fingerprint"
 }
 ```
 
@@ -346,13 +349,14 @@ Tool: **`list-hosts`**
 Returns text with one host per line:
 
 ```
-id=host host=host.local:22 user=user auth=agent
+id=host host=host.local:22 user=user auth=agent hostkey=unchecked
 ```
 
 `auth` values:
 - `password` — password field present
 - `key` — keyPath present
 - `agent` — neither password nor keyPath; agent fallback active
+- `hostkey=pinned` — a SHA256 fingerprint is configured; `hostkey=unchecked` — ssh2 accepts any server key for backward compatibility.
 
 ### Editing Hosts
 
@@ -476,10 +480,10 @@ Tool: **`exec-status`** with `run_id` returns JSON with the full accumulated `ou
 
 #### Streaming logs
 
-Tool: **`exec-logs`** with `run_id` and an `offset` (character index, default `0`) returns only the output produced after that point. Use the returned `nextOffset` as the next `offset` to poll incrementally while the command is still running:
+Tool: **`exec-logs`** with `run_id` and an `offset` (character index, default `0`) returns only the output produced after that point. Captured output is capped at 1,048,576 characters; responses include `earliestOffset`, and `truncated: true` means the requested offset predates retained output. Use the returned `nextOffset` as the next `offset` to poll incrementally while the command is still running:
 
 ```json
-{ "run_id": "7f1c…", "state": "running", "output": "…new output…", "nextOffset": 412, "exitCode": null }
+{ "run_id": "7f1c…", "state": "running", "output": "…new output…", "nextOffset": 412, "earliestOffset": 0, "truncated": false, "exitCode": null }
 ```
 
 #### Cancelling
@@ -520,10 +524,10 @@ A finished run (completed, failed, or cancelled) stays queryable via `exec-statu
 
 #### Reading session output
 
-Tool: **`session-output`** with `session_id` and `offset` (character index, default `0`) returns the output the session's shell has produced from that offset onward, plus `nextOffset` for continuing:
+Tool: **`session-output`** with `session_id` and `offset` (character index, default `0`) returns the output the session's shell has produced from that offset onward, plus `nextOffset` for continuing. Its 1,048,576-character rolling buffer reports `earliestOffset`; `truncated: true` means older output was dropped before the requested offset:
 
 ```json
-{ "output": "…menu text…", "nextOffset": 412 }
+{ "output": "…menu text…", "nextOffset": 412, "earliestOffset": 0, "truncated": false }
 ```
 
 #### Writing input
@@ -641,7 +645,7 @@ Progress is polled with `transfer-status` (pass the returned transfer id) and th
 
 The synchronous `download-file` / `upload-file` tools are retained for small files and backward compatibility. All async file and directory tools accept `chunk_threshold_mb` (default **400**), `chunk_threads` (default **4**, max 16), and `chunk_size_mb` (default **8**): only a fresh transfer at or above the threshold uses parallel chunks. Each fresh chunk uses its own SSH/SFTP connection (one primary connection plus one extra connection for every additional segment), so the transfer can use multiple TCP flows in the same way as a multi-connection downloader; a resumed `.part` always continues sequentially. Directory transfers additionally cap the effective chunk threads so concurrent files use at most 16 SFTP connections in aggregate, and refuse manifests larger than 100,000 entries. Like server-to-server transfers, async transfers run inside the MCP server's own SSH session — closing the laptop or the MCP server interrupts them.
 
-Async transfers are **resumable**. The file is first written to a `<目标>.part` intermediate file (the destination path plus a `.part` suffix). If the transfer is cancelled, fails, or is otherwise interrupted, the `.part` file is **kept** — re-running the same `start-download` / `start-upload` with the same destination automatically resumes from the `.part` offset instead of starting over. Only after the whole file has been transferred is the `.part` file renamed to the final destination path (replacing any existing file there at that point). Before the rename, the transferred data is verified against the source by **size and sha256 hash**; a mismatch marks the transfer `failed` and leaves the `.part` file in place for the next resume attempt. 传输先写入 `<目标>.part` 中间文件；中断或失败后 `.part` 会保留，重跑同一 `start-download` / `start-upload` 即自动从断点续传，成功后校验（大小 + sha256）并重命名为目标路径；校验不符则标记 failed 且保留 `.part` 供下次续传。
+Async transfers are **resumable**. The file is first written to a `<目标>.part` intermediate file (the destination path plus a `.part` suffix). If the transfer is cancelled, fails, or is otherwise interrupted, the `.part` file is **kept** — re-running the same `start-download` / `start-upload` with the same destination automatically resumes from the `.part` offset instead of starting over. Only after the whole file has been transferred is the `.part` file renamed to the final destination path (replacing any existing file there at that point). Before the rename, the transferred data is verified against the source by **size and sha256 hash**; a hash mismatch marks the transfer `failed` and removes the invalid `.part`, so retrying starts cleanly. Concurrent async transfers with overlapping target paths (including another transfer's `.part` path) are rejected until the active transfer finishes. 传输先写入 `<目标>.part` 中间文件；一般中断或失败后 `.part` 会保留并可续传；哈希校验不符时会删除无效 `.part`，避免后续重试陷入循环。传输完成后先校验大小与 sha256，再重命名为最终路径，已有目标文件会被替换；写入目标或其 `.part` 路径冲突的并发任务会被拒绝。
 
 > **Note:** seeing a `<目标>.part` file during or after an interrupted transfer is **normal** — it is the resume point, not garbage. Leave it in place to resume later, or delete it if you want to start from scratch. 传输中或中断后看到目标路径旁的 `<目标>.part` 文件属正常现象，它是续传断点；可保留以便后续续传，也可删除以重新开始。
 
@@ -890,7 +894,7 @@ Tool: **`transfer-status`** with `transfer_id` returns JSON with `state`, `kind`
 ## Authentication Modes
 
 1. **Password** — stored in `hosts.json`; transmitted to `ssh2` during connection.
-2. **Private key** — `keyPath` read at runtime; supports encrypted keys (prompt user to set `SSH_MCP_KEY_PASSPHRASE` before launch if needed).
+2. **Private key** — `keyPath` read at runtime; encrypted keys use `SSH_MCP_KEY_PASSPHRASE`.
 3. **SSH agent (fallback)** — if neither password nor key is set and `SSH_AUTH_SOCK` is present, the agent is passed to `ssh2` (`agentForward: true`).
 
 ---
@@ -1056,9 +1060,10 @@ The default runtime image can be built with `docker build -t ssh-mcp-toolkit .`;
 
 ## Security Considerations
 
-- Treat `~/.ssh-mcp/hosts.json` as sensitive; it may contain passwords or key paths.
+- Treat `~/.ssh-mcp/hosts.json` as sensitive; it may contain passwords or key paths. On POSIX systems, the server enforces directory mode 0700 and file mode 0600, rejects a symlink in place of the config file, and atomically replaces the file when saving.
+- Set `hostKeyFingerprint` for each target and jump host to verify SSH server identity. Existing hosts without a pin continue to connect without key verification.
 - Prefer key-based or agent authentication where possible.
-- Limit `hosts.json` permissions: `chmod 600 ~/.ssh-mcp/hosts.json`.
+- Existing configurations are tightened when the server writes them; check permissions manually if the server has not written the file since upgrading.
 - Sessions inherit all privileges of the configured SSH user.
 - Long-running sessions can be closed manually or rely on the inactivity timeout.
 

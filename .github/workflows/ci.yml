@@ -39,10 +39,14 @@ jobs:
       - name: Run tests
         env:
           SSH_MCP_DISABLE_MAIN: "1"
-          SSH_HOST: 127.0.0.1
-          SSH_PORT: "2222"
-          SSH_USER: test
-          SSH_PASSWORD: secret
         run: npm test
+      - name: Run SSH integration tests
+        env:
+          SSH_MCP_INTEGRATION_HOST: 127.0.0.1
+          SSH_MCP_INTEGRATION_JUMP_HOST: 127.0.0.1
+          SSH_MCP_INTEGRATION_PORT: "2222"
+          SSH_MCP_INTEGRATION_USER: test
+          SSH_MCP_INTEGRATION_PASSWORD: secret
+        run: npm run test:integration
 
 

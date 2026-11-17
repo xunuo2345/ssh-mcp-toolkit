@@ -55,7 +55,7 @@ describe('formatHostLine', () => {
       id: 'h1', host: '1.2.3.4', port: 22, username: 'user', password: 'secret',
     };
     expect(formatHostLine(host)).toBe(
-      'id=h1 host=1.2.3.4:22 user=user auth=password'
+      'id=h1 host=1.2.3.4:22 user=user auth=password hostkey=unchecked'
     );
   });
 
@@ -66,7 +66,7 @@ describe('formatHostLine', () => {
       proxyJump: 'jump',
     };
     expect(formatHostLine(host)).toBe(
-      'id=h2 host=10.0.0.1:2222 user=admin auth=key jump=jump'
+      'id=h2 host=10.0.0.1:2222 user=admin auth=key jump=jump hostkey=unchecked'
     );
   });
 
@@ -76,7 +76,14 @@ describe('formatHostLine', () => {
       id: 'h3', host: '192.168.1.1', port: 22, username: 'root',
     };
     expect(formatHostLine(host)).toBe(
-      'id=h3 host=192.168.1.1:22 user=root auth=agent'
+      'id=h3 host=192.168.1.1:22 user=root auth=agent hostkey=unchecked'
     );
+  });
+
+  it('marks a pinned host key in the host list', async () => {
+    const { formatHostLine } = await import('../src/index.js');
+    expect(formatHostLine({
+      id: 'pinned', host: 'example.test', port: 22, username: 'u', hostKeyFingerprint: `SHA256:${'a'.repeat(43)}`,
+    })).toContain('hostkey=pinned');
   });
 });

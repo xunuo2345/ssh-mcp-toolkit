@@ -252,6 +252,33 @@ describe('ShellCommandQueue', () => {
     expect(done).toEqual({ output: 'err line', exitCode: 9009 });
   });
 
+  it('waits for all exit-code digits when the marker line is split across data events', async () => {
+    const { ShellCommandQueue } = await import('../src/index.js');
+    const { shell, writes } = makeFakeShell();
+    const q = new ShellCommandQueue(shell as any);
+    let done: { output: string; exitCode: number } | null = null;
+    q.launch('exit 127', { onDone: (r) => { done = r; } });
+    const marker = markerFromWrites(writes);
+    q.handleData(`${marker}1`);
+    expect(done).toBeNull();
+    q.handleData('27\n');
+    expect(done).toEqual({ output: '', exitCode: 127 });
+  });
+
+  it('does not emit a completion marker prefix as command output', async () => {
+    const { ShellCommandQueue } = await import('../src/index.js');
+    const { shell, writes } = makeFakeShell();
+    const q = new ShellCommandQueue(shell as any);
+    let streamed = '';
+    let done: { output: string; exitCode: number } | null = null;
+    q.launch('printf output', { onData: (chunk) => { streamed += chunk; }, onDone: (r) => { done = r; } });
+    const marker = markerFromWrites(writes);
+    q.handleData(`output${marker.slice(0, 12)}`);
+    expect(streamed).toBe('output');
+    q.handleData(`${marker.slice(12)}0\n`);
+    expect(done).toEqual({ output: 'output', exitCode: 0 });
+  });
+
   it('pwsh marker parses back into the correct exit code', async () => {
     const { ShellCommandQueue } = await import('../src/index.js');
     const { shell, writes } = makeFakeShell();
@@ -395,6 +422,18 @@ describe('exec run helpers', () => {
     const logs = formatExecLogs(makeRun({ output: 'abc' }), 10);
     expect(logs.output).toBe('');
     expect(logs.nextOffset).toBe(3);
+  });
+
+  it('reports absolute offsets when old run output has been trimmed', async () => {
+    const { formatExecLogs } = await import('../src/index.js');
+    const logs = formatExecLogs(makeRun({ output: 'tail', outputOffset: 100 }), 102);
+    expect(logs.output).toBe('il');
+    expect(logs.nextOffset).toBe(104);
+    expect(logs.earliestOffset).toBe(100);
+    expect(logs.truncated).toBe(false);
+    const oldOffset = formatExecLogs(makeRun({ output: 'tail', outputOffset: 100 }), 2);
+    expect(oldOffset.output).toBe('tail');
+    expect(oldOffset.truncated).toBe(true);
   });
 
   it('pruneExpiredExecRuns removes expired entries but keeps running ones', async () => {

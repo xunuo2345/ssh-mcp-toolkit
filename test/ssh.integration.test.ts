@@ -218,6 +218,26 @@ integration('real SSH/SFTP container integration', () => {
     await upload.start();
     expect(upload.getInfo().state, upload.getInfo().error ?? 'upload failed').toBe('completed');
 
+    const replacement = Buffer.from('replacement payload');
+    await writeFile(sourcePath, replacement);
+    const overwrite = new runtime.FileTransfer(
+      'integration-upload-overwrite', 'target', sourcePath, remotePath, 'upload', await openSftp(proxiedHost),
+    );
+    await overwrite.start();
+    expect(overwrite.getInfo().state, overwrite.getInfo().error ?? 'overwrite failed').toBe('completed');
+    const overwriteCheck = await openSftp(proxiedHost);
+    try {
+      expect(await readRemoteFile(overwriteCheck.sftp, remotePath)).toEqual(replacement);
+    } finally {
+      closeSftp(overwriteCheck);
+    }
+    await writeFile(sourcePath, payload);
+    const restore = new runtime.FileTransfer(
+      'integration-upload-restore', 'target', sourcePath, remotePath, 'upload', await openSftp(proxiedHost),
+    );
+    await restore.start();
+    expect(restore.getInfo().state, restore.getInfo().error ?? 'restore upload failed').toBe('completed');
+
     const download = new runtime.FileTransfer(
       'integration-download', 'target', downloadPath, remotePath, 'download', await openSftp(proxiedHost),
       {

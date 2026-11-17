@@ -79,6 +79,20 @@ describe('PersistentSession session-level output buffer', () => {
     expect(session.sessionOutputLength).toBeLessThanOrEqual(1024 * 1024);
     expect(session.sessionOutputLength).toBeGreaterThan(1024 * 1024 - 64 * 1024);
   });
+
+  it('keeps session output offsets monotonic after dropping old output', async () => {
+    const session = await makeSession();
+    const { formatSessionOutput } = await import('../src/index.js');
+    (session as any).shell = { write: () => {}, end: () => {} };
+    (session as any).commandQueue = null;
+    (session as any).onSessionData('x'.repeat(1024 * 1024));
+    const first = formatSessionOutput(session.getSessionOutput(), 0, session.sessionOutputOffset);
+    (session as any).onSessionData('NEW');
+    const next = formatSessionOutput(session.getSessionOutput(), first.nextOffset, session.sessionOutputOffset);
+    expect(next.output).toBe('NEW');
+    expect(next.nextOffset).toBe(first.nextOffset + 3);
+    expect(next.earliestOffset).toBeGreaterThan(0);
+  });
 });
 
 describe('session output formatting', () => {

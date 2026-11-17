@@ -1,7 +1,7 @@
 {
   "name": "ssh-mcp-toolkit",
   "license": "MIT",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "An MCP tool to manage persistent ssh connections to a collection of hosts enabling remote development, deployment, and information gathering. Adds multi-hop ProxyJump tunneling and SFTP file transfer.",
   "type": "module",
   "bin": {
@@ -21,7 +21,7 @@
     "build"
   ],
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.17.5",
+    "@modelcontextprotocol/sdk": "1.17.5",
     "ssh2": "^1.17.0",
     "zod": "3.23.8"
   },
@@ -35,6 +35,11 @@
     "tsx": "^4.20.6",
     "typescript": "^5.9.2",
     "vitest": "^3.2.4"
+  },
+  "overrides": {
+    "@modelcontextprotocol/sdk": {
+      "zod": "3.25.76"
+    }
   },
   "homepage": "https://github.com/xunuo2345/ssh-mcp-toolkit#readme",
   "repository": {

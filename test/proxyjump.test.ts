@@ -1,4 +1,9 @@
 import { describe, it, expect } from 'vitest';
+import { createHash } from 'crypto';
+import SSH2Module from 'ssh2';
+import { mkdtemp, writeFile, rm } from 'fs/promises';
+import { join } from 'path';
+import { tmpdir } from 'os';
 
 describe('ProxyJump data model', () => {
   it('HostsSchema accepts proxyJump field', async () => {
@@ -116,5 +121,38 @@ describe('resolveHostFromList', () => {
       { id: 'b', host: '10.0.1.10', port: 22, username: 'b-user', proxyJump: 'a' },
     ];
     await expect(resolveHostFromList('a', hosts)).rejects.toThrow('ProxyJump cycle detected');
+  });
+});
+
+describe('SSH authentication hardening', () => {
+  it('uses SSH_MCP_KEY_PASSPHRASE for encrypted private keys', async () => {
+    const { resolveHostFromList } = await import('../src/index.js');
+    const { private: key } = SSH2Module.utils.generateKeyPairSync('ed25519', {
+      passphrase: 'unit-test-passphrase', cipher: 'aes256-cbc',
+    });
+    const previous = process.env.SSH_MCP_KEY_PASSPHRASE;
+    const directory = await mkdtemp(join(tmpdir(), 'ssh-mcp-key-'));
+    const keyPath = join(directory, 'id_ed25519');
+    await writeFile(keyPath, key, { mode: 0o600 });
+    process.env.SSH_MCP_KEY_PASSPHRASE = 'unit-test-passphrase';
+    try {
+      const result = await resolveHostFromList('host', [{ id: 'host', host: 'example.test', username: 'u', port: 22, keyPath }]);
+      expect(result.config.passphrase).toBe('unit-test-passphrase');
+    } finally {
+      if (previous === undefined) delete process.env.SSH_MCP_KEY_PASSPHRASE;
+      else process.env.SSH_MCP_KEY_PASSPHRASE = previous;
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a pinned host key that does not match', async () => {
+    const { resolveHostFromList } = await import('../src/index.js');
+    const { public: publicKey } = SSH2Module.utils.generateKeyPairSync('ed25519');
+    const hostKey = SSH2Module.utils.parseKey(publicKey).getPublicSSH();
+    const expected = createHash('sha256').update('different-key').digest('base64').replace(/=+$/, '');
+    const resolved = await resolveHostFromList('host', [{
+      id: 'host', host: 'example.test', username: 'u', port: 22, password: 'p', hostKeyFingerprint: expected,
+    }]);
+    expect(resolved.config.hostVerifier!(hostKey as Buffer)).toBe(false);
   });
 });

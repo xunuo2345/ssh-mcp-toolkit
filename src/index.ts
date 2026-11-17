@@ -7,9 +7,9 @@ import SSH2Module from 'ssh2';
 const { Client: SSHClient, utils: sshUtils } = SSH2Module as typeof import('ssh2');
 import { z } from 'zod';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { readFile, writeFile, mkdir, stat, lstat, rename, rm, open, readdir } from 'fs/promises';
+import { readFile, writeFile, mkdir, stat, lstat, rename, rm, open, readdir, chmod } from 'fs/promises';
 import { createReadStream, createWriteStream } from 'fs';
-import { posix as posixPath, relative as relativePath, resolve as resolvePath, sep as pathSeparator } from 'path';
+import { dirname, posix as posixPath, relative as relativePath, resolve as resolvePath, sep as pathSeparator } from 'path';
 import os from 'os';
 import { randomUUID, createHash } from 'crypto';
 import net from 'net';
@@ -35,6 +35,7 @@ export type StoredHost = {
   username: string;
   password?: string;
   keyPath?: string;
+  hostKeyFingerprint?: string;
   proxyJump?: string;
 };
 
@@ -56,24 +57,34 @@ export const HostsSchema = z.object({
     username: z.string(),
     password: z.string().optional(),
     keyPath: z.string().optional(),
+    hostKeyFingerprint: z.string().regex(/^(?:SHA256:)?[A-Za-z0-9+/]{43}=?$/).optional(),
     proxyJump: z.string().optional(),
   })).default([]),
 });
 
 async function ensureHostsFile(): Promise<void> {
-  await mkdir(HOSTS_DIR, { recursive: true });
+  await mkdir(HOSTS_DIR, { recursive: true, mode: 0o700 });
+  if (process.platform !== 'win32') await chmod(HOSTS_DIR, 0o700);
   try {
-    const stats = await stat(HOSTS_FILE);
-    if (!stats.isFile()) {
-      throw new McpError(ErrorCode.InternalError, `${HOSTS_FILE} exists but is not a file`);
+    const stats = await lstat(HOSTS_FILE);
+    if (!stats.isFile() || stats.isSymbolicLink()) {
+      throw new McpError(ErrorCode.InternalError, `${HOSTS_FILE} exists but is not a regular file`);
     }
+    if (process.platform !== 'win32') await chmod(HOSTS_FILE, 0o600);
   } catch (err: any) {
     if (err?.code === 'ENOENT') {
-      await writeFile(HOSTS_FILE, JSON.stringify({ hosts: [] }, null, 2), 'utf8');
-    } else if (err?.code !== 'EISDIR') {
-      throw err;
+      try {
+        await writeFile(HOSTS_FILE, JSON.stringify({ hosts: [] }, null, 2), { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+      } catch (createError: any) {
+        if (createError?.code !== 'EEXIST') throw createError;
+      }
+      const stats = await lstat(HOSTS_FILE);
+      if (!stats.isFile() || stats.isSymbolicLink()) {
+        throw new McpError(ErrorCode.InternalError, `${HOSTS_FILE} exists but is not a regular file`);
+      }
+      if (process.platform !== 'win32') await chmod(HOSTS_FILE, 0o600);
     } else {
-      throw new McpError(ErrorCode.InternalError, `${HOSTS_FILE} is a directory`);
+      throw err;
     }
   }
 }
@@ -90,7 +101,26 @@ async function readHosts(): Promise<StoredHost[]> {
 
 async function writeHosts(hosts: StoredHost[]): Promise<void> {
   await ensureHostsFile();
-  await writeFile(HOSTS_FILE, JSON.stringify({ hosts }, null, 2), 'utf8');
+  const tempPath = `${HOSTS_FILE}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(tempPath, JSON.stringify({ hosts }, null, 2), { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    if (process.platform !== 'win32') await chmod(tempPath, 0o600);
+    await rename(tempPath, HOSTS_FILE);
+  } finally {
+    await rm(tempPath, { force: true }).catch(() => {});
+  }
+}
+
+let hostsMutationQueue: Promise<void> = Promise.resolve();
+
+async function mutateHosts(mutator: (hosts: StoredHost[]) => void): Promise<void> {
+  const operation = hostsMutationQueue.then(async () => {
+    const hosts = await readHosts();
+    mutator(hosts);
+    await writeHosts(hosts);
+  });
+  hostsMutationQueue = operation.catch(() => {});
+  await operation;
 }
 
 async function buildConnectConfig(host: StoredHost, hostId: string): Promise<ConnectConfig> {
@@ -101,6 +131,11 @@ async function buildConnectConfig(host: StoredHost, hostId: string): Promise<Con
     keepaliveInterval: 30 * 1000,
   };
 
+  if (host.hostKeyFingerprint) {
+    const expected = host.hostKeyFingerprint.replace(/^SHA256:/, '').replace(/=+$/, '');
+    config.hostVerifier = (key: Buffer) => createHash('sha256').update(key).digest('base64').replace(/=+$/, '') === expected;
+  }
+
   if (host.password) {
     config.password = host.password;
   } else if (host.keyPath) {
@@ -110,6 +145,9 @@ async function buildConnectConfig(host: StoredHost, hostId: string): Promise<Con
     }
     const keyContent = await readFile(expanded, 'utf8');
     config.privateKey = keyContent;
+    if (process.env.SSH_MCP_KEY_PASSPHRASE) {
+      config.passphrase = process.env.SSH_MCP_KEY_PASSPHRASE;
+    }
   } else {
     if (process.env.SSH_AUTH_SOCK) {
       config.agent = process.env.SSH_AUTH_SOCK;
@@ -314,7 +352,13 @@ function isMissingPathError(error: any): boolean {
 
 function sftpRename(sftp: SFTPWrapper, from: string, to: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    sftp.rename(from, to, (err) => err ? reject(err) : resolve());
+    sftp.rename(from, to, (err) => {
+      if (!err) { resolve(); return; }
+      const extendedRename = (sftp as any).ext_openssh_rename;
+      if (typeof extendedRename !== 'function') { reject(err); return; }
+      extendedRename.call(sftp, from, to, (extendedError: Error | undefined) =>
+        extendedError ? reject(extendedError) : resolve());
+    });
   });
 }
 
@@ -401,7 +445,8 @@ export function validateProxyJump(hostId: string, proxyJump: string | undefined,
 export function formatHostLine(host: StoredHost): string {
   const auth = host.password ? 'password' : host.keyPath ? 'key' : 'agent';
   const jump = host.proxyJump ? ` jump=${host.proxyJump}` : '';
-  return `id=${host.id} host=${host.host}:${host.port} user=${host.username} auth=${auth}${jump}`;
+  const fingerprint = host.hostKeyFingerprint ? ' hostkey=pinned' : ' hostkey=unchecked';
+  return `id=${host.id} host=${host.host}:${host.port} user=${host.username} auth=${auth}${jump}${fingerprint}`;
 }
 
 export type PortForwardInfo = {
@@ -552,12 +597,12 @@ function rewriteRequest(headerBlock: string, parsed: { host: string; port: numbe
 }
 
 export function handleProxyConnection(stream: Duplex, connect: ConnectFn): void {
-  let buffer = '';
+  let buffer = Buffer.alloc(0);
   let routed = false;
 
   const fail = () => stream.destroy();
 
-  const route = (headerBlock: string, rest: string, requestLine: string, headers: string[]) => {
+  const route = (headerBlock: string, rest: Buffer, requestLine: string, headers: string[]) => {
     const parts = requestLine.split(' ');
     if (parts.length < 3) {
       fail();
@@ -621,32 +666,35 @@ export function handleProxyConnection(stream: Duplex, connect: ConnectFn): void 
     );
   };
 
-  const wireUpstream = (client: Duplex, upstream: Duplex, rest: string) => {
+  const wireUpstream = (client: Duplex, upstream: Duplex, rest: Buffer) => {
     if (client.destroyed) {
       upstream.destroy();
       return;
     }
-    if (rest) upstream.write(rest);
+    if (rest.length) upstream.write(rest);
     client.pipe(upstream);
     upstream.pipe(client);
     client.on('error', () => upstream.destroy());
     upstream.on('error', () => client.destroy());
     client.on('close', () => upstream.destroy());
     upstream.on('close', () => client.destroy());
+    client.resume();
   };
 
-  const onData = (chunk: Buffer) => {
-    buffer += chunk.toString('latin1');
+  const onData = (chunk: Buffer | string) => {
+    const incoming = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, 'latin1');
+    buffer = Buffer.concat([buffer, incoming]);
     if (routed) return;
-    const headerEnd = buffer.indexOf('\r\n\r\n');
+    const headerEnd = buffer.indexOf(Buffer.from('\r\n\r\n'));
     if (headerEnd === -1) {
       if (buffer.length > 64 * 1024) stream.destroy();
       return;
     }
     routed = true;
+    stream.pause();
     stream.removeListener('data', onData);
-    const headerBlock = buffer.slice(0, headerEnd);
-    const rest = buffer.slice(headerEnd + 4);
+    const headerBlock = buffer.subarray(0, headerEnd).toString('latin1');
+    const rest = buffer.subarray(headerEnd + 4);
     const lines = headerBlock.split('\r\n');
     route(headerBlock, rest, lines[0], lines.slice(1));
   };
@@ -708,6 +756,7 @@ export type ExecRun = {
   command: string;
   state: 'running' | 'completed' | 'failed' | 'cancelled';
   output: string;
+  outputOffset?: number;
   exitCode: number | null;
   startedAt: number;
   finishedAt: number | null;
@@ -993,11 +1042,61 @@ const activeEgress = new Map<string, InternetEgress>();
 const activeTransfers = new Map<string, ActiveTransfer>();
 const activeExecRuns = new Map<string, ExecRun>();
 const DEFAULT_SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
+const MAX_CAPTURED_OUTPUT_CHARS = 1024 * 1024;
+const TRANSFER_HISTORY_TTL_MS = 10 * 60 * 1000;
+
+export function pruneExpiredTransfers(transfers: Map<string, ActiveTransfer>, now: number): void {
+  for (const [id, transfer] of transfers) {
+    const info = transfer.getInfo();
+    if (info.finishedAt !== null && info.finishedAt + TRANSFER_HISTORY_TTL_MS <= now) transfers.delete(id);
+  }
+}
+
+function transferPath(host: string, path: string): string {
+  return host === 'local' ? resolvePath(path) : posixPath.normalize(path);
+}
+
+function pathsOverlap(a: string, b: string): boolean {
+  if (a === b) return true;
+  const isWindows = pathSeparator === '\\';
+  const separator = isWindows && !a.startsWith('/') && !b.startsWith('/') ? '\\' : '/';
+  const left = a.replace(/[\\/]+$/, '');
+  const right = b.replace(/[\\/]+$/, '');
+  return a.startsWith(`${right}${separator}`) || b.startsWith(`${left}${separator}`);
+}
+
+function transferWritePaths(info: TransferInfo): string[] {
+  const target = transferPath(info.targetHost, info.targetPath);
+  return [target, `${target}.part`];
+}
+
+function registerActiveTransfer(id: string, transfer: ActiveTransfer): void {
+  pruneExpiredTransfers(activeTransfers, Date.now());
+  if (activeTransfers.has(id)) {
+    (transfer as any).dispose?.();
+    throw new McpError(ErrorCode.InvalidParams, `Transfer '${id}' already exists`);
+  }
+  const next = transfer.getInfo();
+  const nextPaths = transferWritePaths(next);
+  for (const active of activeTransfers.values()) {
+    const info = active.getInfo();
+    if (info.finishedAt !== null || info.targetHost !== next.targetHost) continue;
+    const activePaths = transferWritePaths(info);
+    if (activePaths.some((activePath) => nextPaths.some((nextPath) => pathsOverlap(activePath, nextPath)))) {
+      (transfer as any).dispose?.();
+      throw new McpError(ErrorCode.InvalidParams, `Another active transfer writes to '${next.targetPath}' or an overlapping directory`);
+    }
+  }
+  activeTransfers.set(id, transfer);
+}
+
+const transferPruneTimer = setInterval(() => pruneExpiredTransfers(activeTransfers, Date.now()), 60_000);
+transferPruneTimer.unref();
 
 const server = new McpServer({
   name: 'SSH MCP Server',
   // Keep in sync with the "version" field in package.json.
-  version: '1.0.6',
+  version: '1.0.7',
   capabilities: {
     resources: {},
     tools: {},
@@ -1014,24 +1113,15 @@ server.tool(
     username: z.string().describe("SSH username"),
     password: z.string().optional().describe("Password for authentication"),
     keyPath: z.string().optional().describe("Path to private key (defaults to SSH agent if omitted)"),
+    hostKeyFingerprint: z.string().regex(/^(?:SHA256:)?[A-Za-z0-9+/]{43}=?$/).optional().describe("Optional SHA256 host key fingerprint pin; obtain it from a trusted channel"),
     proxyJump: z.string().optional().describe("ID of another stored host to use as a jump host"),
   },
-  async ({ host_id, host, port, username, password, keyPath, proxyJump }) => {
-    const hosts = await readHosts();
-    if (hosts.some((h) => h.id === host_id)) {
-      throw new McpError(ErrorCode.InvalidParams, `Host '${host_id}' already exists`);
-    }
-    validateProxyJump(host_id, proxyJump, hosts);
-    hosts.push({
-      id: host_id,
-      host,
-      port,
-      username,
-      password,
-      keyPath,
-      ...(proxyJump ? { proxyJump } : {}),
+  async ({ host_id, host, port, username, password, keyPath, hostKeyFingerprint, proxyJump }) => {
+    await mutateHosts((hosts) => {
+      if (hosts.some((h) => h.id === host_id)) throw new McpError(ErrorCode.InvalidParams, `Host '${host_id}' already exists`);
+      validateProxyJump(host_id, proxyJump, hosts);
+      hosts.push({ id: host_id, host, port, username, password, keyPath, hostKeyFingerprint, ...(proxyJump ? { proxyJump } : {}) });
     });
-    await writeHosts(hosts);
     return { content: [{ type: 'text', text: `Host '${host_id}' added` }] };
   }
 );
@@ -1057,12 +1147,11 @@ server.tool(
     host_id: z.string().describe("Identifier of the host to remove"),
   },
   async ({ host_id }) => {
-    const hosts = await readHosts();
-    const next = hosts.filter((host) => host.id !== host_id);
-    if (next.length === hosts.length) {
-      throw new McpError(ErrorCode.InvalidParams, `Host '${host_id}' does not exist`);
-    }
-    await writeHosts(next);
+    await mutateHosts((hosts) => {
+      const index = hosts.findIndex((host) => host.id === host_id);
+      if (index === -1) throw new McpError(ErrorCode.InvalidParams, `Host '${host_id}' does not exist`);
+      hosts.splice(index, 1);
+    });
     return { content: [{ type: 'text', text: `Host '${host_id}' removed` }] };
   }
 );
@@ -1077,28 +1166,27 @@ server.tool(
     username: z.string().optional(),
     password: z.string().optional(),
     keyPath: z.string().optional(),
+    hostKeyFingerprint: z.string().regex(/^(?:SHA256:)?[A-Za-z0-9+/]{43}=?$/).optional(),
     proxyJump: z.string().optional().describe("ID of a jump host; empty string clears it"),
   },
-  async ({ host_id, host, port, username, password, keyPath, proxyJump }) => {
-    const hosts = await readHosts();
-    const target = hosts.find((h) => h.id === host_id);
-    if (!target) {
-      throw new McpError(ErrorCode.InvalidParams, `Host '${host_id}' does not exist`);
-    }
-    if (host) target.host = host;
-    if (port) target.port = port;
-    if (username) target.username = username;
-    if (password !== undefined) target.password = password;
-    if (keyPath !== undefined) target.keyPath = keyPath;
-    if (proxyJump !== undefined) {
-      if (proxyJump === '') {
-        delete target.proxyJump;
-      } else {
-        validateProxyJump(host_id, proxyJump, hosts);
-        target.proxyJump = proxyJump;
+  async ({ host_id, host, port, username, password, keyPath, hostKeyFingerprint, proxyJump }) => {
+    await mutateHosts((hosts) => {
+      const target = hosts.find((h) => h.id === host_id);
+      if (!target) throw new McpError(ErrorCode.InvalidParams, `Host '${host_id}' does not exist`);
+      if (host) target.host = host;
+      if (port) target.port = port;
+      if (username) target.username = username;
+      if (password !== undefined) target.password = password;
+      if (keyPath !== undefined) target.keyPath = keyPath;
+      if (hostKeyFingerprint !== undefined) target.hostKeyFingerprint = hostKeyFingerprint;
+      if (proxyJump !== undefined) {
+        if (proxyJump === '') delete target.proxyJump;
+        else {
+          validateProxyJump(host_id, proxyJump, hosts);
+          target.proxyJump = proxyJump;
+        }
       }
-    }
-    await writeHosts(hosts);
+    });
     return { content: [{ type: 'text', text: `Host '${host_id}' updated` }] };
   }
 );
@@ -1228,6 +1316,7 @@ server.tool(
       command: sanitizedCommand,
       state: 'running',
       output: '',
+      outputOffset: 0,
       exitCode: null,
       startedAt: Date.now(),
       finishedAt: null,
@@ -1240,9 +1329,17 @@ server.tool(
       session.launch(sanitizedCommand, {
         onData: (chunk) => {
           run.output += chunk.replace(/\r/g, '');
+          if (run.output.length > MAX_CAPTURED_OUTPUT_CHARS) {
+            const drop = run.output.length - MAX_CAPTURED_OUTPUT_CHARS;
+            run.output = run.output.slice(drop);
+            run.outputOffset = (run.outputOffset ?? 0) + drop;
+          }
         },
         onDone: (result) => {
-          run.output = result.output;
+          // Keep the streamed buffer stable: clients may already have used
+          // its absolute offsets while the command was running. The queue's
+          // final output is normalized (for example, trailing whitespace is
+          // stripped), so replacing the stream here would invalidate cursors.
           run.exitCode = result.exitCode;
           run.state = resolveExecFinishState(run.cancelRequested, result.exitCode);
           run.finishedAt = Date.now();
@@ -1395,7 +1492,7 @@ server.tool(
       throw new McpError(ErrorCode.InvalidParams, `Session '${session_id}' does not exist`);
     }
     return {
-      content: [{ type: 'text', text: JSON.stringify(formatSessionOutput(session.getSessionOutput(), offset), null, 2) }],
+      content: [{ type: 'text', text: JSON.stringify(formatSessionOutput(session.getSessionOutput(), offset, session.sessionOutputOffset), null, 2) }],
     };
   }
 );
@@ -1419,7 +1516,7 @@ server.tool(
       await new Promise((resolve) => setTimeout(resolve, wait_ms));
     }
     return {
-      content: [{ type: 'text', text: JSON.stringify(formatSessionOutput(session.getSessionOutput(), offset), null, 2) }],
+      content: [{ type: 'text', text: JSON.stringify(formatSessionOutput(session.getSessionOutput(), offset, session.sessionOutputOffset), null, 2) }],
     };
   }
 );
@@ -1722,11 +1819,12 @@ server.tool(
         : new McpError(ErrorCode.InternalError, `Failed to start transfer: ${error instanceof Error ? error.message : String(error)}`);
     }
 
-    if (activeTransfers.has(id)) {
+    try {
+      registerActiveTransfer(id, transfer);
+    } catch (error) {
       transfer.dispose();
-      throw new McpError(ErrorCode.InvalidParams, `Transfer '${id}' already exists`);
+      throw error;
     }
-    activeTransfers.set(id, transfer);
     transfer.start().catch(() => {
       // start() records failures internally; nothing further to do.
     });
@@ -1746,6 +1844,7 @@ server.tool(
     transfer_id: z.string().describe("Identifier of the transfer"),
   },
   async ({ transfer_id }) => {
+    pruneExpiredTransfers(activeTransfers, Date.now());
     const transfer = activeTransfers.get(transfer_id);
     if (!transfer) {
       throw new McpError(ErrorCode.InvalidParams, `Transfer '${transfer_id}' does not exist`);
@@ -1763,6 +1862,7 @@ server.tool(
     transfer_id: z.string().describe("Identifier of the transfer to cancel"),
   },
   async ({ transfer_id }) => {
+    pruneExpiredTransfers(activeTransfers, Date.now());
     const transfer = activeTransfers.get(transfer_id);
     if (!transfer) {
       throw new McpError(ErrorCode.InvalidParams, `Transfer '${transfer_id}' does not exist`);
@@ -1803,7 +1903,7 @@ server.tool(
         chunkThreshold: chunk_threshold_mb * 1024 * 1024,
         parallelConnectionFactory: () => openSftpConnection(resolved),
       });
-    activeTransfers.set(id, transfer);
+    registerActiveTransfer(id, transfer);
     transfer.start().catch(() => {});
     return {
       content: [{ type: 'text', text: `Directory download '${id}' started: ${host_id}:${remote_dir} -> '${resolvedLocalDir}'` }],
@@ -1852,7 +1952,7 @@ server.tool(
         chunkThreshold: chunk_threshold_mb * 1024 * 1024,
         parallelConnectionFactory: () => openSftpConnection(resolved),
       });
-    activeTransfers.set(id, transfer);
+    registerActiveTransfer(id, transfer);
     transfer.start().catch(() => {});
     return {
       content: [{ type: 'text', text: `Directory upload '${id}' started: '${resolvedLocalDir}' -> ${host_id}:${remote_dir}` }],
@@ -1873,7 +1973,7 @@ server.tool(
   },
   async ({ host_id, remote_path, local_path, chunk_threads, chunk_size_mb, chunk_threshold_mb }) => {
     const resolvedLocalPath = resolvePath(local_path);
-    await assertLocalDestinationParent(posixPath.dirname(resolvedLocalPath));
+    await assertLocalDestinationParent(dirname(resolvedLocalPath));
     const id = randomUUID();
     const resolved = await resolveHost(host_id);
     let conn: { conn: InstanceType<typeof SSHClient>; jumpConns: InstanceType<typeof SSHClient>[]; sftp: SFTPWrapper };
@@ -1889,7 +1989,7 @@ server.tool(
         chunkThreshold: chunk_threshold_mb * 1024 * 1024,
         parallelConnectionFactory: () => openSftpConnection(resolved),
       });
-    activeTransfers.set(id, transfer);
+    registerActiveTransfer(id, transfer);
     transfer.start().catch(() => {
       // start() records failures internally; nothing further to do.
     });
@@ -1938,7 +2038,7 @@ server.tool(
         chunkThreshold: chunk_threshold_mb * 1024 * 1024,
         parallelConnectionFactory: () => openSftpConnection(resolved),
       });
-    activeTransfers.set(id, transfer);
+    registerActiveTransfer(id, transfer);
     transfer.start().catch(() => {
       // start() records failures internally; nothing further to do.
     });
@@ -2171,7 +2271,18 @@ export class ShellCommandQueue {
     const { marker } = this.pending;
     const markerIndex = this.buffer.indexOf(marker);
     if (markerIndex === -1) {
-      this.pushIncrement(this.buffer.length);
+      let safeLength = this.buffer.length;
+      if (this.pending.markerExpected) {
+        const max = Math.min(marker.length - 1, this.buffer.length);
+        for (let length = max; length > 0; length -= 1) {
+          if (this.buffer.endsWith(marker.slice(0, length))) {
+            safeLength -= length;
+            break;
+          }
+        }
+      }
+      this.pushIncrement(safeLength);
+      this.trimPendingBuffer(marker);
       return;
     }
     // The completion path is only safe when a marker was actually injected
@@ -2186,13 +2297,10 @@ export class ShellCommandQueue {
       return;
     }
     const afterMarker = this.buffer.slice(markerIndex + marker.length);
-    // Match the exit code as one or more digits immediately after the
-    // marker. POSIX `printf '%d\n' $?` ends with a single `\n`; cmd's
-    // `echo marker%ERRORLEVEL%` ends with a trailing space (and possibly a
-    // `\r\n` that the channel layer has not yet delivered). Accepting the
-    // exit code as soon as `\d+` is present lets both formats complete
-    // without waiting for a newline that may never arrive over cmd.
-    const codeMatch = /^(\d+)/.exec(afterMarker);
+    // Wait for a delimiter after the digits. Otherwise an exit code split
+    // across data events (for example `1` then `27`) could be read as 1.
+    // POSIX and Windows marker commands both emit trailing whitespace.
+    const codeMatch = /^(\d+)(?=[\t \r\n])/.exec(afterMarker);
     if (!codeMatch) {
       this.pushIncrement(markerIndex);
       return;
@@ -2242,6 +2350,22 @@ export class ShellCommandQueue {
     }
   }
 
+  private trimPendingBuffer(marker: string): void {
+    if (!this.pending || this.buffer.length <= MAX_CAPTURED_OUTPUT_CHARS) return;
+    const excess = this.buffer.length - MAX_CAPTURED_OUTPUT_CHARS;
+    let preserve = 0;
+    const max = Math.min(marker.length - 1, this.buffer.length);
+    for (let length = max; length > 0; length -= 1) {
+      if (this.buffer.endsWith(marker.slice(0, length))) {
+        preserve = length;
+        break;
+      }
+    }
+    const drop = Math.min(excess, this.buffer.length - preserve);
+    this.buffer = this.buffer.slice(drop);
+    this.pending.pushedUntil = Math.max(0, this.pending.pushedUntil - drop);
+  }
+
   private rejectPending(error: Error): void {
     if (!this.pending) {
       return;
@@ -2265,12 +2389,15 @@ export function formatExecStatus(run: ExecRun): Record<string, unknown> {
 
 export function formatExecLogs(run: ExecRun, offset: number): Record<string, unknown> {
   const safeOffset = Number.isFinite(offset) && offset > 0 ? Math.floor(offset) : 0;
-  const output = run.output.slice(safeOffset);
+  const baseOffset = run.outputOffset ?? 0;
+  const output = run.output.slice(Math.max(0, safeOffset - baseOffset));
   return {
     run_id: run.run_id,
     state: run.state,
     output,
-    nextOffset: run.output.length,
+    nextOffset: baseOffset + run.output.length,
+    earliestOffset: baseOffset,
+    truncated: safeOffset < baseOffset,
     exitCode: run.exitCode,
   };
 }
@@ -2279,11 +2406,14 @@ export function formatExecInputResult(run: ExecRun, offset: number): Record<stri
   return formatExecLogs(run, offset);
 }
 
-export function formatSessionOutput(rawOutput: string, offset: number): Record<string, unknown> {
+export function formatSessionOutput(rawOutput: string, offset: number, baseOffset = 0): Record<string, unknown> {
   const safeOffset = Number.isFinite(offset) && offset > 0 ? Math.floor(offset) : 0;
+  const effectiveOffset = Math.max(safeOffset, baseOffset);
   return {
-    output: rawOutput.slice(safeOffset),
-    nextOffset: rawOutput.length,
+    output: rawOutput.slice(effectiveOffset - baseOffset),
+    nextOffset: baseOffset + rawOutput.length,
+    earliestOffset: baseOffset,
+    truncated: safeOffset < baseOffset,
   };
 }
 
@@ -2336,6 +2466,7 @@ export class PersistentSession {
   private readonly createdAt = Date.now();
   private lastCommand: string | null = null;
   private sessionOutput = '';
+  private sessionOutputBaseOffset = 0;
   private shellType: ShellType = 'posix';
   /** True while the initial shell-type probe is in flight. */
   private shellProbeActive = false;
@@ -2381,8 +2512,12 @@ export class PersistentSession {
     return this.sessionOutput;
   }
 
+  get sessionOutputOffset(): number {
+    return this.sessionOutputBaseOffset;
+  }
+
   readSessionOutput(offset: number): string {
-    return this.sessionOutput.slice(offset);
+    return this.sessionOutput.slice(Math.max(0, offset - this.sessionOutputBaseOffset));
   }
 
   writeInput(text: string): void {
@@ -2399,7 +2534,9 @@ export class PersistentSession {
   private onSessionData(data: string): void {
     this.sessionOutput += data;
     if (this.sessionOutput.length > 1024 * 1024) {
-      this.sessionOutput = this.sessionOutput.slice(this.sessionOutput.length - 1024 * 1024);
+      const drop = this.sessionOutput.length - 1024 * 1024;
+      this.sessionOutput = this.sessionOutput.slice(drop);
+      this.sessionOutputBaseOffset += drop;
     }
     this.commandQueue?.handleData(data);
   }
@@ -2712,6 +2849,7 @@ export class PersistentSession {
     }
     this.commandQueue = null;
     this.sessionOutput = '';
+    this.sessionOutputBaseOffset = 0;
 
     if (this.conn) {
       this.conn.removeAllListeners();
@@ -3590,7 +3728,8 @@ export class FileTransfer {
     const partHash = await sha256File(this.partPath);
     const remoteHash = await sha256Remote(this.conns.sftp, this.remotePath);
     if (partHash !== remoteHash) {
-      throw new Error(`sha256 mismatch: expected ${remoteHash}, got ${partHash}`);
+      await rm(this.partPath, { force: true });
+      throw new Error(`sha256 mismatch: expected ${remoteHash}, got ${partHash}; the invalid partial file was removed, so retry to start again`);
     }
     if (this.rejectLocalSymlinks) {
       try {
@@ -3674,7 +3813,8 @@ export class FileTransfer {
     const localHash = await sha256File(this.localPath);
     const remoteHash = await sha256Remote(this.conns.sftp, this.partPath);
     if (localHash !== remoteHash) {
-      throw new Error(`sha256 mismatch: expected ${localHash}, got ${remoteHash}`);
+      await this.removeRemotePart();
+      throw new Error(`sha256 mismatch: expected ${localHash}, got ${remoteHash}; the invalid partial file was removed, so retry to start again`);
     }
     await sftpRename(this.conns.sftp, this.partPath, this.remotePath);
     this.complete();
