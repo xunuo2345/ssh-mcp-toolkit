@@ -146,12 +146,16 @@ Each active session maintains:
 
 ## Installation
 
-> This fork publishes under the distinct package name `ssh-mcp-toolkit`. After its first npm release, install it from the npm registry as shown below.
+> This fork is published under the distinct npm package name `ssh-mcp-toolkit`. Install it from the npm registry as shown below.
 
 ### Global install from npm
 
 ```bash
+# Install the latest version
 npm install -g ssh-mcp-toolkit
+
+# Or pin to the current release
+npm install -g ssh-mcp-toolkit@1.0.7
 ```
 
 Launch the server anywhere by running `ssh-mcp-toolkit`.
@@ -162,15 +166,15 @@ Launch the server anywhere by running `ssh-mcp-toolkit`.
 npm install -g github:xunuo2345/ssh-mcp-toolkit
 ```
 
-The `prepare` script compiles TypeScript during install. This is also available before the first npm release.
+The `prepare` script compiles TypeScript during install.
 
 ### Publishing
 
-Pushing a stable version tag (`1.0.6` or `v1.0.6`) that matches `package.json` runs `.github/workflows/publish.yml`. The workflow installs dependencies, runs the test suite, builds the package, and publishes it to npm with GitHub Actions trusted publishing.
+Pushing a stable version tag (`1.0.7` or `v1.0.7`) that matches `package.json` runs `.github/workflows/publish.yml`. The workflow installs dependencies, runs the test suite, builds the package, and publishes it to npm with GitHub Actions trusted publishing.
 
 Before the first automated publish, the package must exist on npm and its Trusted Publisher settings must point to GitHub Actions, repository `xunuo2345/ssh-mcp-toolkit`, and workflow `publish.yml`, with direct publishing enabled. If the package has not been created yet, an npm maintainer must publish the first version manually, then configure the trusted publisher. Later releases need no long-lived npm token.
 
-The existing `1.0.5` Git tag is a historical mismatch: it points to a commit whose manifest still says `1.0.4`. It is left unchanged; this release advances the package and server versions to `1.0.6`. For later releases, bump both versions first, then push a matching version tag.
+The existing `1.0.5` Git tag is a historical mismatch: it points to a commit whose manifest still says `1.0.4`. It is left unchanged. The current package and server versions are `1.0.7`; for later releases, bump both versions first, then push a matching version tag.
 
 ### From source
 
