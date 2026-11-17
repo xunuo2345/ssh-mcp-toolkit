@@ -368,6 +368,31 @@ describe('DirectoryTransfer concurrency', () => {
     await rm(localRoot, { recursive: true, force: true });
   });
 
+  it('allows concurrent downloads to create the same nested local parents', async () => {
+    const { DirectoryTransfer } = await import('../src/index.js');
+    const { mkdtemp, rm, stat } = await import('fs/promises');
+    const { join } = await import('path');
+    const { tmpdir } = await import('os');
+    const localRoot = await mkdtemp(join(tmpdir(), 'dir-raced-mkdir-'));
+    const entries = Array.from({ length: 64 }, (_, index) => ({
+      relPath: `nested/deep/file-${index}.bin`,
+      size: 1,
+    }));
+    const transfer = new DirectoryTransfer('mkdir-race', 'A', '/data', localRoot, 'download-dir',
+      { conn: { end() {} } as any, jumpConns: [], sftp: {} as any },
+      { concurrency: 16 });
+    (transfer as any).listFiles = async () => entries;
+    (transfer as any).maybeSkip = async () => false;
+    (transfer as any).transferOne = async () => 1;
+
+    await transfer.start();
+
+    expect(transfer.getInfo().state).toBe('completed');
+    expect(transfer.getInfo().filesDone).toBe(entries.length);
+    expect((await stat(join(localRoot, 'nested', 'deep'))).isDirectory()).toBe(true);
+    await rm(localRoot, { recursive: true, force: true });
+  });
+
   it('waits for in-flight workers before closing the shared connection after a failure', async () => {
     const { DirectoryTransfer } = await import('../src/index.js');
     const { mkdtemp, rm } = await import('fs/promises');

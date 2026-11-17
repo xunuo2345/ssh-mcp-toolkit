@@ -273,6 +273,7 @@ integration('real SSH/SFTP container integration', () => {
     await mkdir(join(sourceDir, 'nested'), { recursive: true });
     await writeFile(join(sourceDir, 'root.txt'), 'root file\n');
     await writeFile(join(sourceDir, 'nested', 'child.txt'), 'nested file\n');
+    await writeFile(join(sourceDir, 'nested', 'sibling.txt'), 'sibling file\n');
     await mkdir(join(sourceDir, 'empty'));
     const remoteDir = `${remoteRoot}/directory`;
 
@@ -291,6 +292,7 @@ integration('real SSH/SFTP container integration', () => {
     expect(downloadDirTransfer.getInfo().state, downloadDirTransfer.getInfo().error ?? 'directory download failed').toBe('completed');
     expect(await readFile(join(downloadDir, 'root.txt'))).toEqual(Buffer.from('root file\n'));
     expect(await readFile(join(downloadDir, 'nested', 'child.txt'))).toEqual(Buffer.from('nested file\n'));
+    expect(await readFile(join(downloadDir, 'nested', 'sibling.txt'))).toEqual(Buffer.from('sibling file\n'));
     expect((await stat(join(downloadDir, 'empty'))).isDirectory()).toBe(true);
 
     const chain = await openChain(proxiedHost);

@@ -964,7 +964,15 @@ async function ensureLocalDirectoryPath(root: string, directory: string): Promis
     } catch (error: any) {
       if (error instanceof McpError) throw error;
       if (error?.code !== 'ENOENT') throw resolveLocalStatError(error, current);
-      await mkdir(current);
+      try {
+        await mkdir(current);
+      } catch (createError: any) {
+        if (createError?.code !== 'EEXIST') throw resolveLocalStatError(createError, current);
+        // Concurrent directory-download workers can discover the same
+        // missing parent and race to create it. Accept that race only after
+        // rechecking that the winner created a real directory, not a symlink.
+        await ensureLocalDirectoryRoot(current);
+      }
     }
   }
 }
